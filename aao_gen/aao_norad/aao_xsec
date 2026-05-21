@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+make -s -C "$DIR" aao_xsec_bin
+exec "$DIR/build/aao_xsec" "$@"

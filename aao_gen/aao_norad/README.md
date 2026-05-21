@@ -1,0 +1,27 @@
+# aao_norad
+
+## How to run `aao_norad`:
+```
+cd aao_norad
+make
+./build/aao_norad < aao_norad.inp
+```
+
+The content of input file `aao_norad.inp` configures the generator parameters.
+Refer to `input.txt` for documentation on the content:
+```
+The input file must have the following format. Please see the script aaorun 
+and example input file aao_norad_input.inp included in this package for an 
+example of how to run the program:
+
+phys         Physics model: 1=A0, 4=MAID98, 5=MAID2000
+flag_ehel    0= no polarized electron, 1=polarized electron
+npart        number of particles in BOS banks: 2=(e-,h+), 3=(e-,h+,h0)
+epirea       final state hadron: 1=pi0, 3=pi+
+ebeam        incident electron beam energy in GeV
+q2min q2max  minimum and maximum Q^2 limits in GeV^2
+epmin epmax  minimum and maximum scattered electron energy limits in GeV
+nmax         number of output events
+fmcall       factor to adjust the maximum cross section, used in M.C. selection
+boso         1=bos output, 0=no bos output
+```
