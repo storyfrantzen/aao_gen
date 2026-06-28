@@ -59,16 +59,25 @@ def run_generator(args,repo_base_dir):
         runstring = "{} < {}aao_input.inp".format(args.generator_exe_path,args.outdir)
         process = subprocess.Popen(runstring,stdout=subprocess.PIPE,shell=True)
         process.wait()
-        process2 = subprocess.Popen("mv aao_norad.lund {}aao_norad.lund".format(args.outdir),shell=True)
-        process2.wait()
-        #shutil.move(repo_base_dir+"/aao_norad.lund", args.outdir+"aao_norad.lund")
-        print("Moved lund file to new directory")
+        preserve_generator_outputs(args)
         return 0
     except OSError as e:
         print("\nError using event generator")
         print("The error message was:\n %s - %s." % (e.filename, e.strerror))
         print("Exiting\n")  
         return -1
+
+def preserve_generator_outputs(args):
+    os.makedirs(args.outdir, exist_ok=True)
+    for filename in (
+        "aao_norad.lund",
+        "aao_norad.sum",
+        "aao_norad.out",
+        "aao_norad.norm",
+    ):
+        if os.path.exists(filename):
+            shutil.move(filename, os.path.join(args.outdir, filename))
+    print("Moved generator lund, summary, and normalization files")
 
 def filter_lund(args):
     try:

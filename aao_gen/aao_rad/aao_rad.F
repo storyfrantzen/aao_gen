@@ -175,6 +175,7 @@ c     character*1 ich1
       character*13 file_out
       character*13 lund_out
       character*13 file_sum
+      character*13 file_norm
       character*13 file_bos
       character*8 recname
       character*28  ctime
@@ -199,6 +200,7 @@ c     character*1 ich1
       data file_out /'aao_rad.out'/
       data lund_out /'aao_rad.lund'/
       data file_sum /'aao_rad.sum'/
+      data file_norm /'aao_rad.norm'/
       data file_bos /'aao_rad.bos'/
       data ctime    /'                            '/
 
@@ -1323,6 +1325,28 @@ Clcs      call hrend('aaoradgen')
      *    ,' seconds'
       write(14,*)' Elapsed CPU time = ',t_elapse/60,' minutes'
       write(14,*)' CPU time/event = ', t_elapse/nevent,' sec'
+
+      open(unit=15,file=file_norm)
+      write(15,*)'generator=aao_rad'
+      write(15,*)'integrated_cross_section_units=micro-barns'
+      write(15,*)'sig_int=',sig_int
+      write(15,*)'sig_sum=',sig_sum
+      write(15,*)'events=',events
+      write(15,*)'ntries=',ntries
+      write(15,*)'nevent=',nevent
+      write(15,*)'mcall_max=',mcall_max
+      write(15,*)'sigr_max=',sigr_max
+      write(15,*)'ebeam=',ebeam
+      write(15,*)'q2_min=',q2_min
+      write(15,*)'q2_max=',q2_max
+      write(15,*)'ep_min=',ep_min
+      write(15,*)'ep_max_effective=',epmax
+      write(15,*)'delta=',delta
+      write(15,*)'epirea=',epirea
+      write(15,*)'th_opt=',th_opt
+      write(15,*)'res_opt=',res_opt
+      write(15,*)'fmcall=',fmcall
+      close(unit=15)
 
       write(14,1425)reg1,reg2-reg1,reg3-reg2, reg4-reg3,1.-reg4
       write(14,*)'csrng =',csrng

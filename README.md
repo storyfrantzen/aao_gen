@@ -45,6 +45,21 @@ BeamEnergy = 10.6
 The kinematic options `-xB`, `-Q2`, `-t`, `-phi`, and `-BeamEnergy` must be
 given explicitly.
 
+## Generator normalization sidecars
+
+The event generators write machine-readable normalization sidecars at the end of
+each successful run:
+
+```text
+aao_gen/aao_norad/aao_norad.norm
+aao_gen/aao_rad/aao_rad.norm
+```
+
+These files preserve the run-level integrated cross section needed to normalize
+accepted unweighted LUND events. Downstream analyses should use `sig_sum` as the
+generator integrated cross section. The older `.sum` files still contain the
+same value in the line `Integrated cross section = <sig_int> <sig_sum>`.
+
 To make the phi plot with ROOT:
 
 ```bash

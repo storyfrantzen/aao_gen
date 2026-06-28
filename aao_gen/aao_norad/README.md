@@ -25,3 +25,7 @@ nmax         number of output events
 fmcall       factor to adjust the maximum cross section, used in M.C. selection
 boso         1=bos output, 0=no bos output
 ```
+
+Each successful `aao_norad` run writes `aao_norad.norm` in addition to the LUND,
+`.out`, and `.sum` outputs. Use the `sig_sum` value from `aao_norad.norm` as the
+Born integrated cross section when normalizing generated-event histograms.

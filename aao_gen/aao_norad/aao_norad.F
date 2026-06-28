@@ -84,7 +84,7 @@ clcs     common/quest/iquest(100)
       
       integer h,nevent,nmax,istat,icycle
       
-      character*132 filerz,file_out,file_sum,file_bos, file_lund
+      character*132 filerz,file_out,file_sum,file_bos,file_lund,file_norm
       character*8 recname
 
       DATA PI   /3.1415926/
@@ -99,6 +99,7 @@ clcs     common/quest/iquest(100)
       data file_sum	/'aao_norad.sum'/
 c      data file_bos	/'aao_norad.evt'/
       data file_lund     /'aao_norad.lund'/
+      data file_norm     /'aao_norad.norm'/
 
       alpha=1/137.
       
@@ -601,6 +602,25 @@ c      if (boso.eq.1) call bos_end(recname)
      *    ,' micro-barns'
       write(14,*)' Beam time at Lum=1.0E34 =',events/sig_sum*1.E-4
      *    ,' seconds'
+      open(unit=15,file=file_norm)
+      write(15,*)'generator=aao_norad'
+      write(15,*)'integrated_cross_section_units=micro-barns'
+      write(15,*)'sig_int=',sig_int
+      write(15,*)'sig_sum=',sig_sum
+      write(15,*)'events=',events
+      write(15,*)'ntries=',ntries
+      write(15,*)'nevent=',nevent
+      write(15,*)'mcall_max=',mcall_max
+      write(15,*)'sigr_max=',sigr_max
+      write(15,*)'ebeam=',ebeam
+      write(15,*)'q2_min=',q2_min
+      write(15,*)'q2_max=',q2_max
+      write(15,*)'ep_min=',ep_min
+      write(15,*)'ep_max_effective=',epmax
+      write(15,*)'epirea=',epirea
+      write(15,*)'phys=',phys
+      write(15,*)'fmcall=',fmcall
+      close(unit=15)
       close(unit=12)
       close(unit=14)
 
@@ -919,5 +939,4 @@ C----------------------------------------------------------------------
       return
       end
 C======================================================================
-
 
