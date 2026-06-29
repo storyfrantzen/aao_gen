@@ -36,7 +36,8 @@ fi
 INPUT_ABS="$1"
 OUTPUT_BASE="$2"
 
-AAO_EXE="/work/clas12/storyf/aao_gen/aao_rad/build/aao_rad.exe"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AAO_EXE="${SCRIPT_DIR}/aao_rad/build/aao_rad"
 
 echo "Executable: $AAO_EXE"
 echo "Input file: $INPUT_ABS"
