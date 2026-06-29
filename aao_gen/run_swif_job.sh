@@ -108,11 +108,32 @@ fi
 
 # ---- output destination ----
 mkdir -p "$OUTPUT_BASE"
+OUTSTEM="${OUTPUT_BASE}/aao_rad_${TAG}_${UNIQ_ID}"
 
-OUTFILE="${OUTPUT_BASE}/aao_rad_${TAG}_${UNIQ_ID}.lund"
-mv aao_rad.lund "$OUTFILE"
+mv aao_rad.lund "${OUTSTEM}.lund"
 
-echo "Saved output: $OUTFILE"
+if [ -f aao_rad.norm ]; then
+    mv aao_rad.norm "${OUTSTEM}.norm"
+else
+    echo "WARNING: missing output file aao_rad.norm"
+fi
+
+if [ -f aao_rad.sum ]; then
+    mv aao_rad.sum "${OUTSTEM}.sum"
+else
+    echo "WARNING: missing output file aao_rad.sum"
+fi
+
+if [ -f aao_rad.out ]; then
+    mv aao_rad.out "${OUTSTEM}.out"
+else
+    echo "WARNING: missing output file aao_rad.out"
+fi
+
+cp input.inp "${OUTSTEM}.inp"
+
+echo "Saved output stem: ${OUTSTEM}"
+ls -lh "${OUTSTEM}".*
 
 # ---- cleanup ----
 cd /
