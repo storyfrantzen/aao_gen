@@ -16,7 +16,7 @@ set -euo pipefail
 
 # ---------------- CONFIG ----------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT="${SCRIPT_DIR}/run_swif_job.s
+SCRIPT="${SCRIPT_DIR}/run_swif_job.sh"
 OUTBASE="/volatile/clas12/storyf/LUND/aao_rad_normtest"
 
 BEAM="6.535"
