@@ -62,7 +62,7 @@ c     and make a new version.
       real epw
       real ep_min,ep_max,ep_test
       real ep_sav
-      real events
+      real*8 events
       real f
       real fkt
       real fmcall
@@ -122,7 +122,7 @@ c     and make a new version.
       real theta
       real tk_max
       real tp
-      real tries
+      real*8 tries
       real itime1, itime2
       real ts
       real uek
@@ -132,7 +132,8 @@ c     and make a new version.
       real x1
       real x2
       real targs,targp,xs,eloss,gxs,xtest,ebeam,t_targ,bfac,r_targ,temp
-      real sig_int, hydrogen_rad, vertex_x, vertex_y, vertex_z, vz
+      real*8 sig_int
+      real hydrogen_rad, vertex_x, vertex_y, vertex_z, vz
 
       integer dismc(6,100)
       integer intreg
@@ -152,7 +153,7 @@ cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
       integer ehel
 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
       integer*4 idum
-      integer*4 ntries
+      integer*8 ntries
       
       real cfac,asig
 

@@ -38,7 +38,8 @@ c     and make a new version.
       real pi0bp, pi0b2, pi0gam, pi0gam2
       real csthcm, csthcm_max, cstk
       real epi, epmax, eprng, eprot, epw
-      real ebeam,ep_min,ep_max,ep_test, events, evirt
+      real ebeam,ep_min,ep_max,ep_test, evirt
+      real*8 events
       real fmcall
       real gam_flux
       real itime1, itime2
@@ -52,11 +53,12 @@ c     and make a new version.
       real ran,rotc,rots,rtest
       real s,sigi,sigl,sigt,sigu,sigma0,signr,sig_ratio,sigr_max,stest
       real sigip, asym_p
-      real t_elapse,tries
+      real t_elapse
+      real*8 tries
       real*8 uq2, uq2_min,uq2_max,uq2rng
       real w2,wreal,w_max
       real t_targ
-      real sig_int
+      real*8 sig_int
       real vertex_x, vertex_y, vertex_z
 
 
@@ -74,7 +76,7 @@ cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
       integer ehel
 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
       integer*8 idum, count_rate, count_max
-      integer*4 ntries
+      integer*8 ntries
       
       real*4 ntp(24)
 
@@ -939,4 +941,3 @@ C----------------------------------------------------------------------
       return
       end
 C======================================================================
-

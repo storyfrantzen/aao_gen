@@ -59,12 +59,42 @@ if [ ! -f aao_norad.lund ]; then
     exit 3
 fi
 
+if [ ! -f aao_norad.norm ]; then
+    echo "ERROR: missing aao_norad.norm"
+    exit 4
+fi
+
+python3 - aao_norad.norm <<'PY'
+from pathlib import Path
+import math
+import re
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(errors="replace")
+
+def get(key):
+    match = re.search(
+        r"(?im)^\s*" + key + r"\s*=\s*"
+        r"([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][-+]?\d+)?)",
+        text,
+    )
+    if match is None:
+        raise SystemExit(f"ERROR: missing {key} in {path}")
+    return float(match.group(1).replace("D", "E").replace("d", "e"))
+
+for key in ("sig_sum", "events", "ntries"):
+    value = get(key)
+    if not math.isfinite(value) or value <= 0.0:
+        raise SystemExit(f"ERROR: invalid {key}={value} in {path}")
+PY
+
 mkdir -p "$OUTPUT_BASE"
 OUTSTEM="${OUTPUT_BASE}/aao_norad_${TAG}_${UNIQ_ID}"
 
 mv aao_norad.lund "${OUTSTEM}.lund"
 
-[ -f aao_norad.norm ] && mv aao_norad.norm "${OUTSTEM}.norm"
+mv aao_norad.norm "${OUTSTEM}.norm"
 [ -f aao_norad.sum ]  && mv aao_norad.sum  "${OUTSTEM}.sum"
 [ -f aao_norad.out ]  && mv aao_norad.out  "${OUTSTEM}.out"
 

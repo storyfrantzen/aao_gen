@@ -70,7 +70,7 @@ TAG="E${EBEAM}_Q2${Q2MIN}-${Q2MAX}_EP${EPMIN}-${EPMAX}_EG${EGMIN}"
 echo "Kinematic tag: $TAG"
 
 # ---- workspace ----
-WORKROOT="${SWIF_JOB_WORK_DIR:-/tmp}"
+WORKROOT="${SWIF_JOB_WORK_DIR:-${TMPDIR:-/tmp}}"
 WORKDIR="${WORKROOT}/aao_${UNIQ_ID}"
 mkdir -p "$WORKDIR"
 cleanup() {
@@ -107,17 +107,43 @@ if [ ! -f aao_rad.lund ]; then
     exit 3
 fi
 
+if [ ! -f aao_rad.norm ]; then
+    echo "ERROR: missing output file aao_rad.norm"
+    exit 4
+fi
+
+python3 - aao_rad.norm <<'PY'
+from pathlib import Path
+import math
+import re
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(errors="replace")
+
+def get(key):
+    match = re.search(
+        r"(?im)^\s*" + key + r"\s*=\s*"
+        r"([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][-+]?\d+)?)",
+        text,
+    )
+    if match is None:
+        raise SystemExit(f"ERROR: missing {key} in {path}")
+    return float(match.group(1).replace("D", "E").replace("d", "e"))
+
+for key in ("sig_sum", "events", "ntries"):
+    value = get(key)
+    if not math.isfinite(value) or value <= 0.0:
+        raise SystemExit(f"ERROR: invalid {key}={value} in {path}")
+PY
+
 # ---- output destination ----
 mkdir -p "$OUTPUT_BASE"
 OUTSTEM="${OUTPUT_BASE}/aao_rad_${TAG}_${UNIQ_ID}"
 
 mv aao_rad.lund "${OUTSTEM}.lund"
 
-if [ -f aao_rad.norm ]; then
-    mv aao_rad.norm "${OUTSTEM}.norm"
-else
-    echo "WARNING: missing output file aao_rad.norm"
-fi
+mv aao_rad.norm "${OUTSTEM}.norm"
 
 if [ -f aao_rad.sum ]; then
     mv aao_rad.sum "${OUTSTEM}.sum"
