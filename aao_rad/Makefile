@@ -5,13 +5,13 @@ OBJC=  unixtime.o
  
 aao_rad : $(OBJ) $(OBJC)
 	mkdir -p build
-	gfortran  -o build/aao_rad  $(addprefix build/, $(OBJ)) build/$(OBJC) 
+	gfortran -O2 -o build/aao_rad  $(addprefix build/, $(OBJ)) build/$(OBJC) 
 $(OBJ) : %.o: %.F
 	mkdir -p build
-	gfortran -fno-automatic -ffixed-line-length-none -fno-second-underscore -funroll-loops -fomit-frame-pointer -c $< -o build/$@  
+	gfortran -O2 -fno-automatic -ffixed-line-length-none -fno-second-underscore -funroll-loops -fomit-frame-pointer -c $< -o build/$@  
 $(OBJC) : %.o: %.c
 	mkdir -p build
-	gcc  -c $< -o build/$@ 
+	gcc -O2 -c $< -o build/$@ 
 clean:
 	rm -f build/aao_rad $(addprefix build/, $(OBJ)) $(addprefix build/, $(OBJC))
 
@@ -21,4 +21,3 @@ clean:
 ##        -DLinux \
 ##        -I. -I./ -I/group/clas/builds/release-4-14/packages/include -I/group/clas/builds/release-4-14/packages/inc_derived -I/apps/tcl/include -I/usr/X11R6/include -c \
 ##        aac.F  -o /home/avakian/w6/tmp/obj/LinuxRHEL3/generator/aac.o
-
