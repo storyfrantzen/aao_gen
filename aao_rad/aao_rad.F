@@ -37,6 +37,9 @@ c     and make a new version.
       integer timevals(8)
       integer sseed(64)
       integer ssize
+      integer env_status, env_len
+      integer*8 job_seed, attempt_seed, seed_value
+      character*32 env_value
       real*8 ek,Tk,delta
       real*8 alpha,pi,mp,mn,mpi,mel,wg,T0
       real*8 es,ep,ps,pp,rs,rp,u0,pu,uu,pdotk,sdotk
@@ -437,7 +440,29 @@ c     Use the internal clock to initialize the random number generator
       call date_and_time(values=timevals)
       call random_seed(size=ssize)
       write(6,*)'seed:',ssize
-      sseed(:) = timevals(8)
+      job_seed = 0
+      attempt_seed = 0
+      call get_environment_variable('SWIF_JOB_ID', env_value,
+     *     length=env_len, status=env_status)
+      if (env_status .eq. 0 .and. env_len .gt. 0) then
+         read(env_value(1:env_len),*,err=431) job_seed
+      endif
+ 431  continue
+      call get_environment_variable('SWIF_JOB_ATTEMPT_ID', env_value,
+     *     length=env_len, status=env_status)
+      if (env_status .eq. 0 .and. env_len .gt. 0) then
+         read(env_value(1:env_len),*,err=432) attempt_seed
+      endif
+ 432  continue
+      do i=1,ssize
+         seed_value = timevals(8) + 1000_8*timevals(7)
+     *      + 100000_8*timevals(6) + 10000000_8*timevals(5)
+     *      + 104729_8*job_seed + 1009_8*attempt_seed
+     *      + 7919_8*i
+         sseed(i) = int(mod(abs(seed_value), 2147483647_8))
+         if (sseed(i) .eq. 0) sseed(i) = i + 1
+      enddo
+      write(6,*)'seed mix:',job_seed,attempt_seed,sseed(1)
       call random_seed(put=sseed)
 
 c      call random_number(rnd)

@@ -63,6 +63,7 @@ c     and make a new version.
 
 
       integer seed_source
+      integer env_status, env_len
       integer boso
       integer phys,epirea
       integer i,iext1,iext2,iquest
@@ -76,6 +77,7 @@ cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
       integer ehel
 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
       integer*8 idum, count_rate, count_max
+      integer*8 job_seed, attempt_seed
       integer*8 ntries
       
       real*4 ntp(24)
@@ -88,6 +90,7 @@ clcs     common/quest/iquest(100)
       
       character*132 filerz,file_out,file_sum,file_bos,file_lund,file_norm
       character*8 recname
+      character*32 env_value
 
       DATA PI   /3.1415926/
       DATA MPIP /.1395/
@@ -187,17 +190,32 @@ c     seed_source: 0= use unix timestamp from machine time to generate seed, oth
       ncycle		= 0
  1    mcall_max		= 0
       ntold		= 0
-     
+	     
       call timex(itime1)		!Initial seed from internal clock
       call system_clock(idum, count_rate, count_max)
 
       if(seed_source.eq.0) then
+      job_seed = 0
+      attempt_seed = 0
+      call get_environment_variable('SWIF_JOB_ID', env_value,
+     *     length=env_len, status=env_status)
+      if (env_status .eq. 0 .and. env_len .gt. 0) then
+         read(env_value(1:env_len),*,err=131) job_seed
+      endif
+ 131  continue
+      call get_environment_variable('SWIF_JOB_ATTEMPT_ID', env_value,
+     *     length=env_len, status=env_status)
+      if (env_status .eq. 0 .and. env_len .gt. 0) then
+         read(env_value(1:env_len),*,err=132) attempt_seed
+      endif
+ 132  continue
+      idum = idum + 104729_8*job_seed + 1009_8*attempt_seed
       idum	= -idum
       else
       idum = seed_source
       endif
 
- !     Print *, 'The value of idum is', idum, ' '
+      Print *, 'Seed idum is', idum, ' '
     
       cstk		= myran(idum)
       write(*,*) cstk

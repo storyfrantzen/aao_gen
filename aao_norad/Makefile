@@ -9,19 +9,19 @@ all : aao_rad aao_xsec_bin
 
 aao_rad : $(OBJ) $(OBJC)
 	mkdir -p build
-	gfortran -O2 -o build/aao_norad $(addprefix build/, $(OBJ)) build/$(OBJC) 
+	gfortran -o build/aao_norad $(addprefix build/, $(OBJ)) build/$(OBJC) 
 
 aao_xsec_bin : build/aao_xsec
 
 build/aao_xsec : $(XSEC_OBJ)
 	mkdir -p build
-	gfortran -O2 -o build/aao_xsec $(addprefix build/, $(XSEC_OBJ))
+	gfortran -o build/aao_xsec $(addprefix build/, $(XSEC_OBJ))
 $(OBJ) aao_xsec.o : %.o: %.F
 	mkdir -p build
-	gfortran -O2 -fno-automatic -ffixed-line-length-none -fno-second-underscore -funroll-loops -fomit-frame-pointer  -c $< -o build/$@  
+	gfortran -fno-automatic -ffixed-line-length-none -fno-second-underscore -funroll-loops -fomit-frame-pointer  -c $< -o build/$@  
 $(OBJC) : %.o: %.c
 	mkdir -p build
-	gcc -O2 -c $< -o build/$@ 
+	gcc -c $< -o build/$@ 
 clean:
 	rm -f build/aao_norad build/aao_xsec $(addprefix build/, $(OBJ)) $(addprefix build/, aao_xsec.o) $(addprefix build/, $(OBJC)) 
 
