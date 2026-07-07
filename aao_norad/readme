@@ -1,9 +1,9 @@
 ## How to compile
 1. Clone the repo to ifarm machine and `cd` into the directory
-2. Run `scons-2.7`
+2. Run `make`
 
 ## How to run
-1. `./build/aao_norad.exe < aao_norad_input.inp`
+1. `./build/aao_norad < aao_norad_input.inp`
 
 ## The format of input file
 
@@ -22,5 +22,4 @@ nmax         number of output events
 fmcall       factor to adjust the maximum cross section, used in M.C. selection
 boso         1=bos output, 0=no bos output
 seed         0= use unix timestamp from machine time to generate seed, otherwise use given value as seed
-
 

@@ -2,7 +2,7 @@
 #!/usr/bin/env python3
 
 """
-This is a mock generator for debugging on local machines where aao_norad.exe is not able to run correctly
+This is a mock generator for debugging on local machines where build/aao_norad is not able to run correctly
 This generates a simulated lund file for debugging purposes and is not needed for production
 """
 import os

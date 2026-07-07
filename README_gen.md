@@ -45,8 +45,7 @@ optional arguments:
   --input_filename INPUT_FILENAME
                         filename for aao_norad (default: aao_norad_input.inp)
   --generator_exe_path GENERATOR_EXE_PATH
-                        Path to generator executable (default: <path>/aao_norad/build/aao_norad.exe
-                        )
+                        Path to generator executable (default: <path>/aao_norad/build/aao_norad)
   --xBmin XBMIN         minimum Bjorken X value (default: -1)
   --xBmax XBMAX         maximum Bjorken X value (default: 10)
   --w2min W2MIN         minimum w2 value, in GeV^2 (default: -1)
@@ -72,7 +71,7 @@ optional arguments:
 cd aao_gen/aao_norad/
 
 ## Build the aao_norad generator executable
-scons-2.7
+make
 
 ## cd into head of repository
 cd ..

@@ -184,7 +184,7 @@ if __name__ == "__main__":
     # repository head
     # ├── aao_norad
     # │   ├── build
-    # │   │   └── aao_norad.exe
+    # │   │   └── aao_norad
     # ├── aao_rad
     # ├── gen_wrapper
     # │   ├── run
@@ -199,7 +199,7 @@ if __name__ == "__main__":
     slash = "/"
     repo_base_dir = slash.join(full_file_path.split(slash)[:-3])
     input_file_maker_path = repo_base_dir + "/gen_wrapper/batch-farm-executables/run/input_file_maker_aao_norad.exe"
-    aao_norad_path = repo_base_dir + "/aao_norad/build/aao_norad.exe"
+    aao_norad_path = repo_base_dir + "/aao_norad/build/aao_norad"
     lund_filter_path = repo_base_dir + "/gen_wrapper/batch-farm-executables/run/lund_filter.exe"
     output_file_path = repo_base_dir + "/output/"
 

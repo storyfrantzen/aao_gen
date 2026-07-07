@@ -168,7 +168,7 @@ if __name__ == "__main__":
     # repository head
     # ├── aao_norad
     # │   ├── build
-    # │   │   └── aao_norad.exe
+    # │   │   └── aao_norad
     # ├── aao_rad
     # ├── gen_wrapper
     # │   ├── run

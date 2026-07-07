@@ -1,11 +1,29 @@
 # aao_norad
 
+## Build products
+
+Files under `build/` are generated locally and are not tracked. Build the
+needed target once before running local or batch workflows.
+
 ## How to run `aao_norad`:
 ```
 cd aao_norad
 make
 ./build/aao_norad < aao_norad.inp
 ```
+
+The single-point cross-section executable used by bin-centering scans is built
+with:
+
+```
+cd aao_norad
+make aao_xsec_bin
+./build/aao_xsec -xB 0.3 -Q2 2.0 -t -0.2 -phi 30 -BeamEnergy 10.6
+```
+
+For large batch scans, point jobs directly at `build/aao_xsec`. Avoid invoking
+the `aao_xsec` helper wrapper from every job because it can run `make` in this
+shared directory.
 
 The content of input file `aao_norad.inp` configures the generator parameters.
 Refer to `input.txt` for documentation on the content:

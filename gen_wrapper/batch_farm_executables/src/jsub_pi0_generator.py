@@ -30,7 +30,7 @@ COMMAND:
 mkdir -p aao_norad/build
 mkdir -p gen_wrapper/run
 cp {0} gen_wrapper/run/
-cp {1} aao_norad/build/
+cp {1} aao_norad/build/aao_norad
 cp {2} gen_wrapper/run/
 cp {3} gen_wrapper/run/
 
@@ -56,7 +56,7 @@ cp {3} gen_wrapper/run/
 --trig {} \
 --precision {} \
 --maxloops {} \
---generator_exe_path aao_norad/build/aao_norad.exe \
+--generator_exe_path aao_norad/build/aao_norad \
 --filter_exe_path gen_wrapper/run/lund_filter.exe \
 --outdir output/ \
 --xBmin {} \
@@ -102,7 +102,7 @@ if __name__ == "__main__":
     # repository head
     # ├── aao_norad
     # │   ├── build
-    # │   │   └── aao_norad.exe
+    # │   │   └── aao_norad
     # ├── aao_rad
     # ├── gen_wrapper
     # │   ├── run
@@ -117,7 +117,7 @@ if __name__ == "__main__":
     slash = "/"
     repo_base_dir = slash.join(full_file_path.split(slash)[:-3])
     input_file_maker_path = repo_base_dir + "/gen_wrapper/run/input_file_maker_aao_norad.exe"
-    aao_norad_path = repo_base_dir + "/aao_norad/build/aao_norad.exe"
+    aao_norad_path = repo_base_dir + "/aao_norad/build/aao_norad"
     lund_filter_path = repo_base_dir + "/gen_wrapper/run/lund_filter.exe"
     output_file_path = repo_base_dir + "/output/"
     jsub_textdir_path = repo_base_dir + "/submission_warehouse/"
