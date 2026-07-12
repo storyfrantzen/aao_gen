@@ -27,8 +27,8 @@ EPMAX="4.5"
 EGMIN="0.010"
 
 LABEL="stage2_normfix_seedfix_noO2"
-NEVENTS_PER_JOB="20000"
-NJOBS="5000"
+NEVENTS_PER_JOB="5000"
+NJOBS="20000"
 WALLTIME="24hr"
 # ----------------------------------------
 
