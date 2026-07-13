@@ -1,3 +1,9 @@
 
 aao_rad/build/
 aao_norad/build/
+
+# Generated AAO scan plots/results.
+aao_norad/BC_scans*/
+aao_norad/*.png
+aao_norad/*.pdf
+aao_norad/*.dat
