@@ -44,6 +44,10 @@ c     and make a new version.
       real gam_flux
       real itime1, itime2
       real jacob
+      real analysis_volume,xb,xb_min,xb_max,xbrng
+      real minus_t,mt_min,mt_max,mtrng
+      real phi_min,phi_max,phirng,q2rng_analysis
+      real q0cm,qcm,epicm,picm,tcm,cmden
       real myran,mm2, mpi0,mpip,mpi_s
       real ppx,ppy,ppz,px,py
       real ppix,ppiy,ppiz
@@ -63,6 +67,7 @@ c     and make a new version.
 
 
       integer seed_source
+      integer sampling_mode,input_status
       integer env_status, env_len
       integer boso
       integer phys,epirea
@@ -89,6 +94,7 @@ clcs     common/quest/iquest(100)
       integer h,nevent,nmax,istat,icycle
       
       character*132 filerz,file_out,file_sum,file_bos,file_lund,file_norm
+      character*132 file_kin
       character*8 recname
       character*32 env_value
 
@@ -105,6 +111,7 @@ clcs     common/quest/iquest(100)
 c      data file_bos	/'aao_norad.evt'/
       data file_lund     /'aao_norad.lund'/
       data file_norm     /'aao_norad.norm'/
+      data file_kin      /'aao_norad.kin'/
 
       alpha=1/137.
       
@@ -122,6 +129,42 @@ c     seed_source: 0= use unix timestamp from machine time to generate seed, oth
 
       read(5,*) phys,flag_ehel,npart,epirea,ebeam,q2_min,q2_max,ep_min,
      1ep_max,nmax,fmcall,boso,seed_source
+
+c     Optional sampling extension.  EOF preserves the historical input format.
+c       0 = legacy coordinates and full legacy domain
+c       1 = uniform Q2, xB, -t, phi analysis coordinates
+c       2 = legacy coordinates restricted to the same analysis bounds
+      sampling_mode = 0
+      xb_min = 0.
+      xb_max = 1.
+      mt_min = 0.
+      mt_max = 100.
+      phi_min = 0.
+      phi_max = 360.
+      read(5,*,iostat=input_status) sampling_mode
+      if (input_status .eq. 0 .and. sampling_mode .ne. 0) then
+         read(5,*,iostat=input_status) xb_min,xb_max
+         if (input_status .ne. 0) stop 'Missing xB sampling bounds'
+         read(5,*,iostat=input_status) mt_min,mt_max
+         if (input_status .ne. 0) stop 'Missing -t sampling bounds'
+         read(5,*,iostat=input_status) phi_min,phi_max
+         if (input_status .ne. 0) stop 'Missing phi sampling bounds'
+      endif
+      if (sampling_mode .lt. 0 .or. sampling_mode .gt. 2) then
+         stop 'sampling_mode must be 0, 1, or 2'
+      endif
+      if (sampling_mode .ne. 0) then
+         if (xb_min .le. 0. .or. xb_max .le. xb_min) then
+            stop 'Invalid xB sampling bounds'
+         endif
+         if (mt_min .lt. 0. .or. mt_max .le. mt_min) then
+            stop 'Invalid -t sampling bounds'
+         endif
+         if (phi_min .lt. 0. .or. phi_max .gt. 360. .or.
+     *       phi_max .le. phi_min) then
+            stop 'Invalid phi sampling bounds'
+         endif
+      endif
     
       if (npart .ne. 3) npart=2
 
@@ -181,6 +224,11 @@ c     seed_source: 0= use unix timestamp from machine time to generate seed, oth
       uq2_min		= 1/q2_max
       uq2_max		= 1/q2_min
       uq2rng		= uq2_max-uq2_min
+      q2rng_analysis     = q2_max-q2_min
+      xbrng              = xb_max-xb_min
+      mtrng              = mt_max-mt_min
+      phirng             = (phi_max-phi_min)*pi/180.
+      analysis_volume    = 2.*pi*q2rng_analysis*xbrng*mtrng*phirng
 
       epmax		= es-(wg**2+q2_min-mp**2)/2./mp    
       if (ep_max.lt.epmax) epmax=ep_max     
@@ -229,6 +277,8 @@ c     seed_source: 0= use unix timestamp from machine time to generate seed, oth
       open(unit=12,file=file_out)
       open(unit=14,file=file_sum)
       open(unit=13,file=file_lund)
+      open(unit=16,file=file_kin)
+      write(16,*)'# event Q2 xB minus_t phi_deg signr jacobian'
 
 clcs      call hlimit(1000000)
 clcs      iquest(10)	= 65000
@@ -253,6 +303,12 @@ c      if (boso.eq.1) call bos_ini(recname)
       write(12,*)' Electron Q**2 limits:',q2_min,q2_max
       write(12,*)' Lower and upper limit for scattered electron',
      * ' (GeV):',ep_min,epmax
+      write(12,*)' Sampling mode:',sampling_mode
+      if (sampling_mode .ne. 0) then
+         write(12,*)' Analysis xB bounds:',xb_min,xb_max
+         write(12,*)' Analysis -t bounds:',mt_min,mt_max
+         write(12,*)' Analysis phi bounds (deg):',phi_min,phi_max
+      endif
 
 c     Do a preliminary calculation to estimate the maximum value
 c     of the integrand
@@ -264,25 +320,62 @@ c     of the integrand
       if(flag_ehel.eq.1) ehel = 1
        
       do i=1,10000
-        ep		= epmax-eprng*myran(idum)
-        nu              = es-ep
-        epw             = sqrt(mp**2-q2+2*mp*nu)
-        pp		= sqrt(ep**2-mel**2)
-        rp		= pp/ep
-        s		= q2/4/es/ep
-        th0		= 2.*asin(sqrt(s))
-        theta		= th0*180./pi
-        t0		= th0
-        snt0		= sin(th0)
-        cst0		= cos(th0)
-        evirt		= (epw**2-mp**2)/2./mp
-        qsq		= q2
-        q0		= (epw**2-mp**2+q2)/2./mp        
-        gam_flux	= alpha/4/pi**2*ep/es*evirt/qsq*
-     +  (2. + 1./tan(th0/2)**2/(1.+q0**2/qsq))
-        jacob		= q2**2/(2.*es*ep)        
-        csthcm		= 2.*(myran(idum)-0.5)
-        phicm		= 360.*myran(idum)
+        if (sampling_mode .eq. 1) then
+          q2 = q2_min+q2rng_analysis*myran(idum)
+          xb = xb_min+xbrng*myran(idum)
+          q0 = q2/(2.*mp*xb)
+          ep = es-q0
+        else
+          uq2 = uq2_min+uq2rng*myran(idum)
+          q2 = 1./uq2
+          ep = epmax-eprng*myran(idum)
+          q0 = es-ep
+          if (q0 .le. 0.) cycle
+          xb = q2/(2.*mp*q0)
+        endif
+        if (ep .lt. ep_min .or. ep .gt. epmax) cycle
+        s = q2/(4.*es*ep)
+        if (s .le. 0. .or. s .gt. .5) cycle
+        th0 = 2.*asin(sqrt(s))
+        theta = th0*180./pi
+        t0 = th0
+        snt0 = sin(th0)
+        cst0 = cos(th0)
+        w2 = mp**2+2.*mp*q0-q2
+        if (w2 .le. (wg+0.002)**2) cycle
+        epw = sqrt(w2)
+        q0cm = (w2-mp**2-q2)/(2.*epw)
+        if (q0cm**2+q2 .le. 0.) cycle
+        qcm = sqrt(q0cm**2+q2)
+        epicm = (w2+mpi**2-mp**2)/(2.*epw)
+        if (epicm**2-mpi**2 .le. 0.) cycle
+        picm = sqrt(epicm**2-mpi**2)
+        cmden = 2.*qcm*picm
+        if (cmden .le. 0.) cycle
+        if (sampling_mode .eq. 1) then
+          minus_t = mt_min+mtrng*myran(idum)
+          tcm = -minus_t
+          csthcm = (tcm-mpi**2+q2+2.*q0cm*epicm)/cmden
+          phicm = phi_min+(phi_max-phi_min)*myran(idum)
+          if (abs(csthcm) .gt. 1.) cycle
+          jacob = q2/(8.*mp*xb**2*es*ep*qcm*picm)
+        else
+          csthcm = 2.*(myran(idum)-0.5)
+          phicm = 360.*myran(idum)
+          tcm = mpi**2-q2-2.*q0cm*epicm+cmden*csthcm
+          minus_t = -tcm
+          if (sampling_mode .eq. 2) then
+            if (xb .lt. xb_min .or. xb .ge. xb_max) cycle
+            if (minus_t .lt. mt_min .or. minus_t .ge. mt_max) cycle
+            if (phicm .lt. phi_min .or. phicm .ge. phi_max) cycle
+          endif
+          jacob = q2**2/(2.*es*ep)
+        endif
+        if (jacob .le. 0.) cycle
+        evirt = (epw**2-mp**2)/2./mp
+        qsq = q2
+        gam_flux = alpha/4/pi**2*ep/es*evirt/qsq*
+     +    (2. + 1./tan(th0/2)**2/(1.+q0**2/qsq))
         call dsigma(th0,qsq,epw,csthcm,phicm,phys,epirea,0,sigma0
      * ,sigu,sigt,sigl,sigi,sigip,asym_p,ehel)
         signr		= gam_flux*sigma0*jacob
@@ -299,6 +392,9 @@ c     of the integrand
       write(12,*)'sigr_max,csthcm_max,phicm_max,w_max',
      *            sigr_max,csthcm_max,phicm_max,w_max
 
+      if (sigr_max .le. 0.) then
+         stop 'Maximum scan found no physical positive-cross-section point'
+      endif
       sigr_max		= sigr_max*fmcall
       write(6,*) 'sigr_max changed to',sigr_max
       write(12,*)'sigr_max changed to',sigr_max
@@ -309,27 +405,31 @@ c   %%%%%%%%%%%%%%%%%%% Main Calculation  %%%%%%%%%%%%%%%%%%%%%%%
       ntries		= ntries+1
       if(flag_ehel.eq.1) ehel = get_spin(idum)
       es		= ebeam
-      uq2		= uq2_min+uq2rng*myran(idum)
-      q2		= 1./uq2
-
-      ep		= epmax-eprng*myran(idum)	
+      if (sampling_mode .eq. 1) then
+         q2 = q2_min+q2rng_analysis*myran(idum)
+         xb = xb_min+xbrng*myran(idum)
+         q0 = q2/(2.*mp*xb)
+         ep = es-q0
+      else
+         uq2 = uq2_min+uq2rng*myran(idum)
+         q2 = 1./uq2
+         ep = epmax-eprng*myran(idum)
+         q0 = es-ep
+         if (q0 .le. 0.) go to 20
+         xb = q2/(2.*mp*q0)
+      endif
       
-      if (ep .lt. ep_min) go to 20 !Electron energy above detector threshold?
+      if (ep .lt. ep_min .or. ep .gt. epmax) go to 20
 
-      q0		= es-ep
       s			= q2/4/es/ep
 
-      if (s .gt. .5) go to 20		!Electron angle < 90 deg?
+      if (s .le. 0. .or. s .gt. .5) go to 20
       
       th0		= 2.*asin(sqrt(s))
       theta		= th0*180./pi
       T0		= th0
       snt0		= sin(th0)
       cst0		= cos(th0)
-      ep_test		= (mp**2+2*mp*es-wg**2)/2./(mp+2.*es*s)	
-            
-      if (ep .gt. ep_test) go to 20	!Electron energy above pion threshold?
-
       pp		= sqrt(ep**2-mel**2)
       qsq		= q2
       
@@ -349,8 +449,32 @@ c   %%%%%%%%%%%%%%%%%%% Main Calculation  %%%%%%%%%%%%%%%%%%%%%%%
       
       if (epw .lt. wg+0.002)go to 20
 
-      csthcm		= -1.+2.*myran(idum)
-      phicm		= 360.*myran(idum)
+      q0cm = (w2-mp**2-q2)/(2.*epw)
+      if (q0cm**2+q2 .le. 0.) go to 20
+      qcm = sqrt(q0cm**2+q2)
+      epicm = (w2+mpi**2-mp**2)/(2.*epw)
+      if (epicm**2-mpi**2 .le. 0.) go to 20
+      picm = sqrt(epicm**2-mpi**2)
+      cmden = 2.*qcm*picm
+      if (cmden .le. 0.) go to 20
+
+      if (sampling_mode .eq. 1) then
+         minus_t = mt_min+mtrng*myran(idum)
+         tcm = -minus_t
+         csthcm = (tcm-mpi**2+q2+2.*q0cm*epicm)/cmden
+         phicm = phi_min+(phi_max-phi_min)*myran(idum)
+         if (abs(csthcm) .gt. 1.) go to 20
+      else
+         csthcm = -1.+2.*myran(idum)
+         phicm = 360.*myran(idum)
+         tcm = mpi**2-q2-2.*q0cm*epicm+cmden*csthcm
+         minus_t = -tcm
+         if (sampling_mode .eq. 2) then
+            if (xb .lt. xb_min .or. xb .ge. xb_max) go to 20
+            if (minus_t .lt. mt_min .or. minus_t .ge. mt_max) go to 20
+            if (phicm .lt. phi_min .or. phicm .ge. phi_max) go to 20
+         endif
+      endif
       call dsigma(th0,qsq,epw,csthcm,phicm,phys,epirea,0,sigma0
      * ,sigu,sigt,sigl,sigi,sigip,asym_p,ehel)
 
@@ -366,7 +490,11 @@ cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
       asym      = asym_p
       hel       = ehel
 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
-28    jacob = q2**2/(2.*es*ep)
+28    if (sampling_mode .eq. 1) then
+         jacob = q2/(8.*mp*xb**2*es*ep*qcm*picm)
+      else
+         jacob = q2**2/(2.*es*ep)
+      endif
       signr = signr*jacob
       sig_ratio = signr/sigr_max
       
@@ -429,6 +557,7 @@ c     if mcall .gt. 0 generate mcall n-tuple events.
 clcs        call hfnt(10)
         
         nevent = nevent+1
+        write(16,*)nevent,q2,xb,minus_t,phicm,signr,jacob
         
         do jj = 1,npart
           v(jj,1) = 0.
@@ -573,11 +702,17 @@ c        if (boso.eq.1) call bos_out	! Pack the BOS banks and write out to file
         tries		= ntries
         sig_int		= events/tries
           
-c     hadron phase space = 4*pi
-c     electron phase space =2*pi*uq2rng*eprng
-
-        sig_int		= sig_int*sigr_max*(4.*pi)*(2.*pi*uq2rng*eprng)
-        sig_sum		= sig_tot*(4.*pi)*(2.*pi*uq2rng*eprng)/tries
+        if (sampling_mode .eq. 1) then
+          sig_int = sig_int*sigr_max*analysis_volume
+          sig_sum = sig_tot*analysis_volume/tries
+        else
+c         hadron phase space = 4*pi
+c         electron phase space =2*pi*uq2rng*eprng
+          sig_int = sig_int*sigr_max*(4.*pi)*
+     *      (2.*pi*uq2rng*eprng)
+          sig_sum = sig_tot*(4.*pi)*
+     *      (2.*pi*uq2rng*eprng)/tries
+        endif
 
         write(6,*)' Integrated cross section =',sig_int,sig_sum,
      *    ' micro-barns'
@@ -595,10 +730,22 @@ c     electron phase space =2*pi*uq2rng*eprng
         ntold		= ntold+1
       endif
 
-      if (nevent .gt. nmax) go to 50
+      if (nevent .ge. nmax) go to 50
  30   go to 20
 
  50   continue
+      events = nevent
+      tries = ntries
+      sig_int = events/tries
+      if (sampling_mode .eq. 1) then
+         sig_int = sig_int*sigr_max*analysis_volume
+         sig_sum = sig_tot*analysis_volume/tries
+      else
+         sig_int = sig_int*sigr_max*(4.*pi)*
+     *      (2.*pi*uq2rng*eprng)
+         sig_sum = sig_tot*(4.*pi)*
+     *      (2.*pi*uq2rng*eprng)/tries
+      endif
 clcs      call hrout(0,icycle,' ')
 clcs      call hrend('AONORAD')
 clcs      close(unit=1)
@@ -640,9 +787,19 @@ c      if (boso.eq.1) call bos_end(recname)
       write(15,*)'epirea=',epirea
       write(15,*)'phys=',phys
       write(15,*)'fmcall=',fmcall
+      write(15,*)'sampling_mode=',sampling_mode
+      if (sampling_mode .ne. 0) then
+         write(15,*)'xb_min=',xb_min
+         write(15,*)'xb_max=',xb_max
+         write(15,*)'minus_t_min=',mt_min
+         write(15,*)'minus_t_max=',mt_max
+         write(15,*)'phi_min_deg=',phi_min
+         write(15,*)'phi_max_deg=',phi_max
+      endif
       close(unit=15)
       close(unit=12)
       close(unit=14)
+      close(unit=16)
 
  99   continue
  

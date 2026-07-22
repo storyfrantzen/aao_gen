@@ -46,6 +46,13 @@ def gen_input_file(args):
             "--fmcall", str(args.fmcall),
             "--boso", str(args.boso),
             "--seed", str(args.seed),
+            "--sampling_mode", str(args.sampling_mode),
+            "--xbmin", str(args.xBmin),
+            "--xbmax", str(args.xBmax),
+            "--minus_t_min", str(args.analysis_minus_t_min),
+            "--minus_t_max", str(args.analysis_minus_t_max),
+            "--phi_min", str(args.phi_min),
+            "--phi_max", str(args.phi_max),
             "--out", args.outdir+'aao_input.inp'])
         return 0
     except OSError as e:
@@ -74,6 +81,7 @@ def preserve_generator_outputs(args):
         "aao_norad.sum",
         "aao_norad.out",
         "aao_norad.norm",
+        "aao_norad.kin",
     ):
         if os.path.exists(filename):
             shutil.move(filename, os.path.join(args.outdir, filename))
@@ -229,6 +237,10 @@ if __name__ == "__main__":
     parser.add_argument("--boso",help="1=bos output, 0=no bos output",default=1)
     parser.add_argument("--seed",help="0= use unix timestamp from machine time to generate seed, otherwise use given value as seed",default=0)
     parser.add_argument("--trig",type=int,help="number of generated events",default=10000)
+    parser.add_argument("--sampling_mode",type=int,choices=(0,1,2),default=0,
+                        help="0=legacy, 1=analysis coordinates, 2=bounded legacy validation")
+    parser.add_argument("--analysis_minus_t_min",type=float,default=0.09)
+    parser.add_argument("--analysis_minus_t_max",type=float,default=2.0)
     parser.add_argument("--precision",type=float,help="Enter how close, in percent, you want the number of filtered events to be relative to desired events",default=10)
     parser.add_argument("--maxloops",type=int,help="Enter the number of generation iteration loops permitted to converge to desired number of events",default=10)
 
@@ -243,6 +255,8 @@ if __name__ == "__main__":
     parser.add_argument("--w2max",type=float,help='maximum w2 value, in GeV^2',default=100)
     parser.add_argument("--tmin",type=float,help='minimum t value, in GeV^2',default=-1)
     parser.add_argument("--tmax",type=float,help='maximum t value, in GeV^2',default=100)
+    parser.add_argument("--phi_min",type=float,default=0.0,help="minimum generated hadronic phi in degrees")
+    parser.add_argument("--phi_max",type=float,default=360.0,help="maximum generated hadronic phi in degrees")
 
     #Specify output directory for lund file
     parser.add_argument("--outdir",help="Specify full or relative path to output directory final lund file",default=output_file_path)

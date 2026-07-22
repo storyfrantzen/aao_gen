@@ -12,4 +12,11 @@ epmin epmax  minimum and maximum scattered electron energy limits in GeV
 nmax         number of output events
 fmcall       factor to adjust the maximum cross section, used in M.C. selection
 boso         1=bos output, 0=no bos output
+seed         0=clock/farm seed, otherwise the explicit integer seed
 
+The following extension is optional.  EOF after seed selects legacy mode 0:
+
+sampling_mode  0=legacy; 1=uniform (Q2,xB,-t,phi); 2=bounded legacy validation
+xbmin xbmax
+minus_t_min minus_t_max
+phi_min phi_max   hadronic center-of-mass phi bounds in degrees

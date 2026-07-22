@@ -7,3 +7,10 @@ aao_norad/BC_scans*/
 aao_norad/*.png
 aao_norad/*.pdf
 aao_norad/*.dat
+aao_norad/*.kin
+aao_norad/*.lund
+aao_norad/*.norm
+aao_norad/*.out
+aao_norad/*.sum
+aao_norad/validation_sampling/
+__pycache__/
