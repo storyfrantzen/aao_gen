@@ -237,8 +237,8 @@ if __name__ == "__main__":
     parser.add_argument("--boso",help="1=bos output, 0=no bos output",default=1)
     parser.add_argument("--seed",help="0= use unix timestamp from machine time to generate seed, otherwise use given value as seed",default=0)
     parser.add_argument("--trig",type=int,help="number of generated events",default=10000)
-    parser.add_argument("--sampling_mode",type=int,choices=(0,1,2),default=0,
-                        help="0=legacy, 1=analysis coordinates, 2=bounded legacy validation")
+    parser.add_argument("--sampling_mode",type=int,choices=(0,1,2,3),default=0,
+                        help="0=legacy, 1=uniform-Q2 analysis coordinates, 2=bounded legacy validation, 3=optimal inverse-Q2 analysis coordinates")
     parser.add_argument("--analysis_minus_t_min",type=float,default=0.09)
     parser.add_argument("--analysis_minus_t_max",type=float,default=2.0)
     parser.add_argument("--precision",type=float,help="Enter how close, in percent, you want the number of filtered events to be relative to desired events",default=10)

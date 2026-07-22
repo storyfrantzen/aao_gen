@@ -51,8 +51,8 @@ if __name__ == "__main__":
     parser.add_argument("--fmcall",help="factor to adjust the maximum cross section, used in M.C. selection",default=1.0)
     parser.add_argument("--boso",help="1=bos output, 0=no bos output",default=1)
     parser.add_argument("--seed",help="0= use unix timestamp from machine time to generate seed, otherwise use given value as seed",default=0)
-    parser.add_argument("--sampling_mode",type=int,choices=(0,1,2),default=0,
-                        help="0=legacy, 1=analysis coordinates, 2=legacy coordinates with analysis bounds")
+    parser.add_argument("--sampling_mode",type=int,choices=(0,1,2,3),default=0,
+                        help="0=legacy, 1=uniform-Q2 analysis coordinates, 2=bounded legacy validation, 3=optimal inverse-Q2 analysis coordinates")
     parser.add_argument("--xbmin",type=float,default=0.05)
     parser.add_argument("--xbmax",type=float,default=0.7)
     parser.add_argument("--minus_t_min",type=float,default=0.09)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate direct analysis-coordinate sampling against bounded legacy sampling."""
+"""Validate all bounded AAO sampling modes over the same physical domain."""
 
 from __future__ import annotations
 
@@ -14,6 +14,20 @@ from pathlib import Path
 
 import numpy as np
 from scipy.stats import ks_2samp
+
+
+MODE_NAMES = {
+    1: "direct_q2",
+    2: "bounded_legacy",
+    3: "optimal_inverse_q2",
+}
+COMPARISON_MODES = ((3, 1), (3, 2), (1, 2))
+LUND_Q2_TOLERANCE = 1.0e-5
+LUND_XB_TOLERANCE = 1.0e-5
+LUND_MINUS_T_TOLERANCE = 1.0e-3
+# List-directed single-precision LUND momentum output limits the reconstructed
+# hadron-plane angle, especially close to forward pion kinematics.
+LUND_PHI_TOLERANCE_DEG = 5.0e-3
 
 
 @dataclass(frozen=True)
@@ -36,8 +50,9 @@ def _arguments() -> argparse.Namespace:
     here = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
         description=(
-            "Run matched AAO samples in direct (Q2,xB,-t,phi) and bounded legacy "
-            "coordinates, then compare normalization and unweighted shapes."
+            "Run repeated AAO samples in direct Q2, bounded legacy, and optimal "
+            "inverse-Q2 analysis coordinates, then compare normalization, "
+            "unweighted shapes, and proposal efficiency."
         )
     )
     parser.add_argument("--executable", type=Path, default=here / "build" / "aao_norad")
@@ -188,7 +203,7 @@ def _serializable_run(result: RunResult) -> dict[str, float | int]:
     }
 
 
-def _plot(output: Path, direct: np.ndarray, legacy: np.ndarray) -> None:
+def _plot(output: Path, samples: dict[str, np.ndarray]) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -197,10 +212,17 @@ def _plot(output: Path, direct: np.ndarray, legacy: np.ndarray) -> None:
     columns = ((1, r"$Q^2$ (GeV$^2$)"), (2, r"$x_B$"), (3, r"$-t$ (GeV$^2$)"), (4, r"$\phi$ (deg)"))
     figure, axes = plt.subplots(2, 2, figsize=(10, 8))
     for axis, (column, label) in zip(axes.ravel(), columns):
-        combined = np.concatenate((direct[:, column], legacy[:, column]))
+        combined = np.concatenate([sample[:, column] for sample in samples.values()])
         edges = np.linspace(float(np.min(combined)), float(np.max(combined)), 31)
-        axis.hist(legacy[:, column], bins=edges, density=True, histtype="step", linewidth=1.5, label="bounded legacy")
-        axis.hist(direct[:, column], bins=edges, density=True, histtype="step", linewidth=1.5, label="analysis coordinates")
+        for name, sample in samples.items():
+            axis.hist(
+                sample[:, column],
+                bins=edges,
+                density=True,
+                histtype="step",
+                linewidth=1.5,
+                label=name.replace("_", " "),
+            )
         axis.set_xlabel(label)
         axis.set_ylabel("normalized density")
         axis.legend()
@@ -209,50 +231,95 @@ def _plot(output: Path, direct: np.ndarray, legacy: np.ndarray) -> None:
     plt.close(figure)
 
 
+def _cross_section_summary(runs: list[RunResult]) -> dict[str, float]:
+    values = np.array([run.sig_sum for run in runs])
+    mean, sem = _mean_sem(values)
+    return {"mean": mean, "sem": sem}
+
+
+def _cross_section_comparison(
+    candidate: dict[str, float], reference: dict[str, float]
+) -> dict[str, float]:
+    combined_sem = math.hypot(candidate["sem"], reference["sem"])
+    difference = candidate["mean"] - reference["mean"]
+    if combined_sem > 0.0:
+        z_score = abs(difference) / combined_sem
+    else:
+        z_score = 0.0 if difference == 0.0 else math.inf
+    return {
+        "relative_difference": difference / reference["mean"],
+        "difference_z_score": z_score,
+    }
+
+
+def _ks_comparison(candidate: np.ndarray, reference: np.ndarray) -> dict[str, dict[str, float]]:
+    names = {1: "Q2", 2: "xB", 3: "minus_t", 4: "phi_deg"}
+    results = {}
+    for column, name in names.items():
+        statistic, pvalue = ks_2samp(candidate[:, column], reference[:, column])
+        results[name] = {"statistic": float(statistic), "pvalue": float(pvalue)}
+    return results
+
+
 def main() -> int:
     args = _arguments()
-    if args.events <= 0 or args.replicas <= 0:
-        raise ValueError("events and replicas must be positive")
+    if args.events <= 0 or args.replicas < 2:
+        raise ValueError("events must be positive and replicas must be at least two")
     if not args.executable.is_file():
         raise FileNotFoundError(f"Build the generator first: {args.executable}")
     args.output.mkdir(parents=True, exist_ok=True)
 
-    direct_runs: list[RunResult] = []
-    legacy_runs: list[RunResult] = []
+    runs: dict[int, list[RunResult]] = {mode: [] for mode in MODE_NAMES}
     with tempfile.TemporaryDirectory(prefix="aao_sampling_validation_") as temporary:
         root = Path(temporary)
         for replica in range(args.replicas):
-            direct_seed = args.seed + 2 * replica
-            legacy_seed = args.seed + 2 * replica + 1
-            direct_runs.append(_run(args, 1, direct_seed, root / f"direct_{replica:02d}"))
-            legacy_runs.append(_run(args, 2, legacy_seed, root / f"legacy_{replica:02d}"))
+            for offset, mode in enumerate(MODE_NAMES):
+                seed = args.seed + 3 * replica + offset
+                name = MODE_NAMES[mode]
+                runs[mode].append(_run(args, mode, seed, root / f"{name}_{replica:02d}"))
 
-    direct_sig = np.array([run.sig_sum for run in direct_runs])
-    legacy_sig = np.array([run.sig_sum for run in legacy_runs])
-    direct_mean, direct_sem = _mean_sem(direct_sig)
-    legacy_mean, legacy_sem = _mean_sem(legacy_sig)
-    combined_sem = math.hypot(direct_sem, legacy_sem)
-    z_score = abs(direct_mean - legacy_mean) / combined_sem if combined_sem > 0 else math.inf
+    summaries = {MODE_NAMES[mode]: _cross_section_summary(mode_runs) for mode, mode_runs in runs.items()}
+    kinematics = {
+        MODE_NAMES[mode]: np.concatenate([run.kinematics for run in mode_runs])
+        for mode, mode_runs in runs.items()
+    }
+    cross_section_comparisons = {}
+    ks_comparisons = {}
+    for candidate_mode, reference_mode in COMPARISON_MODES:
+        candidate = MODE_NAMES[candidate_mode]
+        reference = MODE_NAMES[reference_mode]
+        comparison = f"{candidate}_vs_{reference}"
+        cross_section_comparisons[comparison] = _cross_section_comparison(
+            summaries[candidate], summaries[reference]
+        )
+        ks_comparisons[comparison] = _ks_comparison(
+            kinematics[candidate], kinematics[reference]
+        )
 
-    direct_kin = np.concatenate([run.kinematics for run in direct_runs])
-    legacy_kin = np.concatenate([run.kinematics for run in legacy_runs])
-    names = {1: "Q2", 2: "xB", 3: "minus_t", 4: "phi_deg"}
-    ks = {}
-    for column, name in names.items():
-        statistic, pvalue = ks_2samp(direct_kin[:, column], legacy_kin[:, column])
-        ks[name] = {"statistic": float(statistic), "pvalue": float(pvalue)}
-
-    all_runs = direct_runs + legacy_runs
+    all_runs = [run for mode_runs in runs.values() for run in mode_runs]
     lund_passed = all(
-        run.max_lund_q2_error < 1.0e-5
-        and run.max_lund_xb_error < 1.0e-5
-        and run.max_lund_minus_t_error < 5.0e-4
-        and run.max_lund_phi_error_deg < 1.0e-3
+        run.max_lund_q2_error < LUND_Q2_TOLERANCE
+        and run.max_lund_xb_error < LUND_XB_TOLERANCE
+        and run.max_lund_minus_t_error < LUND_MINUS_T_TOLERANCE
+        and run.max_lund_phi_error_deg < LUND_PHI_TOLERANCE_DEG
         for run in all_runs
     )
-    passed = lund_passed and z_score <= args.xsec_z_threshold and all(
-        result["pvalue"] >= args.ks_threshold for result in ks.values()
+    cross_section_passed = all(
+        comparison["difference_z_score"] <= args.xsec_z_threshold
+        for comparison in cross_section_comparisons.values()
     )
+    shapes_passed = all(
+        result["pvalue"] >= args.ks_threshold
+        for comparison in ks_comparisons.values()
+        for result in comparison.values()
+    )
+    passed = lund_passed and cross_section_passed and shapes_passed
+    efficiency = {
+        MODE_NAMES[mode]: sum(run.events for run in mode_runs)
+        / sum(run.ntries for run in mode_runs)
+        for mode, mode_runs in runs.items()
+    }
+    legacy_efficiency = efficiency[MODE_NAMES[2]]
     report = {
         "passed": passed,
         "configuration": {
@@ -267,21 +334,33 @@ def main() -> int:
             "fmcall": args.fmcall,
         },
         "integrated_cross_section_microbarn": {
-            "direct_mean": direct_mean,
-            "direct_sem": direct_sem,
-            "legacy_mean": legacy_mean,
-            "legacy_sem": legacy_sem,
-            "relative_difference": (direct_mean - legacy_mean) / legacy_mean,
-            "difference_z_score": z_score,
+            "modes": summaries,
+            "comparisons": cross_section_comparisons,
         },
-        "ks_tests": ks,
+        "ks_tests": ks_comparisons,
+        "proposal_efficiency": {
+            name: {
+                "aggregate": value,
+                "relative_to_bounded_legacy": value / legacy_efficiency,
+            }
+            for name, value in efficiency.items()
+        },
         "lund_kinematics_consistent": lund_passed,
-        "direct_runs": [_serializable_run(run) for run in direct_runs],
-        "legacy_runs": [_serializable_run(run) for run in legacy_runs],
+        "lund_tolerances": {
+            "Q2": LUND_Q2_TOLERANCE,
+            "xB": LUND_XB_TOLERANCE,
+            "minus_t": LUND_MINUS_T_TOLERANCE,
+            "phi_deg": LUND_PHI_TOLERANCE_DEG,
+        },
+        "all_mcall_max_le_one": all(run.mcall_max <= 1 for run in all_runs),
+        "runs": {
+            MODE_NAMES[mode]: [_serializable_run(run) for run in mode_runs]
+            for mode, mode_runs in runs.items()
+        },
     }
     report_path = args.output / "validation.json"
     report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    _plot(args.output / "shape_comparison.pdf", direct_kin, legacy_kin)
+    _plot(args.output / "shape_comparison.pdf", kinematics)
     print(json.dumps(report, indent=2))
     print(f"Wrote {report_path}")
     return 0 if passed else 1
