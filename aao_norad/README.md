@@ -60,9 +60,14 @@ The modes are:
 - `0`: historical uniform sampling in `(1/Q2, E', cos(theta*), phi*)`;
 - `1`: uniform sampling in `(Q2, xB, -t, phi*)` over the appended bounds;
 - `2`: historical coordinates with the appended analysis bounds applied.  This
-  is the control mode for validating mode 1 over an identical physical domain.
+  is the control mode for validating the direct modes over an identical
+  physical domain;
+- `3`: uniform sampling in `(1/Q2, xB, -t, phi*)`. This is the recommended
+  mode for globally unweighted samples because it retains direct analysis
+  bounds while preferentially proposing the low-`Q2` region where the cross
+  section is largest.
 
-For mode 1, the generator reconstructs
+For modes 1 and 3, the generator reconstructs
 
 ```text
 nu = Q2/(2 M xB)
@@ -70,8 +75,8 @@ E' = E - nu
 W2 = M2 + Q2*(1/xB - 1)
 ```
 
-and obtains the pion center-of-mass angle from the proposed `t`.  The density
-used by acceptance-rejection is
+and obtains the pion center-of-mass angle from the proposed `t`. In mode 1, the
+density used by acceptance-rejection is
 
 ```text
 Gamma_v * sigma0 * Q2 /
@@ -89,6 +94,26 @@ The factor `2*pi` is the unobserved electron azimuth.  Invalid points in the
 rectangular analysis-coordinate domain have zero integrand and remain counted
 in `ntries`.
 
+Mode 3 uses `u = 1/Q2` in place of `Q2`. Its density includes the additional
+coordinate derivative
+
+```text
+|dQ2/du| = Q2^2
+```
+
+so that the acceptance-rejection density and integration volume are
+
+```text
+Gamma_v * sigma0 * Q2^3 /
+    (8 M xB^2 E E' |q*| |p_pi*|)
+
+2*pi * Delta(1/Q2) * Delta(xB) * Delta(-t) * Delta(phi radians)
+```
+
+Here each `Q2` denotes the full kinematic variable (Q^2). Mode 3 changes only
+the proposal efficiency; after acceptance-rejection, its globally unweighted
+events follow the same physical distribution as modes 1 and 2.
+
 Every run also writes `aao_norad.kin`, with one row per LUND event:
 
 ```text
@@ -97,7 +122,8 @@ event Q2 xB minus_t phi_deg signr jacobian
 
 ## Sampling validation
 
-Build the generator and compare direct sampling with bounded legacy sampling:
+Build the generator and compare uniform-`Q2` direct sampling, bounded legacy
+sampling, and optimal inverse-`Q2` direct sampling:
 
 ```bash
 make
@@ -105,10 +131,13 @@ python3 validate_analysis_sampling.py \
   --physics-model 1 --events 20000 --replicas 4
 ```
 
-The study compares replicated `sig_sum` estimates and performs two-sample KS
-tests for the unweighted `Q2`, `xB`, `-t`, and `phi` distributions.  It writes
-`validation_sampling/validation.json` and `shape_comparison.pdf`.  Model 5 also
-requires the normal MAID table configuration, such as `MAID07_TBL`.
+The study compares repeated `sig_sum` estimates pairwise across all three modes
+and performs pairwise two-sample KS tests for the unweighted `Q2`, `xB`, `-t`,
+and `phi` distributions. It also reports aggregate proposal efficiencies. It
+writes `validation_sampling/validation.json` and `shape_comparison.pdf`.
+Because three independent runs are made per repeat, the total event count is
+`3 * events * replicas`. Model 5 also requires the normal MAID table
+configuration, such as `MAID07_TBL`.
 
 Each successful `aao_norad` run writes `aao_norad.norm` in addition to the LUND,
 `.kin`, `.out`, and `.sum` outputs. Use the `sig_sum` value from

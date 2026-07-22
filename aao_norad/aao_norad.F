@@ -134,6 +134,7 @@ c     Optional sampling extension.  EOF preserves the historical input format.
 c       0 = legacy coordinates and full legacy domain
 c       1 = uniform Q2, xB, -t, phi analysis coordinates
 c       2 = legacy coordinates restricted to the same analysis bounds
+c       3 = uniform 1/Q2, xB, -t, phi analysis coordinates
       sampling_mode = 0
       xb_min = 0.
       xb_max = 1.
@@ -150,8 +151,8 @@ c       2 = legacy coordinates restricted to the same analysis bounds
          read(5,*,iostat=input_status) phi_min,phi_max
          if (input_status .ne. 0) stop 'Missing phi sampling bounds'
       endif
-      if (sampling_mode .lt. 0 .or. sampling_mode .gt. 2) then
-         stop 'sampling_mode must be 0, 1, or 2'
+      if (sampling_mode .lt. 0 .or. sampling_mode .gt. 3) then
+         stop 'sampling_mode must be 0, 1, 2, or 3'
       endif
       if (sampling_mode .ne. 0) then
          if (xb_min .le. 0. .or. xb_max .le. xb_min) then
@@ -228,7 +229,11 @@ c       2 = legacy coordinates restricted to the same analysis bounds
       xbrng              = xb_max-xb_min
       mtrng              = mt_max-mt_min
       phirng             = (phi_max-phi_min)*pi/180.
-      analysis_volume    = 2.*pi*q2rng_analysis*xbrng*mtrng*phirng
+      if (sampling_mode .eq. 3) then
+         analysis_volume = 2.*pi*uq2rng*xbrng*mtrng*phirng
+      else
+         analysis_volume = 2.*pi*q2rng_analysis*xbrng*mtrng*phirng
+      endif
 
       epmax		= es-(wg**2+q2_min-mp**2)/2./mp    
       if (ep_max.lt.epmax) epmax=ep_max     
@@ -320,8 +325,13 @@ c     of the integrand
       if(flag_ehel.eq.1) ehel = 1
        
       do i=1,10000
-        if (sampling_mode .eq. 1) then
-          q2 = q2_min+q2rng_analysis*myran(idum)
+        if (sampling_mode .eq. 1 .or. sampling_mode .eq. 3) then
+          if (sampling_mode .eq. 3) then
+            uq2 = uq2_min+uq2rng*myran(idum)
+            q2 = 1./uq2
+          else
+            q2 = q2_min+q2rng_analysis*myran(idum)
+          endif
           xb = xb_min+xbrng*myran(idum)
           q0 = q2/(2.*mp*xb)
           ep = es-q0
@@ -352,13 +362,17 @@ c     of the integrand
         picm = sqrt(epicm**2-mpi**2)
         cmden = 2.*qcm*picm
         if (cmden .le. 0.) cycle
-        if (sampling_mode .eq. 1) then
+        if (sampling_mode .eq. 1 .or. sampling_mode .eq. 3) then
           minus_t = mt_min+mtrng*myran(idum)
           tcm = -minus_t
           csthcm = (tcm-mpi**2+q2+2.*q0cm*epicm)/cmden
           phicm = phi_min+(phi_max-phi_min)*myran(idum)
           if (abs(csthcm) .gt. 1.) cycle
-          jacob = q2/(8.*mp*xb**2*es*ep*qcm*picm)
+          if (sampling_mode .eq. 3) then
+            jacob = q2**3/(8.*mp*xb**2*es*ep*qcm*picm)
+          else
+            jacob = q2/(8.*mp*xb**2*es*ep*qcm*picm)
+          endif
         else
           csthcm = 2.*(myran(idum)-0.5)
           phicm = 360.*myran(idum)
@@ -405,8 +419,13 @@ c   %%%%%%%%%%%%%%%%%%% Main Calculation  %%%%%%%%%%%%%%%%%%%%%%%
       ntries		= ntries+1
       if(flag_ehel.eq.1) ehel = get_spin(idum)
       es		= ebeam
-      if (sampling_mode .eq. 1) then
-         q2 = q2_min+q2rng_analysis*myran(idum)
+      if (sampling_mode .eq. 1 .or. sampling_mode .eq. 3) then
+         if (sampling_mode .eq. 3) then
+            uq2 = uq2_min+uq2rng*myran(idum)
+            q2 = 1./uq2
+         else
+            q2 = q2_min+q2rng_analysis*myran(idum)
+         endif
          xb = xb_min+xbrng*myran(idum)
          q0 = q2/(2.*mp*xb)
          ep = es-q0
@@ -458,7 +477,7 @@ c   %%%%%%%%%%%%%%%%%%% Main Calculation  %%%%%%%%%%%%%%%%%%%%%%%
       cmden = 2.*qcm*picm
       if (cmden .le. 0.) go to 20
 
-      if (sampling_mode .eq. 1) then
+      if (sampling_mode .eq. 1 .or. sampling_mode .eq. 3) then
          minus_t = mt_min+mtrng*myran(idum)
          tcm = -minus_t
          csthcm = (tcm-mpi**2+q2+2.*q0cm*epicm)/cmden
@@ -492,6 +511,8 @@ cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 28    if (sampling_mode .eq. 1) then
          jacob = q2/(8.*mp*xb**2*es*ep*qcm*picm)
+      else if (sampling_mode .eq. 3) then
+         jacob = q2**3/(8.*mp*xb**2*es*ep*qcm*picm)
       else
          jacob = q2**2/(2.*es*ep)
       endif
@@ -702,7 +723,7 @@ c        if (boso.eq.1) call bos_out	! Pack the BOS banks and write out to file
         tries		= ntries
         sig_int		= events/tries
           
-        if (sampling_mode .eq. 1) then
+        if (sampling_mode .eq. 1 .or. sampling_mode .eq. 3) then
           sig_int = sig_int*sigr_max*analysis_volume
           sig_sum = sig_tot*analysis_volume/tries
         else
@@ -737,7 +758,7 @@ c         electron phase space =2*pi*uq2rng*eprng
       events = nevent
       tries = ntries
       sig_int = events/tries
-      if (sampling_mode .eq. 1) then
+      if (sampling_mode .eq. 1 .or. sampling_mode .eq. 3) then
          sig_int = sig_int*sigr_max*analysis_volume
          sig_sum = sig_tot*analysis_volume/tries
       else
