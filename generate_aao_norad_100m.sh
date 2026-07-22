@@ -105,6 +105,7 @@ EOF
 
         mv aao_norad.lund "${OUTSTEM}.lund"
         mv aao_norad.norm "${OUTSTEM}.norm"
+        [ -f aao_norad.kin ] && mv aao_norad.kin "${OUTSTEM}.kin"
         [ -f aao_norad.sum ] && mv aao_norad.sum "${OUTSTEM}.sum"
         [ -f aao_norad.out ] && mv aao_norad.out "${OUTSTEM}.out"
         cp input.inp "${OUTSTEM}.inp"

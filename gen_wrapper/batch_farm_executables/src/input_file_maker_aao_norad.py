@@ -21,9 +21,15 @@ def gen_input(args):
 {}
 {}
 {}
+{}
+{} {}
+{} {}
+{} {}
 """.format(args.physics_model,args.flag_ehel,args.npart,args.epirea,
     args.ebeam,args.q2min,args.q2max,args.epmin,args.epmax,
-    args.trig,args.fmcall,args.boso,args.seed)
+    args.trig,args.fmcall,args.boso,args.seed,args.sampling_mode,
+    args.xbmin,args.xbmax,args.minus_t_min,args.minus_t_max,
+    args.phi_min,args.phi_max)
     outfile.write(string)
     outfile.close()
 
@@ -45,6 +51,14 @@ if __name__ == "__main__":
     parser.add_argument("--fmcall",help="factor to adjust the maximum cross section, used in M.C. selection",default=1.0)
     parser.add_argument("--boso",help="1=bos output, 0=no bos output",default=1)
     parser.add_argument("--seed",help="0= use unix timestamp from machine time to generate seed, otherwise use given value as seed",default=0)
+    parser.add_argument("--sampling_mode",type=int,choices=(0,1,2),default=0,
+                        help="0=legacy, 1=analysis coordinates, 2=legacy coordinates with analysis bounds")
+    parser.add_argument("--xbmin",type=float,default=0.05)
+    parser.add_argument("--xbmax",type=float,default=0.7)
+    parser.add_argument("--minus_t_min",type=float,default=0.09)
+    parser.add_argument("--minus_t_max",type=float,default=2.0)
+    parser.add_argument("--phi_min",type=float,default=0.0,help="minimum hadronic phi in degrees")
+    parser.add_argument("--phi_max",type=float,default=360.0,help="maximum hadronic phi in degrees")
     parser.add_argument("--outfile",help="output filename",default="aao_norad_input.inp")
     args = parser.parse_args()
 
