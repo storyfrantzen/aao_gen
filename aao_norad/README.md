@@ -199,9 +199,11 @@ generated-event histograms.
 
 ## Bin-conditional Born production
 
-`bin_conditional.py` converts an analysis JSON configuration into one mode-4
-input per selected physical analysis bin. It snapshots the configuration and
-writes a manifest containing the bin bounds, indices, seed, generator revision,
+`bin_conditional.py` converts an analysis JSON configuration into one or more
+mode-4 generator invocations per selected physical analysis bin. Strata use the
+canonical ID `sNNNNN`, and independent invocations use `gNNNN`, for example
+`s01440__g0001`. The script snapshots the configuration and writes a manifest
+containing the bin bounds, indices, replica number, seed, generator revision,
 and output location:
 
 ```bash
@@ -209,6 +211,7 @@ python3 bin_conditional.py prepare \
   --config /path/to/configs/analysis/rgk/6.535.json \
   --output born_rgk_conditional \
   --events-per-bin 100000 \
+  --replicas 2 \
   --physics-model 5
 ```
 
@@ -222,6 +225,7 @@ run one manifest entry with:
 ```bash
 python3 bin_conditional.py run born_rgk_conditional/manifest.json \
   --flat-index 1440 \
+  --replica-index 1 \
   --executable build/aao_norad
 ```
 
@@ -231,3 +235,29 @@ output directory. Each output JSON records `sig_sum`,
 `event_weight_microbarn`, requested and actual event counts, any final event
 overshoot, `mcall_max`, whether the multiplicity correction was used, proposal
 count, and event yield per proposal.
+
+After every invocation has completed, finalize the campaign:
+
+```bash
+python3 bin_conditional.py finalize born_rgk_conditional/manifest.json
+```
+
+This writes `campaign_weights.json` and `.tsv`. Replicas estimate the same
+physical stratum cross section, so their cross sections are averaged rather
+than added. The combined estimator pools their Monte Carlo integration
+proposals,
+
+```text
+combined_sig_sum =
+    sum(ntries_r * sig_sum_r) / sum(ntries_r)
+```
+
+and every event in the pooled stratum receives
+
+```text
+pooled_event_weight = combined_sig_sum / sum(events_r).
+```
+
+Consequently, the weights of all replicas together sum once—not once per
+replica—to the combined stratum cross section. The finalized weights file is
+the input to stratum-preserving OSG repacking and downstream event weighting.

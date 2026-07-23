@@ -20,7 +20,8 @@ import numpy as np
 
 PROTON_MASS_GEV = 0.93828
 PI0_MASS_GEV = 0.1349
-MANIFEST_SCHEMA = "aao-born-bin-conditional-v2"
+MANIFEST_SCHEMA = "aao-born-bin-conditional-v3"
+WEIGHTS_SCHEMA = "aao-born-bin-conditional-weights-v1"
 SAMPLING_MODE = 4
 
 
@@ -38,10 +39,7 @@ class Stratum:
 
     @property
     def identifier(self) -> str:
-        return (
-            f"bin_{self.flat_index:05d}_q{self.iq2:02d}_x{self.ixb:02d}_"
-            f"t{self.it:02d}_p{self.iphi:02d}"
-        )
+        return f"s{self.flat_index:05d}"
 
 
 def legacy_flat_index(
@@ -192,6 +190,7 @@ def prepare(args: argparse.Namespace) -> Path:
         raise ValueError(f"invalid flat stratum range [{args.bin_start}, {stop})")
 
     records: list[dict] = []
+    prepared_stratum_ids: set[str] = set()
     skipped = 0
     support_q2_minimum = q2_minimum if condition_phase_space else -math.inf
     support_w_minimum = (
@@ -223,53 +222,64 @@ def prepare(args: argparse.Namespace) -> Path:
             max(stratum.q2[0], q2_minimum) if condition_phase_space else stratum.q2[0],
             stratum.q2[1],
         )
-        seed = -abs(args.seed_base + stratum.flat_index)
-        input_name = f"{stratum.identifier}.inp"
-        input_path = input_dir / input_name
-        input_path.write_text(
-            generator_input(
-                stratum,
-                q2_bounds=q2_bounds,
-                beam_energy=beam_energy,
-                ep_min=ep_min,
-                events=args.events_per_bin,
-                physics_model=args.physics_model,
-                flag_ehel=args.flag_ehel,
-                npart=args.npart,
-                epirea=args.epirea,
-                fmcall=args.fmcall,
-                boso=args.boso,
-                seed=seed,
-                condition_phase_space=condition_phase_space,
-                w_minimum=w_minimum,
-                y_maximum=y_maximum,
-            ),
-            encoding="utf-8",
-        )
-        records.append(
-            {
-                "stratum_id": stratum.identifier,
-                "flat_index": stratum.flat_index,
-                "indices": {
-                    "iq2": stratum.iq2,
-                    "ixb": stratum.ixb,
-                    "it": stratum.it,
-                    "iphi": stratum.iphi,
-                },
-                "bounds": {
-                    "Q2": list(q2_bounds),
-                    "xB": list(stratum.xb),
-                    "minus_t": list(stratum.minus_t),
-                    "phi_deg": list(stratum.phi_deg),
-                },
-                "generation_domain_support": supported,
-                "phase_space_conditioned": condition_phase_space,
-                "events_requested": args.events_per_bin,
-                "seed": seed,
-                "input_file": str(input_path.relative_to(output)),
-                "output_stem": str(Path("outputs") / stratum.identifier / stratum.identifier),
-            }
-        )
+        prepared_stratum_ids.add(stratum.identifier)
+        for replica_index in range(1, args.replicas + 1):
+            generation_id = f"g{replica_index:04d}"
+            generation_stem = f"{stratum.identifier}__{generation_id}"
+            seed = -abs(args.seed_base + stratum.flat_index * 1000 + replica_index)
+            input_name = f"{generation_stem}.inp"
+            input_path = input_dir / input_name
+            input_path.write_text(
+                generator_input(
+                    stratum,
+                    q2_bounds=q2_bounds,
+                    beam_energy=beam_energy,
+                    ep_min=ep_min,
+                    events=args.events_per_bin,
+                    physics_model=args.physics_model,
+                    flag_ehel=args.flag_ehel,
+                    npart=args.npart,
+                    epirea=args.epirea,
+                    fmcall=args.fmcall,
+                    boso=args.boso,
+                    seed=seed,
+                    condition_phase_space=condition_phase_space,
+                    w_minimum=w_minimum,
+                    y_maximum=y_maximum,
+                ),
+                encoding="utf-8",
+            )
+            records.append(
+                {
+                    "stratum_id": stratum.identifier,
+                    "generation_id": generation_id,
+                    "replica_index": replica_index,
+                    "flat_index": stratum.flat_index,
+                    "indices": {
+                        "iq2": stratum.iq2,
+                        "ixb": stratum.ixb,
+                        "it": stratum.it,
+                        "iphi": stratum.iphi,
+                    },
+                    "bounds": {
+                        "Q2": list(q2_bounds),
+                        "xB": list(stratum.xb),
+                        "minus_t": list(stratum.minus_t),
+                        "phi_deg": list(stratum.phi_deg),
+                    },
+                    "generation_domain_support": supported,
+                    "phase_space_conditioned": condition_phase_space,
+                    "events_requested": args.events_per_bin,
+                    "seed": seed,
+                    "input_file": str(input_path.relative_to(output)),
+                    "output_stem": str(
+                        Path("outputs")
+                        / stratum.identifier
+                        / generation_id
+                        / generation_stem
+                    ),
+                }
+            )
 
     manifest = {
         "schema": MANIFEST_SCHEMA,
@@ -299,6 +309,7 @@ def prepare(args: argparse.Namespace) -> Path:
         ),
         "flat_order": "xB, Q2, phi, then minus_t fastest",
         "events_per_bin": args.events_per_bin,
+        "replicas_per_stratum": args.replicas,
         "physics_model": args.physics_model,
         "flag_ehel": args.flag_ehel,
         "npart": args.npart,
@@ -307,7 +318,8 @@ def prepare(args: argparse.Namespace) -> Path:
         "boso": args.boso,
         "support_samples": args.support_samples,
         "total_analysis_bins": len(all_strata),
-        "prepared_strata": len(records),
+        "prepared_strata": len(prepared_stratum_ids),
+        "prepared_generations": len(records),
         "unsupported_strata_skipped": skipped,
         "strata": records,
     }
@@ -355,10 +367,16 @@ def run(args: argparse.Namespace) -> Path:
     if manifest.get("schema") != MANIFEST_SCHEMA:
         raise ValueError(f"unsupported manifest schema: {manifest.get('schema')}")
     matches = [
-        record for record in manifest["strata"] if int(record["flat_index"]) == args.flat_index
+        record
+        for record in manifest["strata"]
+        if int(record["flat_index"]) == args.flat_index
+        and int(record["replica_index"]) == args.replica_index
     ]
     if len(matches) != 1:
-        raise ValueError(f"manifest has {len(matches)} records for flat index {args.flat_index}")
+        raise ValueError(
+            f"manifest has {len(matches)} records for flat index {args.flat_index}, "
+            f"replica {args.replica_index}"
+        )
     record = matches[0]
     root = manifest_path.parent
     input_path = root / record["input_file"]
@@ -424,6 +442,7 @@ def run(args: argparse.Namespace) -> Path:
     run_record = {
         **record,
         "schema": MANIFEST_SCHEMA,
+        "source_manifest": str(manifest_path),
         "sig_sum_microbarn": _float_field(norm, "sig_sum"),
         "events": actual_events,
         "event_overshoot": actual_events - int(record["events_requested"]),
@@ -436,6 +455,114 @@ def run(args: argparse.Namespace) -> Path:
     record_path = output_stem.with_suffix(".json")
     record_path.write_text(json.dumps(run_record, indent=2) + "\n", encoding="utf-8")
     return record_path
+
+
+def finalize(args: argparse.Namespace) -> Path:
+    manifest_path = args.manifest.resolve()
+    with manifest_path.open(encoding="utf-8") as source:
+        manifest = json.load(source)
+    if manifest.get("schema") != MANIFEST_SCHEMA:
+        raise ValueError(f"unsupported manifest schema: {manifest.get('schema')}")
+    root = manifest_path.parent
+    grouped: dict[str, list[tuple[dict, dict]]] = {}
+    for generation in manifest["strata"]:
+        run_path = (root / generation["output_stem"]).with_suffix(".json")
+        if not run_path.is_file():
+            raise FileNotFoundError(
+                f"missing completed generation record for {generation['stratum_id']} "
+                f"{generation['generation_id']}: {run_path}"
+            )
+        with run_path.open(encoding="utf-8") as source:
+            completed = json.load(source)
+        for key in ("stratum_id", "generation_id", "flat_index", "replica_index"):
+            if completed.get(key) != generation.get(key):
+                raise ValueError(f"{run_path} does not match manifest field {key}")
+        grouped.setdefault(generation["stratum_id"], []).append((generation, completed))
+
+    strata: list[dict] = []
+    for stratum_id, items in sorted(
+        grouped.items(), key=lambda item: int(item[1][0][0]["flat_index"])
+    ):
+        items.sort(key=lambda item: int(item[0]["replica_index"]))
+        reference = items[0][0]
+        for generation, _ in items[1:]:
+            for key in ("flat_index", "indices", "bounds", "phase_space_conditioned"):
+                if generation[key] != reference[key]:
+                    raise ValueError(f"replicas for {stratum_id} disagree on {key}")
+        total_events = sum(int(completed["events"]) for _, completed in items)
+        total_ntries = sum(int(completed["ntries"]) for _, completed in items)
+        if total_events <= 0 or total_ntries <= 0:
+            raise ValueError(f"{stratum_id} has nonpositive event or proposal totals")
+        combined_sig_sum = sum(
+            float(completed["sig_sum_microbarn"]) * int(completed["ntries"])
+            for _, completed in items
+        ) / total_ntries
+        replica_sigmas = np.asarray(
+            [float(completed["sig_sum_microbarn"]) for _, completed in items],
+            dtype=float,
+        )
+        generations: list[dict] = []
+        for generation, completed in items:
+            output_stem = root / generation["output_stem"]
+            lund_path = output_stem.with_suffix(".lund")
+            if not lund_path.is_file():
+                raise FileNotFoundError(f"missing LUND output: {lund_path}")
+            generations.append(
+                {
+                    "generation_id": generation["generation_id"],
+                    "replica_index": generation["replica_index"],
+                    "seed": generation["seed"],
+                    "events": int(completed["events"]),
+                    "ntries": int(completed["ntries"]),
+                    "sig_sum_microbarn": float(completed["sig_sum_microbarn"]),
+                    "lund_file": str(lund_path.relative_to(root)),
+                    "run_record": str(output_stem.with_suffix(".json").relative_to(root)),
+                    "normalization_file": str(
+                        output_stem.with_suffix(".norm").relative_to(root)
+                    ),
+                }
+            )
+        strata.append(
+            {
+                "stratum_id": stratum_id,
+                "flat_index": reference["flat_index"],
+                "indices": reference["indices"],
+                "bounds": reference["bounds"],
+                "phase_space_conditioned": reference["phase_space_conditioned"],
+                "replicas": len(items),
+                "total_events": total_events,
+                "total_ntries": total_ntries,
+                "combined_sig_sum_microbarn": combined_sig_sum,
+                "pooled_event_weight_microbarn": combined_sig_sum / total_events,
+                "replica_sig_sum_sem_microbarn": (
+                    float(np.std(replica_sigmas, ddof=1) / math.sqrt(replica_sigmas.size))
+                    if replica_sigmas.size >= 2
+                    else None
+                ),
+                "generations": generations,
+            }
+        )
+
+    weights = {
+        "schema": WEIGHTS_SCHEMA,
+        "source_manifest": str(manifest_path),
+        "source_manifest_sha256": _sha256(manifest_path),
+        "finalized_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "combination_method": "ntries_weighted_mean_sig_sum",
+        "event_weight_definition": "combined_sig_sum_microbarn/total_events",
+        "generator_revision": manifest["generator_revision"],
+        "analysis_config_sha256": manifest["analysis_config_sha256"],
+        "stratum_count": len(strata),
+        "generation_count": sum(len(item["generations"]) for item in strata),
+        "strata": strata,
+    }
+    output_path = (
+        args.output.resolve() if args.output is not None else root / "campaign_weights.json"
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(weights, indent=2) + "\n", encoding="utf-8")
+    _write_weights_tsv(output_path.with_suffix(".tsv"), strata)
+    return output_path
 
 
 def _validate_norm_record(norm: dict[str, str], record: dict) -> None:
@@ -592,7 +719,8 @@ def _t_limits_pi0(xb: np.ndarray, q2: np.ndarray) -> tuple[np.ndarray, np.ndarra
 
 def _write_tsv(path: Path, records: list[dict]) -> None:
     header = (
-        "flat_index\tstratum_id\tiq2\tixb\tit\tiphi\tq2_low\tq2_high\t"
+        "flat_index\tstratum_id\tgeneration_id\treplica_index\t"
+        "iq2\tixb\tit\tiphi\tq2_low\tq2_high\t"
         "xb_low\txb_high\tminus_t_low\tminus_t_high\tphi_low\tphi_high\t"
         "events_requested\tseed\tinput_file\toutput_stem\n"
     )
@@ -606,6 +734,8 @@ def _write_tsv(path: Path, records: list[dict]) -> None:
                 for value in (
                     record["flat_index"],
                     record["stratum_id"],
+                    record["generation_id"],
+                    record["replica_index"],
                     indices["iq2"],
                     indices["ixb"],
                     indices["it"],
@@ -625,6 +755,32 @@ def _write_tsv(path: Path, records: list[dict]) -> None:
     path.write_text("".join(rows), encoding="utf-8")
 
 
+def _write_weights_tsv(path: Path, strata: list[dict]) -> None:
+    rows = [
+        "stratum_id\tflat_index\treplicas\ttotal_events\ttotal_ntries\t"
+        "combined_sig_sum_microbarn\tpooled_event_weight_microbarn\t"
+        "replica_sig_sum_sem_microbarn\n"
+    ]
+    for stratum in strata:
+        rows.append(
+            "\t".join(
+                str(stratum[key])
+                for key in (
+                    "stratum_id",
+                    "flat_index",
+                    "replicas",
+                    "total_events",
+                    "total_ntries",
+                    "combined_sig_sum_microbarn",
+                    "pooled_event_weight_microbarn",
+                    "replica_sig_sum_sem_microbarn",
+                )
+            )
+            + "\n"
+        )
+    path.write_text("".join(rows), encoding="utf-8")
+
+
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -633,6 +789,7 @@ def _arguments() -> argparse.Namespace:
     prepare_parser.add_argument("--config", type=Path, required=True)
     prepare_parser.add_argument("--output", type=Path, required=True)
     prepare_parser.add_argument("--events-per-bin", type=int, default=10_000)
+    prepare_parser.add_argument("--replicas", type=int, default=1)
     prepare_parser.add_argument("--physics-model", type=int, default=5)
     prepare_parser.add_argument("--flag-ehel", type=int, choices=(0, 1), default=1)
     prepare_parser.add_argument("--npart", type=int, default=3)
@@ -654,8 +811,15 @@ def _arguments() -> argparse.Namespace:
     run_parser = subparsers.add_parser("run", help="execute one prepared stratum")
     run_parser.add_argument("manifest", type=Path)
     run_parser.add_argument("--flat-index", type=int, required=True)
+    run_parser.add_argument("--replica-index", type=int, default=1)
     run_parser.add_argument("--executable", type=Path, required=True)
     run_parser.add_argument("--overwrite", action="store_true")
+
+    finalize_parser = subparsers.add_parser(
+        "finalize", help="combine completed replicas into one weight per stratum"
+    )
+    finalize_parser.add_argument("manifest", type=Path)
+    finalize_parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
 
@@ -664,12 +828,19 @@ def main() -> None:
     if args.command == "prepare":
         if args.events_per_bin <= 0:
             raise ValueError("--events-per-bin must be positive")
+        if args.replicas <= 0 or args.replicas >= 1000:
+            raise ValueError("--replicas must satisfy 1 <= replicas < 1000")
         if args.fmcall <= 0.0:
             raise ValueError("--fmcall must be positive")
         path = prepare(args)
         print(f"Wrote {path}")
-    else:
+    elif args.command == "run":
+        if args.replica_index <= 0:
+            raise ValueError("--replica-index must be positive")
         path = run(args)
+        print(f"Wrote {path}")
+    else:
+        path = finalize(args)
         print(f"Wrote {path}")
 
 

@@ -52,6 +52,7 @@ class BinConditionalTests(unittest.TestCase):
                 config=config_path,
                 output=output,
                 events_per_bin=25,
+                replicas=1,
                 physics_model=1,
                 flag_ehel=1,
                 npart=3,
@@ -72,6 +73,7 @@ class BinConditionalTests(unittest.TestCase):
             self.assertEqual(manifest["sampling_mode"], 4)
             self.assertFalse(manifest["phase_space_conditioned"])
             self.assertEqual(manifest["prepared_strata"], 16)
+            self.assertEqual(manifest["prepared_generations"], 16)
             self.assertTrue((output / "analysis_config.json").is_file())
             self.assertEqual(len(manifest["analysis_config_sha256"]), 64)
 
@@ -81,9 +83,64 @@ class BinConditionalTests(unittest.TestCase):
             self.assertEqual(lines[11], "4")
             self.assertEqual(lines[15], "0 2 0.8")
             self.assertEqual(lines[16], "0 0 0 0 0")
+            self.assertEqual(first["stratum_id"], "s00000")
+            self.assertEqual(first["generation_id"], "g0001")
 
             with self.assertRaises(FileExistsError):
                 bin_conditional.prepare(args)
+
+    def test_finalize_pools_replica_cross_sections_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path = root / "analysis.json"
+            config_path.write_text(json.dumps(self._config()), encoding="utf-8")
+            output = root / "prepared"
+            prepare_args = argparse.Namespace(
+                config=config_path,
+                output=output,
+                events_per_bin=100,
+                replicas=2,
+                physics_model=1,
+                flag_ehel=1,
+                npart=3,
+                epirea=1,
+                fmcall=3.0,
+                boso=0,
+                seed_base=1000,
+                bin_start=0,
+                bin_stop=1,
+                support_samples=8,
+                include_unsupported=True,
+                condition_phase_space=False,
+                overwrite=False,
+            )
+            manifest_path = bin_conditional.prepare(prepare_args)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            values = [(100, 10, 8.0), (200, 30, 12.0)]
+            for generation, (events, ntries, sigma) in zip(manifest["strata"], values):
+                stem = output / generation["output_stem"]
+                stem.parent.mkdir(parents=True, exist_ok=True)
+                stem.with_suffix(".lund").write_text("placeholder\n", encoding="utf-8")
+                completed = {
+                    **generation,
+                    "events": events,
+                    "ntries": ntries,
+                    "sig_sum_microbarn": sigma,
+                }
+                stem.with_suffix(".json").write_text(
+                    json.dumps(completed), encoding="utf-8"
+                )
+
+            weights_path = bin_conditional.finalize(
+                argparse.Namespace(manifest=manifest_path, output=None)
+            )
+            weights = json.loads(weights_path.read_text(encoding="utf-8"))
+            stratum = weights["strata"][0]
+            self.assertEqual(weights["combination_method"], "ntries_weighted_mean_sig_sum")
+            self.assertEqual(stratum["stratum_id"], "s00000")
+            self.assertEqual(stratum["total_events"], 300)
+            self.assertEqual(stratum["combined_sig_sum_microbarn"], 11.0)
+            self.assertAlmostEqual(stratum["pooled_event_weight_microbarn"], 11.0 / 300)
 
     def test_kinematics_validation_enforces_selection(self) -> None:
         record = {
