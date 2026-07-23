@@ -25,5 +25,9 @@ phi_min phi_max   hadronic center-of-mass phi bounds in degrees
 
 Mode 4 additionally requires:
 
-W_min y_max
+condition_phase_space W_min y_max
 flat_index iq2 ixb it iphi
+
+Set condition_phase_space to 0 to generate the full rectangular bin (default
+for response production), or 1 to generate only its intersection with the
+configured Q2, W, and y phase space.

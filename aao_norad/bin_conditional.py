@@ -20,7 +20,7 @@ import numpy as np
 
 PROTON_MASS_GEV = 0.93828
 PI0_MASS_GEV = 0.1349
-MANIFEST_SCHEMA = "aao-born-bin-conditional-v1"
+MANIFEST_SCHEMA = "aao-born-bin-conditional-v2"
 SAMPLING_MODE = 4
 
 
@@ -113,7 +113,7 @@ def enumerate_strata(config: dict) -> list[Stratum]:
     return sorted(strata, key=lambda item: item.flat_index)
 
 
-def has_selected_physical_support(
+def has_generation_support(
     stratum: Stratum,
     *,
     beam_energy: float,
@@ -122,7 +122,7 @@ def has_selected_physical_support(
     y_maximum: float,
     samples: int = 32,
 ) -> bool:
-    """Numerically preflight whether a stratum intersects selected pi0 phase space."""
+    """Numerically preflight whether a stratum intersects the generation domain."""
     if samples <= 0:
         raise ValueError("support samples must be positive")
     q2_low = max(stratum.q2[0], q2_minimum)
@@ -166,6 +166,7 @@ def prepare(args: argparse.Namespace) -> Path:
     q2_minimum = float(phase_space.get("Q2_min", config["binning"]["Q2"][0]))
     w_minimum = float(phase_space["W_min"])
     y_maximum = float(phase_space["y_max"])
+    condition_phase_space = bool(args.condition_phase_space)
     if not (0.0 < y_maximum <= 1.0):
         raise ValueError("phase_space.y_max must satisfy 0 < y_max <= 1")
     if w_minimum <= PROTON_MASS_GEV + PI0_MASS_GEV:
@@ -192,22 +193,36 @@ def prepare(args: argparse.Namespace) -> Path:
 
     records: list[dict] = []
     skipped = 0
-    ep_min = max(0.001, beam_energy * (1.0 - y_maximum))
+    support_q2_minimum = q2_minimum if condition_phase_space else -math.inf
+    support_w_minimum = (
+        w_minimum
+        if condition_phase_space
+        else PROTON_MASS_GEV + PI0_MASS_GEV + 0.002
+    )
+    support_y_maximum = y_maximum if condition_phase_space else 1.0
+    ep_min = (
+        max(0.001, beam_energy * (1.0 - y_maximum))
+        if condition_phase_space
+        else 0.001
+    )
     for stratum in all_strata:
         if stratum.flat_index < args.bin_start or stratum.flat_index >= stop:
             continue
-        supported = has_selected_physical_support(
+        supported = has_generation_support(
             stratum,
             beam_energy=beam_energy,
-            q2_minimum=q2_minimum,
-            w_minimum=w_minimum,
-            y_maximum=y_maximum,
+            q2_minimum=support_q2_minimum,
+            w_minimum=support_w_minimum,
+            y_maximum=support_y_maximum,
             samples=args.support_samples,
         )
         if not supported and not args.include_unsupported:
             skipped += 1
             continue
-        q2_bounds = (max(stratum.q2[0], q2_minimum), stratum.q2[1])
+        q2_bounds = (
+            max(stratum.q2[0], q2_minimum) if condition_phase_space else stratum.q2[0],
+            stratum.q2[1],
+        )
         seed = -abs(args.seed_base + stratum.flat_index)
         input_name = f"{stratum.identifier}.inp"
         input_path = input_dir / input_name
@@ -225,6 +240,7 @@ def prepare(args: argparse.Namespace) -> Path:
                 fmcall=args.fmcall,
                 boso=args.boso,
                 seed=seed,
+                condition_phase_space=condition_phase_space,
                 w_minimum=w_minimum,
                 y_maximum=y_maximum,
             ),
@@ -246,7 +262,8 @@ def prepare(args: argparse.Namespace) -> Path:
                     "minus_t": list(stratum.minus_t),
                     "phi_deg": list(stratum.phi_deg),
                 },
-                "selected_physical_support": supported,
+                "generation_domain_support": supported,
+                "phase_space_conditioned": condition_phase_space,
                 "events_requested": args.events_per_bin,
                 "seed": seed,
                 "input_file": str(input_path.relative_to(output)),
@@ -259,7 +276,7 @@ def prepare(args: argparse.Namespace) -> Path:
         "generator": "aao_norad",
         "sampling_mode": SAMPLING_MODE,
         "sampling_description": (
-            "inverse-Q2 unweighted sampling conditional on one selected analysis bin"
+            "inverse-Q2 unweighted sampling conditional on one analysis bin"
         ),
         "analysis_config": str(config_path),
         "analysis_config_snapshot": config_snapshot.name,
@@ -274,6 +291,12 @@ def prepare(args: argparse.Namespace) -> Path:
             "W_min": w_minimum,
             "y_max": y_maximum,
         },
+        "phase_space_conditioned": condition_phase_space,
+        "generation_domain": (
+            "analysis_bin_intersection_phase_space"
+            if condition_phase_space
+            else "full_analysis_bin"
+        ),
         "flat_order": "xB, Q2, phi, then minus_t fastest",
         "events_per_bin": args.events_per_bin,
         "physics_model": args.physics_model,
@@ -307,6 +330,7 @@ def generator_input(
     fmcall: float,
     boso: int,
     seed: int,
+    condition_phase_space: bool,
     w_minimum: float,
     y_maximum: float,
 ) -> str:
@@ -318,7 +342,7 @@ def generator_input(
         f"{stratum.xb[0]:.12g} {stratum.xb[1]:.12g}\n"
         f"{stratum.minus_t[0]:.12g} {stratum.minus_t[1]:.12g}\n"
         f"{stratum.phi_deg[0]:.12g} {stratum.phi_deg[1]:.12g}\n"
-        f"{w_minimum:.12g} {y_maximum:.12g}\n"
+        f"{int(condition_phase_space)} {w_minimum:.12g} {y_maximum:.12g}\n"
         f"{stratum.flat_index} {stratum.iq2} {stratum.ixb} "
         f"{stratum.it} {stratum.iphi}\n"
     )
@@ -370,13 +394,15 @@ def run(args: argparse.Namespace) -> Path:
             raise RuntimeError("AAO completed without both .norm and .lund outputs")
         norm = _norm_fields(norm_path)
         _validate_norm_record(norm, record)
+        actual_events = _int_field(norm, "events")
         _validate_kinematics(
             work / "aao_norad.kin",
             record,
+            expected_events=actual_events,
             beam_energy=float(manifest["beam_energy"]),
             phase_space=manifest["phase_space"],
         )
-        _validate_lund_event_count(lund_path, _int_field(norm, "events"))
+        _validate_lund_event_count(lund_path, actual_events)
 
         for suffix, source_name in (
             (".lund", "aao_norad.lund"),
@@ -399,11 +425,13 @@ def run(args: argparse.Namespace) -> Path:
         **record,
         "schema": MANIFEST_SCHEMA,
         "sig_sum_microbarn": _float_field(norm, "sig_sum"),
-        "events": _int_field(norm, "events"),
+        "events": actual_events,
+        "event_overshoot": actual_events - int(record["events_requested"]),
         "ntries": _int_field(norm, "ntries"),
         "mcall_max": _int_field(norm, "mcall_max"),
+        "multiplicity_correction_used": _int_field(norm, "mcall_max") > 1,
         "event_weight_microbarn": _float_field(norm, "stratum_event_weight_microbarn"),
-        "proposal_efficiency": _int_field(norm, "events") / _int_field(norm, "ntries"),
+        "event_yield_per_proposal": actual_events / _int_field(norm, "ntries"),
     }
     record_path = output_stem.with_suffix(".json")
     record_path.write_text(json.dumps(run_record, indent=2) + "\n", encoding="utf-8")
@@ -414,6 +442,7 @@ def _validate_norm_record(norm: dict[str, str], record: dict) -> None:
     expected = {
         "sampling_mode": SAMPLING_MODE,
         "conditional_unweighted": 1,
+        "phase_space_conditioned": int(record["phase_space_conditioned"]),
         "stratum_flat_index": int(record["flat_index"]),
         "stratum_iq2": int(record["indices"]["iq2"]),
         "stratum_ixb": int(record["indices"]["ixb"]),
@@ -423,23 +452,20 @@ def _validate_norm_record(norm: dict[str, str], record: dict) -> None:
     for key, value in expected.items():
         if _int_field(norm, key) != value:
             raise RuntimeError(f"normalization metadata mismatch for {key}")
-    if _int_field(norm, "events") != int(record["events_requested"]):
-        raise RuntimeError("normalization event count does not match the manifest")
-    if _int_field(norm, "mcall_max") > 1:
-        raise RuntimeError(
-            "mcall_max exceeded 1; increase fmcall and rerun this stratum"
-        )
+    if _int_field(norm, "events") < int(record["events_requested"]):
+        raise RuntimeError("generator stopped before reaching the requested event count")
 
 
 def _validate_kinematics(
     path: Path,
     record: dict,
     *,
+    expected_events: int,
     beam_energy: float,
     phase_space: dict,
 ) -> None:
     kinematics = np.loadtxt(path, comments="#", ndmin=2)
-    if kinematics.shape != (int(record["events_requested"]), 7):
+    if kinematics.shape != (expected_events, 7):
         raise RuntimeError(f"unexpected kinematics sidecar shape {kinematics.shape}")
     expected_ids = np.arange(1, kinematics.shape[0] + 1)
     if not np.array_equal(kinematics[:, 0].astype(int), expected_ids):
@@ -455,12 +481,13 @@ def _validate_kinematics(
         tolerance = 2.0e-6 * max(1.0, abs(low), abs(high))
         if np.any(values < low - tolerance) or np.any(values > high + tolerance):
             raise RuntimeError(f"generated {name} lies outside its stratum bounds")
-    y = q2 / (2.0 * PROTON_MASS_GEV * beam_energy * xb)
-    w2 = PROTON_MASS_GEV**2 + q2 * (1.0 / xb - 1.0)
-    if np.any(y > float(phase_space["y_max"]) + 2.0e-6):
-        raise RuntimeError("generated event violates the configured y cut")
-    if np.any(w2 < float(phase_space["W_min"]) ** 2 - 2.0e-6):
-        raise RuntimeError("generated event violates the configured W cut")
+    if record["phase_space_conditioned"]:
+        y = q2 / (2.0 * PROTON_MASS_GEV * beam_energy * xb)
+        w2 = PROTON_MASS_GEV**2 + q2 * (1.0 / xb - 1.0)
+        if np.any(y > float(phase_space["y_max"]) + 2.0e-6):
+            raise RuntimeError("generated event violates the configured y cut")
+        if np.any(w2 < float(phase_space["W_min"]) ** 2 - 2.0e-6):
+            raise RuntimeError("generated event violates the configured W cut")
 
 
 def _validate_lund_event_count(path: Path, expected: int) -> None:
@@ -617,6 +644,11 @@ def _arguments() -> argparse.Namespace:
     prepare_parser.add_argument("--bin-stop", type=int)
     prepare_parser.add_argument("--support-samples", type=int, default=32)
     prepare_parser.add_argument("--include-unsupported", action="store_true")
+    prepare_parser.add_argument(
+        "--condition-phase-space",
+        action="store_true",
+        help="generate only the intersection with configured Q2, W, and y cuts",
+    )
     prepare_parser.add_argument("--overwrite", action="store_true")
 
     run_parser = subparsers.add_parser("run", help="execute one prepared stratum")

@@ -73,12 +73,15 @@ The modes are:
 Mode 4 requires two additional lines after the analysis bounds:
 
 ```text
-W_min y_max
+condition_phase_space W_min y_max
 flat_index iq2 ixb it iphi
 ```
 
-It applies the `W` and `y` selections during generation and writes the
-selection and bin identity into `aao_norad.norm`.
+With `condition_phase_space=0`, mode 4 generates the full rectangular bin; the
+configured `Q2`, `W`, and `y` values are retained as metadata but are not
+generation cuts. With `condition_phase_space=1`, it generates only the
+intersection of the bin and those phase-space cuts. The choice and bin identity
+are written to `aao_norad.norm`.
 
 For modes 1, 3, and 4, the generator reconstructs
 
@@ -127,10 +130,10 @@ Here each `Q2` denotes the full kinematic variable (Q^2). Mode 3 changes only
 the proposal efficiency; after acceptance-rejection, its globally unweighted
 events follow the same physical distribution as modes 1 and 2.
 
-Mode 4 uses the same proposal density and Jacobian as mode 3, but its rectangle
-is one analysis bin. Events are unweighted *within* a stratum. Different
-strata generally have different integrated cross sections, so when strata are
-combined the physical weight for every event from stratum `i` is
+Mode 4 uses the same proposal density and Jacobian as mode 3, but its proposal
+rectangle is one analysis bin. Events are unweighted *within* a stratum.
+Different strata generally have different integrated cross sections, so when
+strata are combined the physical weight for every event from stratum `i` is
 
 ```text
 w_i = sig_sum_i / N_i
@@ -140,9 +143,29 @@ This is also the weight to use when filling generated-bin and reconstructed-bin
 histograms for a response matrix. Migration is retained because an event keeps
 its source stratum from the manifest while its reconstructed bin is determined
 after detector simulation. Mode 4 supplies the response columns for truth
-events inside the selected analysis phase space; a global mode-3 or dedicated
-guard-region sample is still needed to estimate feed-in from outside that truth
-phase space and to perform an independent closure test.
+events inside the generated domain. Full-bin generation preserves events on
+both sides of the `W/y` boundary so downstream cuts can measure those
+migrations. Phase-space-conditioned generation is more efficient when those
+events are definitely unwanted, but a global mode-3 or dedicated guard-region
+sample is then needed to estimate feed-in and perform an independent closure
+test.
+
+AAO's acceptance step permits `mcall > 1`. If
+`r = signr/sigr_max`, it emits
+
+```text
+mcall = floor(r) + Bernoulli(r - floor(r))
+```
+
+events, so `E[mcall | r] = r` even when `r > 1`. The emitted records still have
+equal unit event weight; they are multiplicity copies of the same proposed hard
+kinematics, with independently generated rotation and decay variables.
+`mcall_max > 1` therefore indicates that the preliminary envelope was exceeded,
+not that the distribution correction failed. A large or frequent multiplicity
+does increase correlations and can overshoot the requested event count on the
+last proposal. Mode-4 normalization uses the actual emitted count in
+`sig_sum/events`; increasing `fmcall` remains useful when fewer duplicate
+kinematics are desired.
 
 Every run also writes `aao_norad.kin`, with one row per LUND event:
 
@@ -189,6 +212,10 @@ python3 bin_conditional.py prepare \
   --physics-model 5
 ```
 
+The default is full-bin generation. Add `--condition-phase-space` to restrict
+each job to the bin's intersection with the configured `Q2`, `W`, and `y`
+selection.
+
 After building `aao_norad` and configuring the MAID tables in the usual way,
 run one manifest entry with:
 
@@ -200,7 +227,7 @@ python3 bin_conditional.py run born_rgk_conditional/manifest.json \
 
 The `run` command is intended to be called once per farm array job. It checks
 the `.norm`, `.kin`, and LUND products before moving them into the stratum
-output directory. By default it rejects a run when `mcall_max > 1`; increase
-`fmcall` and regenerate that input rather than treating an envelope overflow
-as an ordinary unit-weight sample. Each output JSON records `sig_sum`,
-`event_weight_microbarn`, event count, attempt count, and proposal efficiency.
+output directory. Each output JSON records `sig_sum`,
+`event_weight_microbarn`, requested and actual event counts, any final event
+overshoot, `mcall_max`, whether the multiplicity correction was used, proposal
+count, and event yield per proposal.

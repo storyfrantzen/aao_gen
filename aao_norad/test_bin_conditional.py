@@ -63,20 +63,23 @@ class BinConditionalTests(unittest.TestCase):
                 bin_stop=None,
                 support_samples=8,
                 include_unsupported=True,
+                condition_phase_space=False,
                 overwrite=False,
             )
             manifest_path = bin_conditional.prepare(args)
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest["schema"], bin_conditional.MANIFEST_SCHEMA)
             self.assertEqual(manifest["sampling_mode"], 4)
+            self.assertFalse(manifest["phase_space_conditioned"])
             self.assertEqual(manifest["prepared_strata"], 16)
             self.assertTrue((output / "analysis_config.json").is_file())
             self.assertEqual(len(manifest["analysis_config_sha256"]), 64)
 
             first = manifest["strata"][0]
             lines = (output / first["input_file"]).read_text(encoding="utf-8").splitlines()
+            self.assertEqual(lines[6], "0.001 6.535")
             self.assertEqual(lines[11], "4")
-            self.assertEqual(lines[15], "2 0.8")
+            self.assertEqual(lines[15], "0 2 0.8")
             self.assertEqual(lines[16], "0 0 0 0 0")
 
             with self.assertRaises(FileExistsError):
@@ -85,6 +88,7 @@ class BinConditionalTests(unittest.TestCase):
     def test_kinematics_validation_enforces_selection(self) -> None:
         record = {
             "events_requested": 2,
+            "phase_space_conditioned": True,
             "bounds": {
                 "Q2": [1.0, 1.5],
                 "xB": [0.15, 0.25],
@@ -104,6 +108,7 @@ class BinConditionalTests(unittest.TestCase):
             bin_conditional._validate_kinematics(
                 path,
                 record,
+                expected_events=2,
                 beam_energy=6.535,
                 phase_space={"W_min": 2.0, "y_max": 0.8},
             )
@@ -113,9 +118,49 @@ class BinConditionalTests(unittest.TestCase):
                 bin_conditional._validate_kinematics(
                     path,
                     record,
+                    expected_events=2,
                     beam_energy=6.535,
                     phase_space={"W_min": 2.0, "y_max": 0.8},
                 )
+            rows[1, 1:5] = [1.49, 0.15, 0.20, 12.0]
+            np.savetxt(path, rows)
+            with self.assertRaisesRegex(RuntimeError, "y cut"):
+                bin_conditional._validate_kinematics(
+                    path,
+                    record,
+                    expected_events=2,
+                    beam_energy=6.535,
+                    phase_space={"W_min": 2.0, "y_max": 0.8},
+                )
+            record["phase_space_conditioned"] = False
+            bin_conditional._validate_kinematics(
+                path,
+                record,
+                expected_events=2,
+                beam_energy=6.535,
+                phase_space={"W_min": 2.0, "y_max": 0.8},
+            )
+
+    def test_multiplicity_correction_and_event_overshoot_are_valid(self) -> None:
+        record = {
+            "events_requested": 25,
+            "phase_space_conditioned": False,
+            "flat_index": 0,
+            "indices": {"iq2": 0, "ixb": 0, "it": 0, "iphi": 0},
+        }
+        norm = {
+            "sampling_mode": "4",
+            "conditional_unweighted": "1",
+            "phase_space_conditioned": "0",
+            "stratum_flat_index": "0",
+            "stratum_iq2": "0",
+            "stratum_ixb": "0",
+            "stratum_it": "0",
+            "stratum_iphi": "0",
+            "events": "27",
+            "mcall_max": "3",
+        }
+        bin_conditional._validate_norm_record(norm, record)
 
     @staticmethod
     def _config() -> dict:
