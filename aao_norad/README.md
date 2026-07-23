@@ -65,9 +65,22 @@ The modes are:
 - `3`: uniform sampling in `(1/Q2, xB, -t, phi*)`. This is the recommended
   mode for globally unweighted samples because it retains direct analysis
   bounds while preferentially proposing the low-`Q2` region where the cross
-  section is largest.
+  section is largest;
+- `4`: bin-conditional uniform sampling in `(1/Q2, xB, -t, phi*)`. This is the
+  high-statistics production mode for generating a fixed number of unweighted
+  Born events inside each analysis bin.
 
-For modes 1 and 3, the generator reconstructs
+Mode 4 requires two additional lines after the analysis bounds:
+
+```text
+W_min y_max
+flat_index iq2 ixb it iphi
+```
+
+It applies the `W` and `y` selections during generation and writes the
+selection and bin identity into `aao_norad.norm`.
+
+For modes 1, 3, and 4, the generator reconstructs
 
 ```text
 nu = Q2/(2 M xB)
@@ -114,6 +127,23 @@ Here each `Q2` denotes the full kinematic variable (Q^2). Mode 3 changes only
 the proposal efficiency; after acceptance-rejection, its globally unweighted
 events follow the same physical distribution as modes 1 and 2.
 
+Mode 4 uses the same proposal density and Jacobian as mode 3, but its rectangle
+is one analysis bin. Events are unweighted *within* a stratum. Different
+strata generally have different integrated cross sections, so when strata are
+combined the physical weight for every event from stratum `i` is
+
+```text
+w_i = sig_sum_i / N_i
+```
+
+This is also the weight to use when filling generated-bin and reconstructed-bin
+histograms for a response matrix. Migration is retained because an event keeps
+its source stratum from the manifest while its reconstructed bin is determined
+after detector simulation. Mode 4 supplies the response columns for truth
+events inside the selected analysis phase space; a global mode-3 or dedicated
+guard-region sample is still needed to estimate feed-in from outside that truth
+phase space and to perform an independent closure test.
+
 Every run also writes `aao_norad.kin`, with one row per LUND event:
 
 ```text
@@ -143,3 +173,34 @@ Each successful `aao_norad` run writes `aao_norad.norm` in addition to the LUND,
 `.kin`, `.out`, and `.sum` outputs. Use the `sig_sum` value from
 `aao_norad.norm` as the Born integrated cross section when normalizing
 generated-event histograms.
+
+## Bin-conditional Born production
+
+`bin_conditional.py` converts an analysis JSON configuration into one mode-4
+input per selected physical analysis bin. It snapshots the configuration and
+writes a manifest containing the bin bounds, indices, seed, generator revision,
+and output location:
+
+```bash
+python3 bin_conditional.py prepare \
+  --config /path/to/configs/analysis/rgk/6.535.json \
+  --output born_rgk_conditional \
+  --events-per-bin 100000 \
+  --physics-model 5
+```
+
+After building `aao_norad` and configuring the MAID tables in the usual way,
+run one manifest entry with:
+
+```bash
+python3 bin_conditional.py run born_rgk_conditional/manifest.json \
+  --flat-index 1440 \
+  --executable build/aao_norad
+```
+
+The `run` command is intended to be called once per farm array job. It checks
+the `.norm`, `.kin`, and LUND products before moving them into the stratum
+output directory. By default it rejects a run when `mcall_max > 1`; increase
+`fmcall` and regenerate that input rather than treating an envelope overflow
+as an ordinary unit-weight sample. Each output JSON records `sig_sum`,
+`event_weight_microbarn`, event count, attempt count, and proposal efficiency.

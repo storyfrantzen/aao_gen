@@ -47,6 +47,7 @@ c     and make a new version.
       real analysis_volume,xb,xb_min,xb_max,xbrng
       real minus_t,mt_min,mt_max,mtrng
       real phi_min,phi_max,phirng,q2rng_analysis
+      real conditional_w_min,conditional_y_max,analysis_y
       real q0cm,qcm,epicm,picm,tcm,cmden
       real myran,mm2, mpi0,mpip,mpi_s
       real ppx,ppy,ppz,px,py
@@ -68,6 +69,8 @@ c     and make a new version.
 
       integer seed_source
       integer sampling_mode,input_status
+      integer stratum_flat,stratum_iq2,stratum_ixb,stratum_it
+      integer stratum_iphi
       integer env_status, env_len
       integer boso
       integer phys,epirea
@@ -135,6 +138,7 @@ c       0 = legacy coordinates and full legacy domain
 c       1 = uniform Q2, xB, -t, phi analysis coordinates
 c       2 = legacy coordinates restricted to the same analysis bounds
 c       3 = uniform 1/Q2, xB, -t, phi analysis coordinates
+c       4 = bin-conditional uniform 1/Q2, xB, -t, phi coordinates
       sampling_mode = 0
       xb_min = 0.
       xb_max = 1.
@@ -142,6 +146,13 @@ c       3 = uniform 1/Q2, xB, -t, phi analysis coordinates
       mt_max = 100.
       phi_min = 0.
       phi_max = 360.
+      conditional_w_min = 0.
+      conditional_y_max = 1.
+      stratum_flat = -1
+      stratum_iq2 = -1
+      stratum_ixb = -1
+      stratum_it = -1
+      stratum_iphi = -1
       read(5,*,iostat=input_status) sampling_mode
       if (input_status .eq. 0 .and. sampling_mode .ne. 0) then
          read(5,*,iostat=input_status) xb_min,xb_max
@@ -151,8 +162,16 @@ c       3 = uniform 1/Q2, xB, -t, phi analysis coordinates
          read(5,*,iostat=input_status) phi_min,phi_max
          if (input_status .ne. 0) stop 'Missing phi sampling bounds'
       endif
-      if (sampling_mode .lt. 0 .or. sampling_mode .gt. 3) then
-         stop 'sampling_mode must be 0, 1, 2, or 3'
+      if (sampling_mode .eq. 4) then
+         read(5,*,iostat=input_status) conditional_w_min,
+     *      conditional_y_max
+         if (input_status .ne. 0) stop 'Missing conditional W/y cuts'
+         read(5,*,iostat=input_status) stratum_flat,stratum_iq2,
+     *      stratum_ixb,stratum_it,stratum_iphi
+         if (input_status .ne. 0) stop 'Missing conditional bin indices'
+      endif
+      if (sampling_mode .lt. 0 .or. sampling_mode .gt. 4) then
+         stop 'sampling_mode must be 0, 1, 2, 3, or 4'
       endif
       if (sampling_mode .ne. 0) then
          if (xb_min .le. 0. .or. xb_max .le. xb_min) then
@@ -164,6 +183,20 @@ c       3 = uniform 1/Q2, xB, -t, phi analysis coordinates
          if (phi_min .lt. 0. .or. phi_max .gt. 360. .or.
      *       phi_max .le. phi_min) then
             stop 'Invalid phi sampling bounds'
+         endif
+      endif
+      if (sampling_mode .eq. 4) then
+         if (conditional_w_min .le. 0.) then
+            stop 'Invalid conditional W minimum'
+         endif
+         if (conditional_y_max .le. 0. .or.
+     *       conditional_y_max .gt. 1.) then
+            stop 'Invalid conditional y maximum'
+         endif
+         if (stratum_flat .lt. 0 .or. stratum_iq2 .lt. 0 .or.
+     *       stratum_ixb .lt. 0 .or. stratum_it .lt. 0 .or.
+     *       stratum_iphi .lt. 0) then
+            stop 'Invalid conditional bin indices'
          endif
       endif
     
@@ -229,7 +262,7 @@ c       3 = uniform 1/Q2, xB, -t, phi analysis coordinates
       xbrng              = xb_max-xb_min
       mtrng              = mt_max-mt_min
       phirng             = (phi_max-phi_min)*pi/180.
-      if (sampling_mode .eq. 3) then
+      if (sampling_mode .eq. 3 .or. sampling_mode .eq. 4) then
          analysis_volume = 2.*pi*uq2rng*xbrng*mtrng*phirng
       else
          analysis_volume = 2.*pi*q2rng_analysis*xbrng*mtrng*phirng
@@ -314,6 +347,13 @@ c      if (boso.eq.1) call bos_ini(recname)
          write(12,*)' Analysis -t bounds:',mt_min,mt_max
          write(12,*)' Analysis phi bounds (deg):',phi_min,phi_max
       endif
+      if (sampling_mode .eq. 4) then
+         write(12,*)' Conditional W minimum:',conditional_w_min
+         write(12,*)' Conditional y maximum:',conditional_y_max
+         write(12,*)' Conditional flat/q2/xB/t/phi indices:',
+     *      stratum_flat,stratum_iq2,stratum_ixb,stratum_it,
+     *      stratum_iphi
+      endif
 
 c     Do a preliminary calculation to estimate the maximum value
 c     of the integrand
@@ -325,8 +365,9 @@ c     of the integrand
       if(flag_ehel.eq.1) ehel = 1
        
       do i=1,10000
-        if (sampling_mode .eq. 1 .or. sampling_mode .eq. 3) then
-          if (sampling_mode .eq. 3) then
+        if (sampling_mode .eq. 1 .or. sampling_mode .eq. 3 .or.
+     *      sampling_mode .eq. 4) then
+          if (sampling_mode .eq. 3 .or. sampling_mode .eq. 4) then
             uq2 = uq2_min+uq2rng*myran(idum)
             q2 = 1./uq2
           else
@@ -335,6 +376,10 @@ c     of the integrand
           xb = xb_min+xbrng*myran(idum)
           q0 = q2/(2.*mp*xb)
           ep = es-q0
+          if (sampling_mode .eq. 4) then
+            analysis_y = q0/es
+            if (analysis_y .gt. conditional_y_max) cycle
+          endif
         else
           uq2 = uq2_min+uq2rng*myran(idum)
           q2 = 1./uq2
@@ -354,6 +399,9 @@ c     of the integrand
         w2 = mp**2+2.*mp*q0-q2
         if (w2 .le. (wg+0.002)**2) cycle
         epw = sqrt(w2)
+        if (sampling_mode .eq. 4) then
+          if (epw .lt. conditional_w_min) cycle
+        endif
         q0cm = (w2-mp**2-q2)/(2.*epw)
         if (q0cm**2+q2 .le. 0.) cycle
         qcm = sqrt(q0cm**2+q2)
@@ -362,13 +410,14 @@ c     of the integrand
         picm = sqrt(epicm**2-mpi**2)
         cmden = 2.*qcm*picm
         if (cmden .le. 0.) cycle
-        if (sampling_mode .eq. 1 .or. sampling_mode .eq. 3) then
+        if (sampling_mode .eq. 1 .or. sampling_mode .eq. 3 .or.
+     *      sampling_mode .eq. 4) then
           minus_t = mt_min+mtrng*myran(idum)
           tcm = -minus_t
           csthcm = (tcm-mpi**2+q2+2.*q0cm*epicm)/cmden
           phicm = phi_min+(phi_max-phi_min)*myran(idum)
           if (abs(csthcm) .gt. 1.) cycle
-          if (sampling_mode .eq. 3) then
+          if (sampling_mode .eq. 3 .or. sampling_mode .eq. 4) then
             jacob = q2**3/(8.*mp*xb**2*es*ep*qcm*picm)
           else
             jacob = q2/(8.*mp*xb**2*es*ep*qcm*picm)
@@ -419,8 +468,9 @@ c   %%%%%%%%%%%%%%%%%%% Main Calculation  %%%%%%%%%%%%%%%%%%%%%%%
       ntries		= ntries+1
       if(flag_ehel.eq.1) ehel = get_spin(idum)
       es		= ebeam
-      if (sampling_mode .eq. 1 .or. sampling_mode .eq. 3) then
-         if (sampling_mode .eq. 3) then
+      if (sampling_mode .eq. 1 .or. sampling_mode .eq. 3 .or.
+     *    sampling_mode .eq. 4) then
+         if (sampling_mode .eq. 3 .or. sampling_mode .eq. 4) then
             uq2 = uq2_min+uq2rng*myran(idum)
             q2 = 1./uq2
          else
@@ -429,6 +479,10 @@ c   %%%%%%%%%%%%%%%%%%% Main Calculation  %%%%%%%%%%%%%%%%%%%%%%%
          xb = xb_min+xbrng*myran(idum)
          q0 = q2/(2.*mp*xb)
          ep = es-q0
+         if (sampling_mode .eq. 4) then
+            analysis_y = q0/es
+            if (analysis_y .gt. conditional_y_max) go to 20
+         endif
       else
          uq2 = uq2_min+uq2rng*myran(idum)
          q2 = 1./uq2
@@ -467,6 +521,9 @@ c   %%%%%%%%%%%%%%%%%%% Main Calculation  %%%%%%%%%%%%%%%%%%%%%%%
       epw		= sqrt(w2)
       
       if (epw .lt. wg+0.002)go to 20
+      if (sampling_mode .eq. 4) then
+         if (epw .lt. conditional_w_min) go to 20
+      endif
 
       q0cm = (w2-mp**2-q2)/(2.*epw)
       if (q0cm**2+q2 .le. 0.) go to 20
@@ -477,7 +534,8 @@ c   %%%%%%%%%%%%%%%%%%% Main Calculation  %%%%%%%%%%%%%%%%%%%%%%%
       cmden = 2.*qcm*picm
       if (cmden .le. 0.) go to 20
 
-      if (sampling_mode .eq. 1 .or. sampling_mode .eq. 3) then
+      if (sampling_mode .eq. 1 .or. sampling_mode .eq. 3 .or.
+     *    sampling_mode .eq. 4) then
          minus_t = mt_min+mtrng*myran(idum)
          tcm = -minus_t
          csthcm = (tcm-mpi**2+q2+2.*q0cm*epicm)/cmden
@@ -511,7 +569,7 @@ cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 28    if (sampling_mode .eq. 1) then
          jacob = q2/(8.*mp*xb**2*es*ep*qcm*picm)
-      else if (sampling_mode .eq. 3) then
+      else if (sampling_mode .eq. 3 .or. sampling_mode .eq. 4) then
          jacob = q2**3/(8.*mp*xb**2*es*ep*qcm*picm)
       else
          jacob = q2**2/(2.*es*ep)
@@ -723,7 +781,8 @@ c        if (boso.eq.1) call bos_out	! Pack the BOS banks and write out to file
         tries		= ntries
         sig_int		= events/tries
           
-        if (sampling_mode .eq. 1 .or. sampling_mode .eq. 3) then
+        if (sampling_mode .eq. 1 .or. sampling_mode .eq. 3 .or.
+     *      sampling_mode .eq. 4) then
           sig_int = sig_int*sigr_max*analysis_volume
           sig_sum = sig_tot*analysis_volume/tries
         else
@@ -758,7 +817,8 @@ c         electron phase space =2*pi*uq2rng*eprng
       events = nevent
       tries = ntries
       sig_int = events/tries
-      if (sampling_mode .eq. 1 .or. sampling_mode .eq. 3) then
+      if (sampling_mode .eq. 1 .or. sampling_mode .eq. 3 .or.
+     *    sampling_mode .eq. 4) then
          sig_int = sig_int*sigr_max*analysis_volume
          sig_sum = sig_tot*analysis_volume/tries
       else
@@ -816,6 +876,19 @@ c      if (boso.eq.1) call bos_end(recname)
          write(15,*)'minus_t_max=',mt_max
          write(15,*)'phi_min_deg=',phi_min
          write(15,*)'phi_max_deg=',phi_max
+      endif
+      if (sampling_mode .eq. 4) then
+         write(15,*)'conditional_unweighted=1'
+         write(15,*)'phase_space_Q2_min=',q2_min
+         write(15,*)'phase_space_W_min=',conditional_w_min
+         write(15,*)'phase_space_y_max=',conditional_y_max
+         write(15,*)'stratum_flat_index=',stratum_flat
+         write(15,*)'stratum_iq2=',stratum_iq2
+         write(15,*)'stratum_ixb=',stratum_ixb
+         write(15,*)'stratum_it=',stratum_it
+         write(15,*)'stratum_iphi=',stratum_iphi
+         write(15,*)'stratum_cross_section_sig_sum=',sig_sum
+         write(15,*)'stratum_event_weight_microbarn=',sig_sum/events
       endif
       close(unit=15)
       close(unit=12)
