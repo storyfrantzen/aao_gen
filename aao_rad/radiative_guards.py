@@ -1676,24 +1676,219 @@ def validate_guards(args: argparse.Namespace) -> dict:
     }
 
 
+def _aggregate_record_moments(records: Iterable[dict], key: str) -> Moment:
+    result = Moment()
+    for record in records:
+        metrics = record.get(key)
+        if not metrics:
+            continue
+        result.count += int(metrics["contributing_rows"])
+        result.total += float(metrics["sum_trial_contributions_microbarn"])
+        result.square_total += float(
+            metrics["sum_squared_trial_contributions_microbarn2"]
+        )
+        result.maximum = max(
+            result.maximum,
+            float(metrics["largest_trial_contribution_microbarn"]),
+        )
+    return result
+
+
+def _compact_metrics(moment: Moment, proposals: int) -> dict[str, object]:
+    metrics = _metrics(moment, proposals)
+    return {
+        "contributing_rows": metrics["contributing_rows"],
+        "cross_section_microbarn": metrics["cross_section_microbarn"],
+        "cross_section_sem_microbarn": metrics[
+            "cross_section_sem_microbarn"
+        ],
+        "cross_section_relative_standard_error": metrics[
+            "cross_section_relative_standard_error"
+        ],
+        "importance_effective_sample_size": metrics[
+            "importance_effective_sample_size"
+        ],
+        "largest_trial_contribution_microbarn": metrics[
+            "largest_trial_contribution_microbarn"
+        ],
+    }
+
+
+def _weighted_coverage(
+    records: list[dict],
+    *,
+    proposals: int,
+    total_key: str,
+    core_key: str,
+    tail_key: str,
+    expanded_key: str,
+) -> dict[str, object]:
+    total = _aggregate_record_moments(records, total_key)
+    core = _aggregate_record_moments(records, core_key)
+    tail = _aggregate_record_moments(records, tail_key)
+    expanded = _aggregate_record_moments(records, expanded_key)
+    return {
+        "contributing_strata": sum(
+            1
+            for record in records
+            if float(
+                record.get(total_key, {}).get(
+                    "sum_trial_contributions_microbarn", 0.0
+                )
+            )
+            > 0.0
+        ),
+        "total": _compact_metrics(total, proposals),
+        "core": _compact_metrics(core, proposals),
+        "tail": _compact_metrics(tail, proposals),
+        "one_more_dilation": _compact_metrics(expanded, proposals),
+        "cross_section_weighted_core_fraction": (
+            core.total / total.total if total.total > 0.0 else None
+        ),
+        "cross_section_weighted_tail_fraction": (
+            tail.total / total.total if total.total > 0.0 else None
+        ),
+        "cross_section_weighted_one_more_dilation_fraction": (
+            expanded.total / total.total if total.total > 0.0 else None
+        ),
+        "extra_cross_section_fraction_recovered_by_one_more_dilation": (
+            (expanded.total - core.total) / total.total
+            if total.total > 0.0
+            else None
+        ),
+    }
+
+
+def _material_coverage(
+    records: list[dict],
+    *,
+    proposals: int,
+    targets: tuple[float, ...] = (0.5, 0.9, 0.95, 0.99),
+) -> dict[str, object]:
+    contributing = [
+        record
+        for record in records
+        if float(
+            record["holdout_total"]["sum_trial_contributions_microbarn"]
+        )
+        > 0.0
+    ]
+    contributing.sort(
+        key=lambda record: -float(
+            record["holdout_total"]["sum_trial_contributions_microbarn"]
+        )
+    )
+    total = sum(
+        float(record["holdout_total"]["sum_trial_contributions_microbarn"])
+        for record in contributing
+    )
+    result: dict[str, object] = {}
+    for target in targets:
+        retained = 0.0
+        stop = 0
+        for stop, record in enumerate(contributing, 1):
+            retained += float(
+                record["holdout_total"][
+                    "sum_trial_contributions_microbarn"
+                ]
+            )
+            if retained >= target * total:
+                break
+        selected = contributing[:stop]
+        coverage = _weighted_coverage(
+            selected,
+            proposals=proposals,
+            total_key="holdout_total",
+            core_key="holdout_core",
+            tail_key="holdout_tail",
+            expanded_key="holdout_one_more_dilation",
+        )
+        result[f"top_{100.0 * target:g}_percent_cross_section"] = {
+            "strata": stop,
+            "actual_fraction_of_inside_cross_section": (
+                retained / total if total > 0.0 else None
+            ),
+            "minimum_stratum_cross_section_microbarn": (
+                float(
+                    selected[-1]["holdout_total"][
+                        "cross_section_microbarn"
+                    ]
+                )
+                if selected
+                else None
+            ),
+            "cross_section_weighted_core_fraction": coverage[
+                "cross_section_weighted_core_fraction"
+            ],
+            "cross_section_weighted_one_more_dilation_fraction": coverage[
+                "cross_section_weighted_one_more_dilation_fraction"
+            ],
+        }
+    return result
+
+
+def _channel_cross_section_fractions(records: list[dict]) -> dict[str, float]:
+    totals: dict[str, float] = {}
+    total_cross_section = 0.0
+    for record in records:
+        cross_section = float(
+            record["holdout_total"]["cross_section_microbarn"]
+        )
+        total_cross_section += cross_section
+        for channel, channel_fraction in record[
+            "channel_cross_section_fractions"
+        ].items():
+            totals[channel] = totals.get(channel, 0.0) + (
+                cross_section * float(channel_fraction)
+            )
+    return {
+        channel: value / total_cross_section
+        for channel, value in sorted(totals.items(), key=lambda item: int(item[0]))
+        if total_cross_section > 0.0
+    }
+
+
 def summarize_coverage(args: argparse.Namespace) -> dict:
     if args.limit < 0:
         raise GuardLearningError("--limit must be nonnegative")
     manifest = json.loads(args.manifest.resolve().read_text(encoding="utf-8"))
+    manifest_sha256 = hashlib.sha256(
+        args.manifest.resolve().read_bytes()
+    ).hexdigest()
+    training_records = list(manifest["strata"].values())
+    training_proposals = int(manifest["training"]["total_proposals"])
     summary = {
         "manifest_schema": manifest["schema"],
-        "manifest_sha256": hashlib.sha256(
-            args.manifest.resolve().read_bytes()
-        ).hexdigest(),
+        "manifest_sha256": manifest_sha256,
+        "analysis_selection": manifest["analysis_selection"],
+        "partition_axes": manifest["partition_definition"]["axes"],
         "training_replicas": manifest["training"]["replica_ids"],
         "training_global_cross_section_microbarn": manifest["training"][
             "global_observed"
         ]["cross_section_microbarn"],
+        "weighted_coverage": {
+            "training_inside_analysis_partition": _weighted_coverage(
+                training_records,
+                proposals=training_proposals,
+                total_key="training_total",
+                core_key="training_core",
+                tail_key="training_tail",
+                expanded_key="training_one_more_dilation",
+            )
+        },
         **manifest["learning"],
     }
     if args.validation:
         validation = json.loads(
             args.validation.resolve().read_text(encoding="utf-8")
+        )
+        if validation.get("manifest_sha256") != manifest_sha256:
+            raise GuardLearningError(
+                "validation artifact does not reference the supplied manifest"
+            )
+        validation_records = list(validation["strata"].values())
+        validation_proposals = int(
+            validation["validation"]["total_proposals"]
         )
         assessed = [
             (stratum_id, record)
@@ -1707,6 +1902,82 @@ def summarize_coverage(args: argparse.Namespace) -> dict:
                 item[0],
             ),
         )[: args.limit]
+        validation_weighted = _weighted_coverage(
+            validation_records,
+            proposals=validation_proposals,
+            total_key="holdout_total",
+            core_key="holdout_core",
+            tail_key="holdout_tail",
+            expanded_key="holdout_one_more_dilation",
+        )
+        by_training_status = {
+            status: _weighted_coverage(
+                [
+                    record
+                    for record in validation_records
+                    if record["training_status"] == status
+                ],
+                proposals=validation_proposals,
+                total_key="holdout_total",
+                core_key="holdout_core",
+                tail_key="holdout_tail",
+                expanded_key="holdout_one_more_dilation",
+            )
+            for status in (
+                "learned",
+                "learned_low_support",
+                "no_training_contribution",
+            )
+        }
+        by_coverage_result = {
+            label: _weighted_coverage(
+                [
+                    record
+                    for record in validation_records
+                    if record["coverage_passed"] is expected
+                ],
+                proposals=validation_proposals,
+                total_key="holdout_total",
+                core_key="holdout_core",
+                tail_key="holdout_tail",
+                expanded_key="holdout_one_more_dilation",
+            )
+            for label, expected in (("passed", True), ("failed", False))
+        }
+        training_inside = manifest["training"]["inside_analysis_partition"]
+        validation_inside = validation["validation"][
+            "inside_analysis_partition"
+        ]
+        summary["weighted_coverage"].update(
+            {
+                "validation_inside_analysis_partition": validation_weighted,
+                "inside_training_holdout_relative_difference": (
+                    (
+                        float(validation_inside["cross_section_microbarn"])
+                        - float(training_inside["cross_section_microbarn"])
+                    )
+                    / float(training_inside["cross_section_microbarn"])
+                    if float(training_inside["cross_section_microbarn"]) > 0.0
+                    else None
+                ),
+                "inside_training_holdout_difference_z_score": (
+                    _difference_z_score(
+                        float(training_inside["cross_section_microbarn"]),
+                        training_inside["cross_section_sem_microbarn"],
+                        float(validation_inside["cross_section_microbarn"]),
+                        validation_inside["cross_section_sem_microbarn"],
+                    )
+                ),
+                "validation_by_training_status": by_training_status,
+                "validation_by_coverage_result": by_coverage_result,
+                "validation_material_strata": _material_coverage(
+                    validation_records, proposals=validation_proposals
+                ),
+                "validation_radiative_channel_cross_section_fractions": (
+                    _channel_cross_section_fractions(validation_records)
+                ),
+            }
+        )
         summary.update(
             {
                 "validation_schema": validation["schema"],

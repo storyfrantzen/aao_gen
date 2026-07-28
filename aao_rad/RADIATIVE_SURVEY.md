@@ -194,6 +194,22 @@ python3 radiative_guards.py summarize-coverage \
     guard_rgk_iteration000_validation/guard_validation.json
 ```
 
+The summary retains the original per-stratum pass counts and also reports a
+`weighted_coverage` section. That section uses the exact fixed-trial
+cross-section contributions—not raw stratum counts—to provide:
+
+- training and held-out core and tail fractions;
+- fixed-trial cross sections, standard errors, and effective sample sizes;
+- coverage after one additional dilation step;
+- the inside-analysis training/validation difference and z-score;
+- held-out coverage separated by training-support and pass/fail status;
+- coverage among the strata carrying 50%, 90%, 95%, and 99% of the cross
+  section;
+- radiative-channel fractions.
+
+It also prints the frozen analysis selection and proposal partition and refuses
+to combine a validation artifact with a different manifest hash.
+
 The learner writes:
 
 - `guard_manifest.json` and its SHA-256 sidecar;

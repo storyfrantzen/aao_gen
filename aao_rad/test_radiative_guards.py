@@ -361,6 +361,59 @@ class WorkflowTests(unittest.TestCase):
                 summary["worst_holdout_core_fractions"][0]["stratum_id"],
                 "s00000",
             )
+            weighted = summary["weighted_coverage"]
+            self.assertAlmostEqual(
+                weighted["training_inside_analysis_partition"][
+                    "cross_section_weighted_core_fraction"
+                ],
+                10.0 / 14.0,
+            )
+            self.assertAlmostEqual(
+                weighted["validation_inside_analysis_partition"][
+                    "cross_section_weighted_core_fraction"
+                ],
+                0.8,
+            )
+            self.assertAlmostEqual(
+                weighted["validation_inside_analysis_partition"][
+                    "cross_section_weighted_one_more_dilation_fraction"
+                ],
+                1.0,
+            )
+            self.assertAlmostEqual(
+                weighted["validation_by_training_status"]["learned"][
+                    "total"
+                ]["cross_section_microbarn"],
+                0.1,
+            )
+            self.assertAlmostEqual(
+                weighted["validation_material_strata"][
+                    "top_90_percent_cross_section"
+                ]["cross_section_weighted_core_fraction"],
+                0.8,
+            )
+            self.assertEqual(
+                weighted[
+                    "validation_radiative_channel_cross_section_fractions"
+                ],
+                {"1": 1.0},
+            )
+            self.assertFalse(summary["analysis_selection"]["apply_y_max"])
+
+            report["manifest_sha256"] = "not-the-manifest-hash"
+            mismatched = validation_output / "mismatched_validation.json"
+            mismatched.write_text(json.dumps(report), encoding="utf-8")
+            with self.assertRaisesRegex(
+                radiative_guards.GuardLearningError,
+                "does not reference the supplied manifest",
+            ):
+                radiative_guards.summarize_coverage(
+                    argparse.Namespace(
+                        manifest=manifest_path,
+                        validation=mismatched,
+                        limit=1,
+                    )
+                )
 
     def test_training_replica_cannot_be_reused_for_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
