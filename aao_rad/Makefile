@@ -2,6 +2,8 @@ OBJ=  aao.o aao_rad.o cgln_amps.o daresbury.o dsigma.o dvmpw.o dvmpx.o fint.o he
 OBJC=  unixtime.o 
 
 #CERNLIBS =  -L/apps/cernlib/x86_64_rhel6_4.7.2/2005/lib  -lmathlib  -lpacklib 
+
+.PHONY: aao_rad clean test
  
 aao_rad : $(OBJ) $(OBJC)
 	mkdir -p build
@@ -14,6 +16,9 @@ $(OBJC) : %.o: %.c
 	gcc -c $< -o build/$@ 
 clean:
 	rm -f build/aao_rad $(addprefix build/, $(OBJ)) $(addprefix build/, $(OBJC))
+
+test: aao_rad
+	python3 -m unittest -v test_radiative_survey.py
 
 
 

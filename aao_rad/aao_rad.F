@@ -65,6 +65,7 @@ c     and make a new version.
       real epw
       real ep_min,ep_max,ep_test
       real ep_sav
+      real ep_out
       real*8 events
       real f
       real fkt
@@ -89,7 +90,6 @@ c     and make a new version.
       real phicm
       real phicm_max
       real phir
-      real px,py
       real q0
       real q2
       real q2_min,q2_max,q2max
@@ -99,7 +99,6 @@ c     and make a new version.
       real ran
       real reg1,reg2,reg3,reg4
       real rn1,rn2
-      real rotc,rots
       real rtest
       real s
       real s1
@@ -110,6 +109,7 @@ c     and make a new version.
       real sigma0
       real signr
       real sigr,sig_ratio
+      real sigr_observed
       real sigr_max
       real sigr1
       real*8 sig_tot,sig_sum
@@ -132,10 +132,27 @@ c     and make a new version.
       real uq2, uq2_min,uq2_max,uq2rng
       real w2
       real wreal, w_min_input
+      real wreal_h
+      real ppx_h,ppy_h,ppz_h,eprot_h
+      real q2_lep,xb_lep,w_lep
+      real q2_hard,xb_hard,minus_t_hard
+      real q2_obs,xb_obs,minus_t_obs,phi_obs,w_obs,y_obs
+      real r_u,r_ep
+      real vertex_fraction,incoming_loss_base
+      real incoming_loss_accept_test
+      real photon_side_base,photon_cosine_base,photon_phi_base
+      real hadron_cosine_base,hadron_phi_base
+      real outgoing_loss_base,outgoing_loss_accept_test
+      real incoming_loss_fraction,outgoing_loss_fraction
       real x1
       real x2
       real targs,targp,xs,eloss,gxs,xtest,ebeam,t_targ,bfac,r_targ,temp
       real*8 sig_int
+      real*8 analysis_volume
+      real*8 analysis_mp
+      real*8 survey_sig_internal_tot
+      real*8 survey_internal_contribution
+      real*8 survey_observed_contribution
       real hydrogen_rad, vertex_x, vertex_y, vertex_z, vz
 
       integer dismc(6,100)
@@ -149,6 +166,8 @@ c      integer iext
       integer jj
       integer mcall
       integer mcall_max
+      integer sampling_mode,input_status
+      integer candidate_status,coordinate_status,final_valid
       integer nprint,ntell,ntold
 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
       integer get_spin
@@ -157,6 +176,8 @@ cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
       integer*4 idum
       integer*8 ntries
+      integer*8 survey_ntrials,survey_seed,survey_replica
+      integer*8 survey_rows,survey_final_valid
       
       real cfac,asig
 
@@ -181,6 +202,7 @@ c     character*1 ich1
       character*13 file_sum
       character*13 file_norm
       character*13 file_bos
+      character*18 file_survey
       character*8 recname
       character*28  ctime
 
@@ -199,6 +221,7 @@ c     character*1 ich1
       DATA MP   /.93828/
       DATA MN   /.93957/
       DATA MEL  /.511E-3/
+      DATA analysis_mp /0.9382720813D0/
 
       data filerz   /'aao_rad.hbook'/
       data file_out /'aao_rad.out'/
@@ -206,6 +229,7 @@ c     character*1 ich1
       data file_sum /'aao_rad.sum'/
       data file_norm /'aao_rad.norm'/
       data file_bos /'aao_rad.bos'/
+      data file_survey /'aao_rad.survey.csv'/
       data ctime    /'                            '/
 
       do j=1,6
@@ -417,9 +441,55 @@ c
          print *, 'W min=', w_min_input
       endif
 c
+c     Optional backward-compatible sampling trailer.  Legacy input files end
+c     above and therefore retain sampling_mode=0.  Fixed-trial survey mode 1
+c     requires an exact proposal count, explicit nonzero seed, and replica ID.
+
+      sampling_mode=0
+      survey_ntrials=0
+      survey_seed=0
+      survey_replica=0
+      read(5,*,iostat=input_status)sampling_mode
+      if (input_status .lt. 0) sampling_mode=0
+      if (input_status .gt. 0) then
+         write(6,*)'Invalid optional sampling mode input'
+         stop 2
+      endif
+      if (sampling_mode .ne. 0 .and. sampling_mode .ne. 1) then
+         write(6,*)'sampling_mode must be 0 (legacy) or 1 (survey)'
+         stop 2
+      endif
+      if (sampling_mode .eq. 1) then
+         read(5,*,iostat=input_status)survey_ntrials
+         if (input_status .ne. 0 .or. survey_ntrials .le. 0) then
+            write(6,*)'Survey mode requires a positive fixed trial count'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)survey_seed
+         if (input_status .ne. 0 .or. survey_seed .eq. 0) then
+            write(6,*)'Survey mode requires an explicit nonzero seed'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)survey_replica
+         if (input_status .ne. 0 .or. survey_replica .lt. 0) then
+            write(6,*)'Survey mode requires a nonnegative replica ID'
+            stop 2
+         endif
+         if (epirea .ne. 1 .or. npart .ne. 4) then
+            write(6,*)'Survey mode currently requires pi0 and npart=4'
+            stop 2
+         endif
+         write(6,*)'Fixed-trial radiative survey mode:',survey_ntrials
+         write(6,*)'Explicit survey seed:',survey_seed
+         write(6,*)'Survey replica ID:',survey_replica
+      endif
+c
  1    mcall_max	= 0
       ntold	= 0
       events	= 0
+      survey_rows=0
+      survey_final_valid=0
+      survey_sig_internal_tot=0.
 
 c     Use the internal clock to initialize the random number generator
 
@@ -455,10 +525,14 @@ c     Use the internal clock to initialize the random number generator
       endif
  432  continue
       do i=1,ssize
-         seed_value = timevals(8) + 1000_8*timevals(7)
-     *      + 100000_8*timevals(6) + 10000000_8*timevals(5)
-     *      + 104729_8*job_seed + 1009_8*attempt_seed
-     *      + 7919_8*i
+         if (sampling_mode .eq. 1) then
+            seed_value = abs(survey_seed) + 7919_8*i
+         else
+            seed_value = timevals(8) + 1000_8*timevals(7)
+     *         + 100000_8*timevals(6) + 10000000_8*timevals(5)
+     *         + 104729_8*job_seed + 1009_8*attempt_seed
+     *         + 7919_8*i
+         endif
          sseed(i) = int(mod(abs(seed_value), 2147483647_8))
          if (sseed(i) .eq. 0) sseed(i) = i + 1
       enddo
@@ -486,6 +560,29 @@ c     filerz=aaoradgen-pi0-1.6-0811.rz.0, for example.
 
       open(unit=12,file=file_out)
       open(unit=13,file=lund_out)
+      if (sampling_mode .eq. 1) then
+         open(unit=16,file=file_survey,status='replace')
+         write(16,'(A)')'# schema=aao-rad-survey-v1'
+         write(16,'(A)')'replica,trial,final_valid,candidate_status,'
+     *   //'intreg,helicity,r_u,r_ep,u_gamma,channel_selector,'
+     *   //'vertex_fraction,incoming_loss_base,'
+     *   //'incoming_loss_accept_test,photon_side_base,'
+     *   //'photon_cosine_base,photon_phi_base,'
+     *   //'hadron_cosine_base,hadron_phi_base,'
+     *   //'outgoing_loss_base,outgoing_loss_accept_test,'
+     *   //'cos_theta_gamma,'
+     *   //'phi_gamma_deg,cos_theta_cm,phi_cm_deg,energy_in_vertex,'
+     *   //'energy_e_pre_external,energy_e_lund,energy_gamma,'
+     *   //'final_e_px,final_e_py,final_e_pz,final_e_energy,'
+     *   //'final_p_px,final_p_py,final_p_pz,final_p_energy,'
+     *   //'q2_leptonic,xb_leptonic,w_leptonic,q2_hard,xb_hard,'
+     *   //'w_hard,minus_t_hard,q2_observed,xb_observed,'
+     *   //'minus_t_observed,phi_observed_deg,w_observed,y_observed,'
+     *   //'integrand_internal,integrand_observed,'
+     *   //'trial_xsec_internal_microbarn,'
+     *   //'trial_xsec_observed_microbarn,rotation_deg,'
+     *   //'incoming_loss_fraction,outgoing_loss_fraction'
+      endif
 
 c     Initialize BOS
      
@@ -523,7 +620,12 @@ c     Let uek range from 0 to 1. Then ek will range from 0 and infinity.
 c     This requires a jacobian. Jacobian=1./(kexp*uek)=(1./kexp)exp(kexp*ek)
 
       kexp	= 5.
+      analysis_volume=(4.*pi)**2*(2.*pi*uq2rng*eprng)
 
+      if (sampling_mode .eq. 1)then
+         sigr_max=0.
+         go to 20
+      endif
       if (fmcall .eq. 0.)then
          write(6,*)' sigr_max from input data =',sigr_max
          write(12,*)' sigr_max from input data =',sigr_max
@@ -637,6 +739,8 @@ c     Use a Monte-Carlo to calculate a distribution of nmax events
 c     distributed according to the Mo-Tsai integrand.
       ehel = 0      
  20   continue
+      if (sampling_mode .eq. 1 .and.
+     *    ntries .ge. survey_ntrials) go to 50
       ntries	= ntries+1
       if(flag_ehel.eq.1) ehel = get_spin(idum)
 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
@@ -648,7 +752,8 @@ c     choose the interaction point.
       
 c     Change from units of r.l. to cm
       t_targ 	=  hydrogen_rad * t_targ / bfac 
-      targs	= t_targ*myran()
+      vertex_fraction=myran()
+      targs	= t_targ*vertex_fraction
 
 c     Change into proper coordinate system
       vertex_z	= vz + targs - t_targ / 2.0
@@ -672,8 +777,11 @@ c     Now calculate the radiation loss
       xtest	= myran()
       
       if (xtest.gt.gxs) go to 22
+      incoming_loss_base=xs
+      incoming_loss_accept_test=xtest
       
       es	= ebeam*(1.-eloss)
+      incoming_loss_fraction=1.-es/ebeam
       
 c     Cut off the incident energy at e_s=ebeam/4.
 
@@ -684,11 +792,13 @@ c     Cut off the incident energy at e_s=ebeam/4.
 
       uq2	= uq2_min+uq2rng*myran()
       q2	= 1./uq2
+      r_u	= (uq2-uq2_min)/uq2rng
 
 c     calculate the energy and momentum of the scattered electron,
 c     and calculate Q**2
 
       ep	= epmax-eprng*myran()
+      r_ep	= (epmax-ep)/eprng
       
 c     check to see if the scattered electron energy is below the
 c     detector threshold
@@ -792,6 +902,7 @@ c     calculate kinematic quantities needed for the Mo and Tsai calculation
       
       csran	= myran()
       rn1	= myran()
+      photon_side_base=rn1
       
       if (rn1 .gt. 0.5)then
         rn1=1.
@@ -800,6 +911,7 @@ c     calculate kinematic quantities needed for the Mo and Tsai calculation
       endif
       
       rn2	= myran()
+      photon_cosine_base=rn2
       delphi	= ps*cstk1*csrngb/pp/sqrt(1.-cst0**2)/sqrt(1.-cstk1**2)
       
       if (delphi .lt. pi/9.) delphi=pi/9.
@@ -812,30 +924,35 @@ c     calculate kinematic quantities needed for the Mo and Tsai calculation
          intreg	= 1
          cstk	= cstk1+(2.*rn2-1.)*csrngb
          mcfac	= csrngb /reg1
-         phik	= (myran()-0.5)*delphi
+         photon_phi_base=myran()
+         phik	= (photon_phi_base-0.5)*delphi
          mpfac	= delphi/2./pi
       elseif(csran .lt. reg2)then
          intreg	= 2
          cstk	= cstk2+(2.*rn2-1.)*csrngb
          mcfac	= csrngb /(reg2-reg1)
-         phik	= (myran()-0.5)*delphi
+         photon_phi_base=myran()
+         phik	= (photon_phi_base-0.5)*delphi
          mpfac	= delphi/2./pi
       elseif(csran .lt. reg3)then
          intreg	= 3
          cstk	= cstk1+rn1*(csrngb+rn2*(csrnge-csrngb))
          mcfac	= (csrnge-csrngb) /(reg3-reg2)
-         phik	= (myran()-0.5)*delphi
+         photon_phi_base=myran()
+         phik	= (photon_phi_base-0.5)*delphi
          mpfac	= delphi/2./pi
       elseif(csran .lt. reg4)then
          intreg	= 4
          cstk	= cstk2+rn1*(csrngb+rn2*(csrnge-csrngb))
          mcfac	= (csrnge-csrngb) /(reg4-reg3)
-         phik	= (myran()-0.5)*delphi
+         photon_phi_base=myran()
+         phik	= (photon_phi_base-0.5)*delphi
          mpfac	= delphi/2./pi
       else
          intreg	= 5
  45      cstk	= 2.*rn2-1.
-         phik	= 2.*pi*(myran()-0.5)
+         photon_phi_base=myran()
+         phik	= 2.*pi*(photon_phi_base-0.5)
          if (abs(cstk-cstk1) .lt. csrnge .or.
      &       abs(cstk-cstk2) .lt. csrnge) then
          if(abs(phik).lt. delphi/2.) go to 45
@@ -880,8 +997,10 @@ c     choose ek by making a change of variables
       
       if (ek .gt. ekmax)go to 20
 
-      csthcm	= -1.+2.*myran()
-      phicm	= 360.*myran()
+      hadron_cosine_base=myran()
+      hadron_phi_base=myran()
+      csthcm	= -1.+2.*hadron_cosine_base
+      phicm	= 360.*hadron_phi_base
       
 c********************************** Ek < Delta ****************************************      
 
@@ -1031,6 +1150,97 @@ c     Compare sigr to the sigr_max to determine whether to generate
 c     an event.
 
       sigr	= mcfac*mpfac*sigr
+
+c     Fixed-trial mode constructs exactly one post-external-loss candidate
+c     for every internally valid proposal.  It records the original proposal
+c     integrand and gives invalid final candidates zero observed contribution.
+
+      if (sampling_mode .eq. 1) then
+         ep_sav=ep
+         q2_lep=q2
+         w_lep=epw
+         xb_lep=0.
+         if (es-ep_sav .gt. 0.) then
+            xb_lep=q2_lep/(2.*mp*(es-ep_sav))
+         endif
+         wreal_h=wreal
+         ppx_h=ppx
+         ppy_h=ppy
+         ppz_h=ppz
+         eprot_h=eprot
+         q2_hard=mp**2+2.*mp*(es-ep_sav-ek)-wreal_h**2
+         xb_hard=0.
+         if (es-ep_sav-ek .gt. 0.) then
+            xb_hard=q2_hard/(2.*mp*(es-ep_sav-ek))
+         endif
+         minus_t_hard=ppx_h**2+ppy_h**2+ppz_h**2
+     *      -(real(analysis_mp)-eprot_h)**2
+
+         survey_sig_internal_tot=survey_sig_internal_tot+dble(sigr)
+         survey_internal_contribution=analysis_volume*dble(sigr)
+         survey_observed_contribution=0.
+         sigr_observed=0.
+         final_valid=0
+         candidate_status=0
+         coordinate_status=1
+         q2_obs=0.
+         xb_obs=0.
+         minus_t_obs=0.
+         phi_obs=0.
+         w_obs=0.
+         y_obs=0.
+         phir=0.
+         do jj=1,4
+            p(1,jj)=0.
+            p(2,jj)=0.
+         enddo
+
+         call build_final_candidate(ebeam,es,ep_sav,ep,ep_min,th0,
+     *      theta,ek,cstk,phik,mpi_s,csthcm,phicm,targp,delta,
+     *      ppx,ppy,ppz,eprot,ppix,ppiy,ppiz,epi,ekx,eky,ekz,
+     *      wreal,mm2,epw,phir,outgoing_loss_base,
+     *      outgoing_loss_accept_test,candidate_status)
+
+         ep_out=ep
+         outgoing_loss_fraction=1.-ep_out/ep_sav
+         if (candidate_status .eq. 0) then
+            call observed_analysis_coordinates(ebeam,analysis_mp,
+     *         q2_obs,xb_obs,minus_t_obs,phi_obs,w_obs,y_obs,
+     *         coordinate_status)
+            if (coordinate_status .eq. 0) then
+               final_valid=1
+               survey_final_valid=survey_final_valid+1
+               sigr_observed=sigr
+               sig_tot=sig_tot+dble(sigr_observed)
+               survey_observed_contribution=
+     *            analysis_volume*dble(sigr_observed)
+            else
+               candidate_status=3
+            endif
+         endif
+
+         survey_rows=survey_rows+1
+         write(16,9001)survey_replica,ntries,final_valid,
+     *      candidate_status,intreg,ehel,
+     *      r_u,r_ep,uek,csran,
+     *      vertex_fraction,incoming_loss_base,
+     *      incoming_loss_accept_test,photon_side_base,
+     *      photon_cosine_base,photon_phi_base,
+     *      hadron_cosine_base,hadron_phi_base,
+     *      outgoing_loss_base,outgoing_loss_accept_test,
+     *      cstk,phik*180./pi,csthcm,phicm,
+     *      es,ep_sav,ep_out,real(ek),
+     *      p(1,1),p(1,2),p(1,3),p(1,4),
+     *      p(2,1),p(2,2),p(2,3),p(2,4),
+     *      q2_lep,xb_lep,w_lep,
+     *      q2_hard,xb_hard,wreal_h,minus_t_hard,
+     *      q2_obs,xb_obs,minus_t_obs,phi_obs,w_obs,y_obs,
+     *      sigr,sigr_observed,survey_internal_contribution,
+     *      survey_observed_contribution,phir*180./pi,
+     *      incoming_loss_fraction,outgoing_loss_fraction
+         go to 30
+      endif
+
       sig_ratio	= sigr/sigr_max
       sig_tot	= sig_tot + sigr
       
@@ -1084,32 +1294,16 @@ c     If mcall .gt. 0 generate mcall n-tuple events
 
 c     Calculate the radiation loss for the electron leaving the target
 
- 222     xs	= myran()
-         eloss	= xs**(1./targp)
-         gxs	= 1.-eloss
-         xtest	= myran()
-         
-         if (xtest.gt.gxs)go to 222
-         
-         ep	= ep_sav*(1.-eloss)
+         call build_final_candidate(ebeam,es,ep_sav,ep,ep_min,th0,
+     *      theta,ek,cstk,phik,mpi_s,csthcm,phicm,targp,delta,
+     *      ppx,ppy,ppz,eprot,ppix,ppiy,ppiz,epi,ekx,eky,ekz,
+     *      wreal,mm2,epw,phir,outgoing_loss_base,
+     *      outgoing_loss_accept_test,candidate_status)
 
-c     correct the following section on Jan. 23, 1999
-
-         if (ep .lt. ep_min)then
+         if (candidate_status .eq. 1)then
             sig_tot = sig_tot-sigr_max
-            go to 24
          endif
-         
-c     end of correction
-
-         call missm(epirea,ebeam,es,ep,th0,ek,cstk,phik,mpi_s,
-     *  ppx,ppy,ppz,eprot,ppix,ppiy,ppiz,epi,ekx,eky,ekz,
-     *  csthcm,phicm,wreal,mm2)
-
-         if(mm2 .eq. 0. .or. ep .lt. ep_min)go to 24
-
-         w2	= mp**2+2*mp*(ebeam-ep)-2*es*ep*(1-cos(th0))+2.*mel**2
-         epw	= sqrt(w2)
+         if (candidate_status .ne. 0)go to 24
 
 c     Calculate the members of the n-tuple and ouput it to the rz file.
 
@@ -1154,76 +1348,6 @@ c         nevent	= nevent+1
            v(jj,2) = vertex_y
            v(jj,3) = vertex_z
          enddo
-         
-c     rotate all the momenentum by a random angle around the beam line
-
-         phir	= 2.*pi*myran()
-         rotc	= cos(phir)
-         rots	= sin(phir)
-          
-c     momentum of scattered electron:
-
-         px 	=  ep*sin(theta*pi/180.)
-         py 	=  0.
-         p(1,1) = px*rotc+py*rots
-         p(1,2) = py*rotc-px*rots
-         p(1,3) = ep*cos(theta*pi/180.)
-         p(1,4) = ep
-         
-c     momentum of charged hadron
-
-         if ((epirea .eq. 1).or.(epirea.eq.5)) then
-             p(2,1) = ppx*rotc+ppy*rots
-             p(2,2) = ppy*rotc-ppx*rots
-             p(2,3) = ppz
-             p(2,4) = eprot
-             
-c     momentum of scattered pion
-
-             if (npart .eq. 4)then
-                p(3,1) = ppix*rotc+ppiy*rots
-                p(3,2) = ppiy*rotc-ppix*rots
-                p(3,3) = ppiz
-                p(3,4) = epi
-c                print *,sqrt(p(3,4)**2-p(3,3)**2-p(3,2)**2-p(3,1)**2)
-             endif
-             
-         else
-         
-c     momentum of scattered pion
-
-             p(2,1) = ppix*rotc+ppiy*rots
-             p(2,2) = ppiy*rotc-ppix*rots
-             p(2,3) = ppiz
-             p(2,4) = epi
-             
-             if (npart .eq. 4)then
-                p(3,1) = ppx*rotc+ppy*rots
-                p(3,2) = ppy*rotc-ppx*rots
-                p(3,3) = ppz
-                p(3,4) = eprot
-             endif
-             
-         endif
-
-c     momentum of radiated photon
-
-         if (npart .eq. 4)then
-         
-c     suppress radiated photons when E-gamma is less than delta
-
-           if (ek .le. delta)then
-             p(4,1)=0.
-             p(4,2)=0.
-             p(4,3)=1.e-5
-             p(4,4)=1.e-5
-           else
-             p(4,1) = ekx*rotc+eky*rots
-             p(4,2) = eky*rotc-ekx*rots
-             p(4,3) = ekz
-             p(4,4) = ek
-             endif
-         endif
 *
 *   Cut of theta>16 deg applied. For e1-dvcs eta meson production.
 *   12/12/2011, Ivan Bedlinskiy
@@ -1322,9 +1446,34 @@ c     Close out the n-tuple file
 Clcs      call hrout(0,icycle,' ')
 Clcs      call hrend('aaoradgen')
 
+      if (sampling_mode .eq. 1)then
+         tries=ntries
+         events=0.
+         sig_int=0.
+         sig_sum=sig_tot*analysis_volume/tries
+         write(6,*)' Fixed-trial survey proposals =',ntries
+         write(6,*)' Internally valid survey rows =',survey_rows
+         write(6,*)' Valid final survey candidates =',
+     *      survey_final_valid
+         write(6,*)' Survey internal cross section =',
+     *      survey_sig_internal_tot*analysis_volume/tries,
+     *      ' micro-barns'
+         write(6,*)' Survey observed cross section =',sig_sum,
+     *      ' micro-barns'
+         write(12,*)' Fixed-trial survey proposals =',ntries
+         write(12,*)' Internally valid survey rows =',survey_rows
+         write(12,*)' Valid final survey candidates =',
+     *      survey_final_valid
+         write(12,*)' Survey internal cross section =',
+     *      survey_sig_internal_tot*analysis_volume/tries,
+     *      ' micro-barns'
+         write(12,*)' Survey observed cross section =',sig_sum,
+     *      ' micro-barns'
+      endif
 
       close(12)
       close(13)
+      if (sampling_mode .eq. 1)close(16)
 
       open(unit=14,file=file_sum)
       
@@ -1347,13 +1496,24 @@ Clcs      call hrend('aaoradgen')
       write(14,*)' Missing-mass squared cut at:',mm_cut
       write(14,*)' Integrated cross section =',sig_int,sig_sum
      *    ,' micro-barns'
-      write(14,*)' Beam time at Lum=1.0E34 =',events/sig_sum*1.E-4
-     *    ,' seconds'
+      if (sampling_mode .eq. 0)then
+         write(14,*)' Beam time at Lum=1.0E34 =',events/sig_sum*1.E-4
+     *      ,' seconds'
+      else
+         write(14,*)' Survey rows, final valid =',
+     *      survey_rows,survey_final_valid
+         write(14,*)' Survey internal cross section =',
+     *      survey_sig_internal_tot*analysis_volume/tries
+      endif
       write(14,*)' Elapsed CPU time = ',t_elapse/60,' minutes'
-      write(14,*)' CPU time/event = ', t_elapse/nevent,' sec'
+      if (sampling_mode .eq. 0 .and. nevent .gt. 0)then
+         write(14,*)' CPU time/event = ', t_elapse/nevent,' sec'
+      endif
 
       open(unit=15,file=file_norm)
       write(15,*)'generator=aao_rad'
+      write(15,*)'sampling_mode=',sampling_mode
+      write(15,*)'fixed_trial_survey=',merge(1,0,sampling_mode.eq.1)
       write(15,*)'integrated_cross_section_units=micro-barns'
       write(15,*)'sig_int=',sig_int
       write(15,*)'sig_sum=',sig_sum
@@ -1372,6 +1532,20 @@ Clcs      call hrend('aaoradgen')
       write(15,*)'th_opt=',th_opt
       write(15,*)'res_opt=',res_opt
       write(15,*)'fmcall=',fmcall
+      if (sampling_mode .eq. 1)then
+         write(15,*)'survey_schema=aao-rad-survey-v1'
+         write(15,*)'survey_file=',file_survey
+         write(15,*)'survey_seed=',survey_seed
+         write(15,*)'survey_replica=',survey_replica
+         write(15,*)'survey_ntrials_requested=',survey_ntrials
+         write(15,*)'survey_rows=',survey_rows
+         write(15,*)'survey_final_valid=',survey_final_valid
+         write(15,*)'survey_phase_volume=',analysis_volume
+         write(15,*)'survey_internal_sig_sum=',
+     *      survey_sig_internal_tot*analysis_volume/tries
+         write(15,*)'survey_observed_sig_sum=',sig_sum
+         write(15,*)'survey_emits_lund=0'
+      endif
       close(unit=15)
 
       write(14,1425)reg1,reg2-reg1,reg3-reg2, reg4-reg3,1.-reg4
@@ -1382,6 +1556,7 @@ Clcs      call hrend('aaoradgen')
       enddo
 
  1410 format(' Distribution of mcall values, region', i2 /10(1x,10i7/))
+ 9001 format(I0,5(',',I0),50(',',ES24.16E3))
 
       close(14)
 Cvpk      CALL bos_end(recname)
@@ -1391,6 +1566,212 @@ Cvpk      CALL bos_end(recname)
        write(6,*)' END OF LOOP'
       stop
       end
+
+c   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+      subroutine build_final_candidate(ebeam,es,ep_pre,ep_out,ep_min,
+     * th0,theta,ephot,cstk,phik,mpi_s,csthcm,phicm,targp,delta,
+     * ppx,ppy,ppz,eprot,ppix,ppiy,ppiz,epi,ekx,eky,ekz,
+     * wreal,mm2,epw,phir,outgoing_loss_base,
+     * outgoing_loss_accept_test,status)
+
+c     Construct the exact post-outgoing-external-loss candidate used for
+c     legacy LUND output.  Survey mode calls the same routine before observed
+c     coordinate classification so the candidate definitions cannot drift.
+c
+c     status=0: valid final candidate
+c     status=1: final electron below the configured energy threshold
+c     status=2: no physical final hadronic candidate
+
+      implicit none
+
+#include "mc.inc"
+
+      COMMON/ALPHA/ ALPHA,PI,MP,MN,MPI,MEL,WG,EPIREA,TH_OPT,RES_OPT
+
+      real*8 alpha,pi,mp,mn,mpi,mel,wg
+      real*8 es,ep_out,ephot,delta
+      real ebeam,ep_pre,ep_min,th0,theta,cstk,phik,mpi_s
+      real csthcm,phicm,targp
+      real ppx,ppy,ppz,eprot,ppix,ppiy,ppiz,epi
+      real ekx,eky,ekz,wreal,mm2,epw,phir
+      real xs,eloss,gxs,xtest
+      real outgoing_loss_base,outgoing_loss_accept_test
+      real w2,rotc,rots,px,py
+      real myran
+      integer epirea,th_opt,res_opt,status
+
+      status=0
+
+ 222  xs=myran()
+      eloss=xs**(1./targp)
+      gxs=1.-eloss
+      xtest=myran()
+      if (xtest .gt. gxs)go to 222
+      outgoing_loss_base=xs
+      outgoing_loss_accept_test=xtest
+
+      ep_out=ep_pre*(1.-eloss)
+      if (ep_out .lt. ep_min)then
+         status=1
+         return
+      endif
+
+      call missm(epirea,ebeam,es,ep_out,th0,ephot,cstk,phik,mpi_s,
+     * ppx,ppy,ppz,eprot,ppix,ppiy,ppiz,epi,ekx,eky,ekz,
+     * csthcm,phicm,wreal,mm2)
+
+      if (mm2 .eq. 0. .or. ep_out .lt. ep_min)then
+         status=2
+         return
+      endif
+
+      w2=mp**2+2*mp*(ebeam-ep_out)
+     *   -2*es*ep_out*(1-cos(th0))+2.*mel**2
+      epw=sqrt(w2)
+
+c     Rotate all momenta by one common random angle around the beam line.
+
+      phir=2.*pi*myran()
+      rotc=cos(phir)
+      rots=sin(phir)
+
+      px=ep_out*sin(theta*pi/180.)
+      py=0.
+      p(1,1)=px*rotc+py*rots
+      p(1,2)=py*rotc-px*rots
+      p(1,3)=ep_out*cos(theta*pi/180.)
+      p(1,4)=ep_out
+
+      if ((epirea .eq. 1).or.(epirea.eq.5)) then
+         p(2,1)=ppx*rotc+ppy*rots
+         p(2,2)=ppy*rotc-ppx*rots
+         p(2,3)=ppz
+         p(2,4)=eprot
+
+         if (npart .eq. 4)then
+            p(3,1)=ppix*rotc+ppiy*rots
+            p(3,2)=ppiy*rotc-ppix*rots
+            p(3,3)=ppiz
+            p(3,4)=epi
+         endif
+      else
+         p(2,1)=ppix*rotc+ppiy*rots
+         p(2,2)=ppiy*rotc-ppix*rots
+         p(2,3)=ppiz
+         p(2,4)=epi
+
+         if (npart .eq. 4)then
+            p(3,1)=ppx*rotc+ppy*rots
+            p(3,2)=ppy*rotc-ppx*rots
+            p(3,3)=ppz
+            p(3,4)=eprot
+         endif
+      endif
+
+      if (npart .eq. 4)then
+         if (ephot .le. delta)then
+            p(4,1)=0.
+            p(4,2)=0.
+            p(4,3)=1.e-5
+            p(4,4)=1.e-5
+         else
+            p(4,1)=ekx*rotc+eky*rots
+            p(4,2)=eky*rotc-ekx*rots
+            p(4,3)=ekz
+            p(4,4)=ephot
+         endif
+      endif
+
+      return
+      end
+
+c   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+      subroutine observed_analysis_coordinates(ebeam,analysis_mp,
+     * q2_obs,xb_obs,minus_t_obs,phi_obs,w_obs,y_obs,status)
+
+c     Reproduce the analysis coordinate convention from final generator
+c     particles: nominal beam plus the post-external-loss LUND electron and
+c     proton.  The dedicated analysis proton mass is passed explicitly.
+
+      implicit none
+
+#include "mc.inc"
+
+      real ebeam,q2_obs,xb_obs,minus_t_obs,phi_obs,w_obs,y_obs
+      real*8 analysis_mp
+      real*8 ex,ey,ez,ee,pxp,pyp,pzp,epr
+      real*8 qx,qy,qz,q0,qnorm2,qnorm
+      real*8 lnx,lny,lnz,hnx,hny,hnz,lnorm,hnorm
+      real*8 cx,cy,cz,cosphi,sinphi,w2_obs,pi_local
+      integer status
+
+      status=1
+      q2_obs=0.
+      xb_obs=0.
+      minus_t_obs=0.
+      phi_obs=0.
+      w_obs=0.
+      y_obs=0.
+
+      ex=dble(p(1,1))
+      ey=dble(p(1,2))
+      ez=dble(p(1,3))
+      ee=dble(p(1,4))
+      pxp=dble(p(2,1))
+      pyp=dble(p(2,2))
+      pzp=dble(p(2,3))
+      epr=dble(p(2,4))
+
+      q0=dble(ebeam)-ee
+      qx=-ex
+      qy=-ey
+      qz=dble(ebeam)-ez
+      qnorm2=qx*qx+qy*qy+qz*qz
+      q2_obs=real(qnorm2-q0*q0)
+      if (q0 .le. 0.D0 .or. q2_obs .le. 0.)return
+
+      xb_obs=real(dble(q2_obs)/(2.D0*analysis_mp*q0))
+      y_obs=real(q0/dble(ebeam))
+      w2_obs=analysis_mp**2+2.D0*analysis_mp*q0-dble(q2_obs)
+      if (w2_obs .le. 0.D0)return
+      w_obs=real(sqrt(w2_obs))
+
+      minus_t_obs=real(pxp*pxp+pyp*pyp+pzp*pzp
+     *   -(analysis_mp-epr)**2)
+
+c     Lepton normal = beam x electron.
+
+      lnx=-dble(ebeam)*ey
+      lny=dble(ebeam)*ex
+      lnz=0.D0
+
+c     Hadron normal = proton x q.
+
+      hnx=pyp*qz-pzp*qy
+      hny=pzp*qx-pxp*qz
+      hnz=pxp*qy-pyp*qx
+      lnorm=sqrt(lnx*lnx+lny*lny+lnz*lnz)
+      hnorm=sqrt(hnx*hnx+hny*hny+hnz*hnz)
+      qnorm=sqrt(qnorm2)
+      if (lnorm .le. 0.D0 .or. hnorm .le. 0.D0 .or.
+     *    qnorm .le. 0.D0)return
+
+      cosphi=(lnx*hnx+lny*hny+lnz*hnz)/(lnorm*hnorm)
+      cx=lny*hnz-lnz*hny
+      cy=lnz*hnx-lnx*hnz
+      cz=lnx*hny-lny*hnx
+      sinphi=(qx*cx+qy*cy+qz*cz)/(qnorm*lnorm*hnorm)
+      pi_local=acos(-1.D0)
+      phi_obs=real(atan2(sinphi,cosphi)*180.D0/pi_local)
+      if (phi_obs .lt. 0.)phi_obs=phi_obs+360.
+
+      status=0
+      return
+      end
+
+c   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
       real function sigma(ek,Tk,epcos,epphi,ehel)
 

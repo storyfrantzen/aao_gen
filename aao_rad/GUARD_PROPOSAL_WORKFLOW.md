@@ -1093,6 +1093,19 @@ not sufficient.
 - Add deterministic fixed-trial survey runs.
 - Record proposal, hard, final, and weight information.
 
+Implemented on this development branch:
+
+- radiative run-control mode `0` retains legacy unweighted generation;
+- diagnostic mode `1` runs the unrestricted fixed-trial survey;
+- `build_final_candidate` is shared by the legacy and survey paths;
+- `aao-rad-survey-v1` records proposal, hard, final-particle, observed, and
+  cross-section fields;
+- `radiative_survey.py` runs surveys and independently validates their
+  normalization and final-particle coordinate parity.
+
+See `RADIATIVE_SURVEY.md` for commands and exact output semantics. Mode `4`
+remains reserved for the later bin-conditional production implementation.
+
 ## Milestone 2: Python guard learner
 
 Add a workflow with conceptual commands such as:
