@@ -122,3 +122,116 @@ different explicit seed. Keep the trial count and all legacy physics inputs
 fixed, change only the seed, and write each replica to a separate directory.
 Repeating a run with the same compiler, executable, input, trial count, and
 seed should reproduce the survey CSV byte for byte.
+
+## Milestone 2: learn and validate guards
+
+`radiative_guards.py` consumes survey directories without loading their full
+CSVs into memory. It uses the configured observed `(Q2, xB, -t, phi)` bins,
+applies the configured observed `Q2` and `W` selection, and aggregates
+**cross-section contribution**, its square, and its maximum by proposal cell
+and radiative channel. By default, `y_observed` is recorded but no lower or
+upper `y` cut is applied.
+
+The recommended split for the five RGK pilot replicas is:
+
+- replicas `0`, `1`, and `2`: training;
+- replicas `3` and `4`: independent held-out validation.
+
+From `aao_rad`, learn iteration zero with:
+
+```bash
+python3 radiative_guards.py learn-guards \
+  --config ../../../configs/analysis/rgk/6.535.json \
+  --survey \
+    survey_rgk_replica000 \
+    survey_rgk_replica001 \
+    survey_rgk_replica002 \
+  --generator-revision 54f5ba8d59b86b8cabb2229e5c2cf2be5de1ff00 \
+  --output guard_rgk_iteration000
+```
+
+The explicit revision above is the milestone-1 commit that produced the five
+surveys discussed in this study. For a new campaign, replace it with the
+revision actually used to build the surveyed executable. If the option is
+omitted, the learner records the current checkout but marks that provenance as
+an assumption.
+
+Once the RGK upper-`y` selection is finalized, it can be enabled explicitly
+with `--apply-y-max`. That reads `phase_space.y_max` from the analysis
+configuration and records the active value in the frozen manifest. Held-out
+validation always inherits the manifest's selection policy; it cannot
+silently introduce or remove a `y` cut.
+
+The default proposal partition is deliberately modest:
+
+```text
+r_u=8, r_ep=8, u_gamma=6,
+hadron_cosine_base=6, hadron_phi_base=8
+```
+
+`intreg` is always kept separate. `hadron_phi_base` is periodic, so dilation
+wraps across its zero/one boundary. Photon-angle and external-loss base
+variables remain unrestricted in this first guard. This preserves their full
+legacy support while avoiding an excessively sparse initial grid.
+
+Validate the frozen manifest only on replicas that were not used to learn it:
+
+```bash
+python3 radiative_guards.py validate-guards \
+  --manifest guard_rgk_iteration000/guard_manifest.json \
+  --survey \
+    survey_rgk_replica003 \
+    survey_rgk_replica004 \
+  --output guard_rgk_iteration000_validation
+```
+
+Print a compact campaign summary with:
+
+```bash
+python3 radiative_guards.py summarize-coverage \
+  --manifest guard_rgk_iteration000/guard_manifest.json \
+  --validation \
+    guard_rgk_iteration000_validation/guard_validation.json
+```
+
+The learner writes:
+
+- `guard_manifest.json` and its SHA-256 sidecar;
+- `training_coverage.csv`, with one row for every configured analysis stratum;
+- `training_cells.csv`, preserving `S`, `S2`, and `M` for every occupied
+  stratum/channel/proposal cell.
+
+The validator writes:
+
+- `guard_validation.json` and its SHA-256 sidecar;
+- `validation_coverage.csv`, covering strata seen in training or validation;
+- `validation_cells.csv`, labeling every occupied held-out cell as seed, core,
+  one-more-dilation, or tail.
+
+Each CSV also receives its own SHA-256 sidecar.
+
+Output directories must not already exist. This is intentional: learned
+manifests are immutable campaign inputs, and a later iteration must receive a
+new directory and iteration number.
+
+Each stratum's core is stored compactly as a union of weighted seed cells plus
+an explicit number of axis-neighbor dilation steps. The complement of that
+derived core is the complete legacy proposal tail, and the manifest assigns it
+a nonzero mixture probability. Sparse strata are labeled
+`learned_low_support`; they are not silently treated as physically empty.
+
+The validator reports training and held-out core fractions, tail fractions,
+fixed-trial cross sections and standard errors, importance-sampling effective
+sample sizes, radiative-channel fractions, the largest tail cell, and the
+fraction obtained after one additional dilation step. It also reports the
+training-versus-holdout cross-section difference in combined-standard-error
+units. `summarize-coverage` lists the lowest-coverage strata first.
+
+The validation command exits with status `2` when the configured held-out
+coverage threshold is not met. That means the proposed guard needs another
+learning iteration; it does not mean that the survey files or cross-section
+calculation failed.
+
+This is still a learning artifact: `production_ready` is false. The manifest
+does not alter radiative sampling or LUND output until milestone 3 implements
+the exact core-plus-tail proposal correction and unweighting.

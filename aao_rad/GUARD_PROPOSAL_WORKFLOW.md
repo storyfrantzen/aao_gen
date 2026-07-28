@@ -1127,6 +1127,24 @@ The learner should:
 - dilate learned cells;
 - write immutable guard manifests.
 
+Implemented on this development branch:
+
+- `radiative_guards.py learn-guards` streams and pools independent training
+  surveys using the configured observed-coordinate bins and cuts;
+- weighted cell summaries keep `intreg` separate and use periodic angular
+  dilation;
+- the immutable `aao-rad-guard-v1` manifest represents each disconnected core
+  compactly as seed cells plus axis dilation, while defining the tail as the
+  complete global complement with nonzero proposal probability;
+- `validate-guards` refuses training/validation replica overlap and measures
+  core, tail, channel, ESS, largest-tail-cell, and extra-dilation behavior on
+  held-out surveys;
+- `summarize-coverage` provides a compact campaign-level report.
+
+See `RADIATIVE_SURVEY.md` for executable commands. Manifests intentionally set
+`production_ready` to false until milestone 3 implements the exact proposal
+correction and radiative unweighting.
+
 ## Milestone 3: core-plus-tail radiative mode 4
 
 - Read a frozen guard table prepared from the manifest.
