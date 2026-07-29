@@ -1602,7 +1602,8 @@ def plot(args: argparse.Namespace) -> dict[str, object]:
             bottom=passed,
             label="Below threshold",
         )
-        axis.set_xticks(list(positions), labels)
+        axis.set_xticks(list(positions))
+        axis.set_xticklabels(labels)
         axis.set_xlabel("Base outward padding")
         axis.set_ylabel("Held-out analysis strata")
         axis.set_title("Per-stratum continuous-guard coverage")

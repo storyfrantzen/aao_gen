@@ -3806,9 +3806,9 @@ def plot(args: argparse.Namespace) -> dict:
         ]
         figure, axis = plt.subplots(figsize=(9, 4.5))
         axis.bar(range(len(labels)), values)
-        axis.set_xticks(
-            range(len(labels)),
-            [label.replace("_", "\n") for label in labels],
+        axis.set_xticks(range(len(labels)))
+        axis.set_xticklabels(
+            [label.replace("_", "\n") for label in labels]
         )
         axis.set_ylabel("Fraction of inside-analysis cross section")
         axis.set_ylim(0.0, 1.0)
@@ -4035,7 +4035,8 @@ def plot_representations(args: argparse.Namespace) -> dict:
             linewidth=1,
             label=f"Requested minimum ({minimum:.1%})",
         )
-        axis.set_xticks(positions, labels, rotation=12, ha="right")
+        axis.set_xticks(positions)
+        axis.set_xticklabels(labels, rotation=12, ha="right")
         axis.set_ylim(0.0, 1.03)
         axis.set_ylabel(
             "Cross-section-weighted held-out parent coverage"
@@ -4098,7 +4099,8 @@ def plot_representations(args: argparse.Namespace) -> dict:
             label="Native components",
         )
         axes[0].set_yscale("log")
-        axes[0].set_xticks(positions, labels, rotation=15, ha="right")
+        axes[0].set_xticks(positions)
+        axes[0].set_xticklabels(labels, rotation=15, ha="right")
         axes[0].set_ylabel("Total selected across training strata")
         axes[0].set_title("Footprint compactness")
         axes[0].grid(axis="y", alpha=0.25)
@@ -4115,7 +4117,8 @@ def plot_representations(args: argparse.Namespace) -> dict:
             width=width,
             label="One more spatial dilation",
         )
-        axes[1].set_xticks(positions, labels, rotation=15, ha="right")
+        axes[1].set_xticks(positions)
+        axes[1].set_xticklabels(labels, rotation=15, ha="right")
         axes[1].set_ylim(0.0, 1.0)
         axes[1].set_ylabel("Held-out aggregate purity proxy")
         axes[1].set_title("Coverage-versus-purity cost of dilation")
@@ -4265,7 +4268,8 @@ def plot_representations(args: argparse.Namespace) -> dict:
                 width=material_width,
                 label=labels[representation_index],
             )
-        axis.set_xticks(material_positions, material_labels)
+        axis.set_xticks(material_positions)
+        axis.set_xticklabels(material_labels)
         axis.set_ylim(0.0, 1.03)
         axis.set_ylabel("Held-out selected-parent coverage")
         axis.set_title("Coverage in cross-section-dominant strata")

@@ -1485,7 +1485,8 @@ def plot(args: argparse.Namespace) -> dict[str, object]:
             linewidth=1,
             label=f"Requested minimum ({minimum:.1%})",
         )
-        axis.set_xticks(positions, labels, rotation=12, ha="right")
+        axis.set_xticks(positions)
+        axis.set_xticklabels(labels, rotation=12, ha="right")
         axis.set_ylim(0.0, 1.03)
         axis.set_ylabel(
             "Cross-section-weighted held-out core coverage"
@@ -1544,9 +1545,9 @@ def plot(args: argparse.Namespace) -> dict[str, object]:
                 width=width,
                 label=labels[candidate_index],
             )
-        axis.set_xticks(
-            status_positions,
-            ("Well supported", "Low support", "No training"),
+        axis.set_xticks(status_positions)
+        axis.set_xticklabels(
+            ("Well supported", "Low support", "No training")
         )
         axis.set_ylim(0.0, 1.03)
         axis.set_ylabel("Held-out core coverage")
@@ -1573,7 +1574,8 @@ def plot(args: argparse.Namespace) -> dict[str, object]:
             bottom=passed,
             label="Below threshold",
         )
-        axis.set_xticks(positions, labels, rotation=12, ha="right")
+        axis.set_xticks(positions)
+        axis.set_xticklabels(labels, rotation=12, ha="right")
         axis.set_ylabel("Held-out analysis strata")
         axis.set_title("Per-stratum coverage requirement")
         axis.grid(axis="y", alpha=0.25)
