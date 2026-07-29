@@ -13,7 +13,7 @@ from unittest import mock
 
 import radiative_continuous_guards as continuous
 import radiative_guards as guards
-from test_radiative_guards import _config
+from test_radiative_guards import _config, _row, _write_survey
 
 
 def _point(
@@ -165,6 +165,25 @@ class ContinuousBoxTests(unittest.TestCase):
 
 
 class ContinuousWorkflowTests(unittest.TestCase):
+    def test_load_campaign_uses_default_partition(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            survey = root / "survey"
+            _write_survey(
+                survey,
+                replica=0,
+                rows=[_row(replica=0, trial=1, weight=1.0, r_u=0.25)],
+            )
+
+            campaign = continuous._load_campaign(
+                [survey],
+                _config(),
+                apply_y_max=False,
+            )
+
+            self.assertEqual(campaign.proposals, 100)
+            self.assertEqual(sum(len(points) for points in campaign.points.values()), 1)
+
     def test_empty_stratum_borrows_neighbor_and_writes_artifacts(self) -> None:
         training_points = {
             "s00000": [

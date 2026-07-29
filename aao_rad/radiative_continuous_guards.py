@@ -426,7 +426,7 @@ def _load_campaign(
     base = guards.aggregate_surveys(
         directories,
         config,
-        guards.parse_partition(),
+        guards.parse_partition(None),
         apply_y_max=apply_y_max,
     )
     points: dict[str, list[Point]] = {}
