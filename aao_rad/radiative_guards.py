@@ -373,12 +373,21 @@ def dilate_cells(
 def _survey_rows(path: Path) -> Iterator[dict[str, str]]:
     with path.open(encoding="utf-8", newline="") as source:
         first = source.readline().strip()
-        if first != f"# schema={radiative_survey.SURVEY_SCHEMA}":
+        if not first.startswith("# schema="):
             raise GuardLearningError(
-                f"{path}: expected '# schema={radiative_survey.SURVEY_SCHEMA}'"
+                f"{path}: missing survey schema header"
             )
+        schema = first.split("=", 1)[1].strip()
+        try:
+            expected_columns = radiative_survey.SURVEY_COLUMNS_BY_SCHEMA[
+                schema
+            ]
+        except KeyError as error:
+            raise GuardLearningError(
+                f"{path}: unsupported survey schema {schema!r}"
+            ) from error
         reader = csv.DictReader(source)
-        if reader.fieldnames != radiative_survey.SURVEY_COLUMNS:
+        if reader.fieldnames != expected_columns:
             raise GuardLearningError(f"{path}: unexpected survey columns")
         yield from reader
 
@@ -493,14 +502,11 @@ def _legacy_input_metadata(
 ) -> tuple[str, dict[str, float], dict[str, object]]:
     if not path.is_file():
         raise GuardLearningError(f"missing survey input snapshot {path}")
-    records = [
-        line.split("!", 1)[0].strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.split("!", 1)[0].strip()
-    ]
-    if len(records) < 21 or records[-4] != "1":
-        raise GuardLearningError(f"{path}: not a milestone-1 survey input")
-    legacy = records[:-4]
+    try:
+        proposal = radiative_survey._parse_survey_input(path)
+    except (ValueError, radiative_survey.SurveyValidationError) as error:
+        raise GuardLearningError(str(error)) from error
+    legacy = proposal["legacy_records"]
     try:
         probabilities = [float(value) for value in legacy[2].split()]
     except (ValueError, IndexError) as error:
@@ -541,7 +547,23 @@ def _legacy_input_metadata(
         }
     except (ValueError, IndexError) as error:
         raise GuardLearningError(f"{path}: cannot parse legacy settings") from error
-    signature = hashlib.sha256(("\n".join(legacy) + "\n").encode()).hexdigest()
+    proposal_signature = {
+        "legacy_records": legacy,
+        "proposal_mode": proposal["mode"],
+        "legacy_fraction": proposal["legacy_fraction"],
+        "binning": proposal.get("binning"),
+    }
+    signature = hashlib.sha256(
+        (
+            json.dumps(proposal_signature, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode()
+    ).hexdigest()
+    settings["survey_proposal"] = {
+        "mode": proposal["mode"],
+        "legacy_fraction": proposal["legacy_fraction"],
+        "binning": proposal.get("binning"),
+    }
     return signature, channel_probabilities, settings
 
 
@@ -554,12 +576,15 @@ def _validated_norm(directory: Path) -> dict[str, str]:
         "generator": "aao_rad",
         "sampling_mode": "1",
         "fixed_trial_survey": "1",
-        "survey_schema": radiative_survey.SURVEY_SCHEMA,
         "survey_emits_lund": "0",
     }
     for key, value in expected.items():
         if norm.get(key) != value:
             raise GuardLearningError(f"{path}: {key}={norm.get(key)!r}, expected {value!r}")
+    if norm.get("survey_schema") not in radiative_survey.SURVEY_COLUMNS_BY_SCHEMA:
+        raise GuardLearningError(
+            f"{path}: unsupported survey_schema={norm.get('survey_schema')!r}"
+        )
     return norm
 
 
@@ -605,6 +630,12 @@ def aggregate_surveys(
             norm_reference = norm
         else:
             _compatible_settings(norm_reference, norm)
+            if norm.get("survey_schema") != norm_reference.get(
+                "survey_schema"
+            ):
+                raise GuardLearningError(
+                    "survey schemas differ across replicas"
+                )
         signature, probabilities, settings = _legacy_input_metadata(
             directory / "survey_input.inp"
         )
@@ -612,6 +643,17 @@ def aggregate_surveys(
             input_signature = signature
             channel_probabilities = probabilities
             legacy_input_settings = settings
+            proposal = settings.get("survey_proposal", {})
+            if proposal.get("mode") == 1:
+                expected_binning = {
+                    name: [float(value) for value in config["binning"][name]]
+                    for name in ("Q2", "xB", "minus_t", "phi_deg")
+                }
+                if proposal.get("binning") != expected_binning:
+                    raise GuardLearningError(
+                        "balanced survey proposal binning differs from the "
+                        "analysis config"
+                    )
         elif signature != input_signature:
             raise GuardLearningError(
                 "survey legacy inputs differ; training/validation replicas must "
@@ -1070,7 +1112,9 @@ def build_manifest(
         "generator_revision": generator_revision,
         "generator_revision_source": generator_revision_source,
         "guard_learner_revision": learner_revision,
-        "survey_schema": radiative_survey.SURVEY_SCHEMA,
+        "survey_schema": campaign.norm_reference.get(
+            "survey_schema", radiative_survey.SURVEY_SCHEMA
+        ),
         "analysis_config": config,
         "analysis_config_source": str(config_path.resolve()),
         "analysis_config_sha256": config_sha256,

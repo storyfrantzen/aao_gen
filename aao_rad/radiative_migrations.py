@@ -1104,7 +1104,9 @@ def build_manifest(
         "generator_revision": generator_revision,
         "generator_revision_source": generator_revision_source,
         "migration_learner_revision": learner_revision,
-        "survey_schema": radiative_survey.SURVEY_SCHEMA,
+        "survey_schema": campaign.norm_reference.get(
+            "survey_schema", radiative_survey.SURVEY_SCHEMA
+        ),
         "analysis_config": config,
         "analysis_config_source": str(config_path.resolve()),
         "analysis_config_sha256": config_sha256,
@@ -3336,7 +3338,9 @@ def _build_representation_study(
         "generator_revision": generator_revision,
         "generator_revision_source": generator_revision_source,
         "migration_learner_revision": learner_revision,
-        "survey_schema": radiative_survey.SURVEY_SCHEMA,
+        "survey_schema": training.norm_reference.get(
+            "survey_schema", radiative_survey.SURVEY_SCHEMA
+        ),
         "representation_iteration": iteration,
         "legacy_input_sha256": training.input_signature,
         "legacy_generator_settings": training.legacy_input_settings,

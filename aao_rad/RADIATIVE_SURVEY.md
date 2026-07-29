@@ -11,21 +11,79 @@ The two radiative run-control modes are:
 Mode `4` remains reserved for the future bin-conditional unweighted radiative
 generator described in `GUARD_PROPOSAL_WORKFLOW.md`.
 
+Mode `1` now has two proposal choices:
+
+- `legacy`: the original AAO radiative proposal;
+- `balanced`: a full-support mixture of the legacy proposal and a component
+  that allocates trials uniformly across the configured analysis-coordinate
+  bins.
+
+The balanced proposal is the recommended choice for learning guards. The
+legacy proposal remains available for reproducibility and normalization
+cross-checks.
+
+## Balanced proposal
+
+For each fixed trial, the balanced survey first chooses a mixture component.
+The default probabilities are 25% legacy and 75% analysis-balanced.
+
+The analysis-balanced component independently:
+
+1. chooses a configured `Q2` bin uniformly, then samples `Q2` uniformly
+   inside that bin;
+2. chooses an `xB` bin uniformly, samples inside it, and maps `(Q2,xB)` to
+   the pre-outgoing-loss electron energy;
+3. chooses a `minus_t` bin uniformly, samples inside it, and uses the exact
+   affine hard-vertex mapping from `-t` to `cos(theta*)`;
+4. chooses a `phi_deg` bin uniformly and samples inside it.
+
+All photon variables, external-loss variables, and radiative-channel choices
+retain their original AAO sampling. The chosen bins therefore refer to the
+pre-outgoing-loss leptonic `Q2,xB` and hard hadronic `-t,phi`, not directly to
+the final observed coordinates. Radiation, physical-boundary rejection, and
+the final external loss can migrate a trial to another observed bin or make
+it invalid. The final observed bins will consequently be more even, but not
+exactly uniform.
+
+The mixture is corrected exactly:
+
+```text
+q_mix = alpha * q_legacy + (1 - alpha) * q_balanced
+
+corrected integrand =
+    legacy-transformed integrand * q_legacy / q_mix
+```
+
+For the default `alpha=0.25`, the correction is positive and no larger than
+`1/alpha = 4`. The nonzero legacy component guarantees support anywhere the
+legacy generator has support. The survey validator independently recomputes
+this density ratio for every recorded proposal.
+
+Raw occupancy counts diagnose whether trials were allocated more evenly.
+Cross sections and guard coverage must still use the corrected
+`trial_xsec_*` contributions; raw counts are not cross-section weights.
+
 ## Survey input
 
 Existing legacy input files remain valid and select mode `0` at end of file.
-To request a survey manually, append four records after the last legacy
-record:
+The checked Python wrapper should normally construct the survey trailer. A
+legacy-proposal survey trailer has five records after the legacy input:
 
 ```text
 1          ! fixed-trial survey mode
 1000000    ! exact number of unrestricted proposal trials
 371001     ! explicit nonzero random seed
 0          ! explicit nonnegative replica ID
+0          ! legacy survey proposal
 ```
 
-The survey currently supports the neutral-pion, four-particle configuration:
-`epirea=1` and `npart=4`.
+The balanced trailer additionally freezes the mixture fraction and all four
+sets of bin edges. `radiative_survey.py` builds that trailer from the analysis
+JSON, copies the exact JSON bytes into the output directory, and records its
+SHA-256 digest. This avoids maintaining a long trailer by hand.
+
+The balanced survey currently supports the neutral-pion, four-particle
+configuration: `epirea=1` and `npart=4`.
 
 The event-count and `fmcall` records remain in the legacy part of the input
 for compatibility, but survey termination does not use either one. It runs
@@ -40,16 +98,19 @@ From `aao_rad`, first build the executable:
 make
 ```
 
-Then run a survey through the checked wrapper:
+Then run a balanced survey through the checked wrapper:
 
 ```bash
 python3 radiative_survey.py run \
   --executable build/aao_rad \
   --input aao_input.inp \
-  --output survey_rgk_replica000 \
+  --output survey_rgk_balanced_replica000 \
   --trials 1000000 \
   --seed 371001 \
-  --replica 0
+  --replica 0 \
+  --proposal balanced \
+  --config ../../../configs/analysis/rgk/6.535.json \
+  --legacy-fraction 0.25
 ```
 
 The output directory must not already contain survey artifacts. This avoids
@@ -59,18 +120,22 @@ To revalidate an existing output:
 
 ```bash
 python3 radiative_survey.py validate \
-  --directory survey_rgk_replica000
+  --directory survey_rgk_balanced_replica000
 ```
 
 ## Outputs and semantics
 
-`aao_rad.survey.csv` has schema `aao-rad-survey-v1`. Each CSV row is an
+New output uses schema `aao-rad-survey-v2`. Readers remain compatible with
+the earlier `aao-rad-survey-v1` legacy surveys. Each CSV row is an
 internally valid unrestricted proposal. Proposal trials rejected before the
 internal integrand exists are absent from the CSV but remain zero
 contributions through the fixed `ntries` denominator in `aao_rad.norm`.
 
 The CSV records:
 
+- the selected proposal component and, for balanced-component trials, the
+  four target-bin indices;
+- the exact `q_legacy/q_mix` density correction;
 - base proposal coordinates and radiative channel;
 - incoming, pre-outgoing-loss, and final electron energies;
 - internal-photon energy and angles;
@@ -113,13 +178,16 @@ Survey mode intentionally writes no LUND events. The validator requires
 Its JSON summary also reports fixed-trial standard errors, importance-sampling
 effective sample sizes, and the largest single-trial contribution. These are
 important because radiative survey weights can have long tails; a large raw
-trial count alone does not guarantee a precise integral.
+trial count alone does not guarantee a precise integral. Balanced summaries
+also report target-axis counts, final-observed-axis counts, and the number of
+occupied joint analysis strata.
 
 ## Deterministic replicas
 
 A replica means an independent run at identical physical settings with a
 different explicit seed. Keep the trial count and all legacy physics inputs
-fixed, change only the seed, and write each replica to a separate directory.
+and proposal settings fixed, change only the seed, and write each replica to
+a separate directory.
 Repeating a run with the same compiler, executable, input, trial count, and
 seed should reproduce the survey CSV byte for byte.
 
@@ -143,18 +211,16 @@ From `aao_rad`, learn iteration zero with:
 python3 radiative_guards.py learn-guards \
   --config ../../../configs/analysis/rgk/6.535.json \
   --survey \
-    survey_rgk_replica000 \
-    survey_rgk_replica001 \
-    survey_rgk_replica002 \
-  --generator-revision 54f5ba8d59b86b8cabb2229e5c2cf2be5de1ff00 \
-  --output guard_rgk_iteration000
+    survey_rgk_balanced_replica000 \
+    survey_rgk_balanced_replica001 \
+    survey_rgk_balanced_replica002 \
+  --generator-revision GENERATOR_COMMIT_USED_FOR_SURVEYS \
+  --output guard_rgk_balanced_iteration000
 ```
 
-The explicit revision above is the milestone-1 commit that produced the five
-surveys discussed in this study. For a new campaign, replace it with the
-revision actually used to build the surveyed executable. If the option is
-omitted, the learner records the current checkout but marks that provenance as
-an assumption.
+Replace the revision placeholder with the revision actually used to build the
+surveyed executable. If the option is omitted, the learner records the current
+checkout but marks that provenance as an assumption.
 
 Once the RGK upper-`y` selection is finalized, it can be enabled explicitly
 with `--apply-y-max`. That reads `phase_space.y_max` from the analysis
@@ -178,20 +244,20 @@ Validate the frozen manifest only on replicas that were not used to learn it:
 
 ```bash
 python3 radiative_guards.py validate-guards \
-  --manifest guard_rgk_iteration000/guard_manifest.json \
+  --manifest guard_rgk_balanced_iteration000/guard_manifest.json \
   --survey \
-    survey_rgk_replica003 \
-    survey_rgk_replica004 \
-  --output guard_rgk_iteration000_validation
+    survey_rgk_balanced_replica003 \
+    survey_rgk_balanced_replica004 \
+  --output guard_rgk_balanced_iteration000_validation
 ```
 
 Print a compact campaign summary with:
 
 ```bash
 python3 radiative_guards.py summarize-coverage \
-  --manifest guard_rgk_iteration000/guard_manifest.json \
+  --manifest guard_rgk_balanced_iteration000/guard_manifest.json \
   --validation \
-    guard_rgk_iteration000_validation/guard_validation.json
+    guard_rgk_balanced_iteration000_validation/guard_validation.json
 ```
 
 The summary retains the original per-stratum pass counts and also reports a

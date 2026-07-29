@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import tempfile
 import unittest
@@ -102,6 +103,157 @@ class InputValidationTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "without an optional"):
             radiative_survey._validate_legacy_input_shape(text, Path("input.inp"))
+
+    def test_balanced_trailer_round_trips_analysis_edges(self) -> None:
+        config = {
+            "target_mass": radiative_survey.PROTON_MASS_GEV,
+            "binning": {
+                "Q2": [1.0, 2.0, 3.0],
+                "xB": [0.1, 0.2, 0.4],
+                "minus_t": [0.09, 0.3, 1.0],
+                "phi_deg": [0.0, 180.0, 360.0],
+            },
+        }
+        trailer = radiative_survey._survey_trailer(
+            1000,
+            371001,
+            0,
+            proposal="balanced",
+            legacy_fraction=0.25,
+            balanced_config=config,
+        )
+        legacy = "\n".join(
+            [
+                "5",
+                "0",
+                ".20 .12 .20 .20",
+                "4",
+                "1",
+                ".2",
+                "5",
+                ".43",
+                "0",
+                "0",
+                "0",
+                "6.535",
+                "1 3",
+                ".2 6.535",
+                ".005",
+                "100",
+                "2",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "survey_input.inp"
+            path.write_text(legacy + "\n" + trailer, encoding="utf-8")
+            parsed = radiative_survey._parse_survey_input(path)
+
+        self.assertEqual(parsed["mode"], 1)
+        self.assertEqual(parsed["trials"], 1000)
+        self.assertEqual(parsed["binning"], config["binning"])
+        self.assertAlmostEqual(parsed["legacy_fraction"], 0.25)
+
+
+class ProposalDensityTests(unittest.TestCase):
+    def test_global_tail_bounds_density_ratio_outside_balanced_support(self) -> None:
+        row = {
+            "q2_leptonic": 4.0,
+            "xb_leptonic": 0.25,
+            "minus_t_hard": 0.2,
+            "phi_cm_deg": 90.0,
+            "energy_in_vertex": 6.0,
+            "energy_e_pre_external": 3.0,
+            "energy_gamma": 0.05,
+            "cos_theta_gamma": 0.5,
+        }
+        norm = {
+            "q2_min": "1.0",
+            "q2_max": "5.0",
+            "ep_min": "0.2",
+            "ep_max_effective": "6.0",
+        }
+        spec = {
+            "mode": 1,
+            "legacy_fraction": 0.25,
+            "binning": {
+                "Q2": [1.0, 2.0, 3.0],
+                "xB": [0.1, 0.2, 0.4],
+                "minus_t": [0.09, 0.3, 1.0],
+                "phi_deg": [0.0, 180.0, 360.0],
+            },
+        }
+
+        self.assertAlmostEqual(
+            radiative_survey._proposal_density_ratio(row, norm, spec),
+            4.0,
+        )
+
+    def test_balanced_config_is_frozen_without_reformatting(self) -> None:
+        payload = {
+            "beam_energy": 6.535,
+            "target_mass": radiative_survey.PROTON_MASS_GEV,
+            "binning": {
+                "Q2": [1.0, 2.0, 3.0],
+                "xB": [0.1, 0.2, 0.4],
+                "minus_t": [0.09, 0.3, 1.0],
+                "phi_deg": [0.0, 180.0, 360.0],
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            _, raw, digest = radiative_survey._load_balanced_config(path)
+
+        self.assertEqual(raw, (json.dumps(payload, indent=2) + "\n").encode())
+        self.assertEqual(len(digest), 64)
+
+    def test_allocation_summary_separates_target_and_observed_bins(self) -> None:
+        spec = {
+            "binning": {
+                "Q2": [1.0, 2.0, 3.0],
+                "xB": [0.1, 0.2, 0.4],
+                "minus_t": [0.09, 0.3, 1.0],
+                "phi_deg": [0.0, 180.0, 360.0],
+            }
+        }
+        rows = [
+            {
+                "proposal_component": 1,
+                "proposal_q2_bin": 1,
+                "proposal_xb_bin": 0,
+                "proposal_t_bin": 1,
+                "proposal_phi_bin": 0,
+                "final_valid": 1,
+                "q2_observed": 1.5,
+                "xb_observed": 0.3,
+                "minus_t_observed": 0.2,
+                "phi_observed_deg": 270.0,
+            },
+            {
+                "proposal_component": 0,
+                "proposal_q2_bin": -1,
+                "proposal_xb_bin": -1,
+                "proposal_t_bin": -1,
+                "proposal_phi_bin": -1,
+                "final_valid": 0,
+                "q2_observed": 0.0,
+                "xb_observed": 0.0,
+                "minus_t_observed": 0.0,
+                "phi_observed_deg": 0.0,
+            },
+        ]
+
+        summary = radiative_survey._allocation_summary(rows, spec)
+
+        self.assertEqual(
+            summary["balanced_target_axis_counts_in_recorded_internal_rows"][
+                "Q2"
+            ],
+            [0, 1],
+        )
+        self.assertEqual(summary["final_observed_axis_counts"]["Q2"], [1, 0])
+        self.assertEqual(summary["final_observed_joint_strata_occupied"], 1)
+        self.assertEqual(summary["analysis_joint_strata_total"], 16)
 
 
 class SchemaTests(unittest.TestCase):

@@ -121,12 +121,12 @@ Run from `aao_rad`:
 python3 radiative_continuous_guards.py compare \
   --config ../../../configs/analysis/rgk/6.535.json \
   --training-survey \
-    survey_rgk_replica000 \
-    survey_rgk_replica001 \
-    survey_rgk_replica002 \
+    survey_rgk_balanced_replica000 \
+    survey_rgk_balanced_replica001 \
+    survey_rgk_balanced_replica002 \
   --validation-survey \
-    survey_rgk_replica003 \
-    survey_rgk_replica004 \
+    survey_rgk_balanced_replica003 \
+    survey_rgk_balanced_replica004 \
   --target-core-fraction 0.995 \
   --neighbor-radius 1 \
   --regularization-ess 5 \
@@ -135,13 +135,23 @@ python3 radiative_continuous_guards.py compare \
   --minimum-training-ess 5 \
   --minimum-validation-coverage 0.98 \
   --iteration 0 \
-  --generator-revision 54f5ba8d59b86b8cabb2229e5c2cf2be5de1ff00 \
-  --output migration_rgk_continuous_guards_iteration000
+  --generator-revision GENERATOR_COMMIT_USED_FOR_SURVEYS \
+  --output migration_rgk_balanced_continuous_guards_iteration000
 ```
 
-The revision above is the milestone-1 generator revision that produced the
-existing five RGK surveys. Use the revision that actually produced the
-surveys for any new campaign.
+Replace `GENERATOR_COMMIT_USED_FOR_SURVEYS` with the exact revision used to
+build the executable. In `tcsh`, capture it before starting the replicas with:
+
+```tcsh
+set generator_revision = `git rev-parse HEAD`
+```
+
+and pass `--generator-revision $generator_revision`.
+
+These commands intentionally use only balanced-proposal surveys in one
+comparison. Do not pool legacy-proposal and balanced-proposal replicas: their
+fixed-trial contributions are individually valid, but the guard tools require
+one frozen proposal definition per campaign.
 
 The default applies the configured final-LUND `Q2` and `W` requirements and
 does not apply an analysis-level `y` cut. Add `--apply-y-max` only after the
@@ -154,8 +164,8 @@ The output directory is immutable and must not already exist.
 ```bash
 python3 radiative_continuous_guards.py plot \
   --comparison \
-    migration_rgk_continuous_guards_iteration000/continuous_guard_comparison.json \
-  --output migration_rgk_continuous_guards_iteration000_plots
+    migration_rgk_balanced_continuous_guards_iteration000/continuous_guard_comparison.json \
+  --output migration_rgk_balanced_continuous_guards_iteration000_plots
 ```
 
 ## Artifacts

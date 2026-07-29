@@ -69,6 +69,12 @@ def _row(
             "final_valid": final_valid,
             "candidate_status": 0 if final_valid else 1,
             "intreg": 1,
+            "proposal_component": 0,
+            "proposal_q2_bin": -1,
+            "proposal_xb_bin": -1,
+            "proposal_t_bin": -1,
+            "proposal_phi_bin": -1,
+            "proposal_density_ratio": 1.0,
             "r_u": r_u,
             "r_ep": 0.2,
             "u_gamma": 0.5,
@@ -119,6 +125,12 @@ def _write_survey(
         "fixed_trial_survey": "1",
         "survey_schema": radiative_survey.SURVEY_SCHEMA,
         "survey_emits_lund": "0",
+        "survey_proposal_mode": "0",
+        "survey_proposal": "legacy",
+        "survey_legacy_fraction": "1.0",
+        "survey_balanced_fraction": "0.0",
+        "survey_legacy_trials": str(ntrials),
+        "survey_balanced_trials": "0",
         "ntries": str(ntrials),
         "survey_ntrials_requested": str(ntrials),
         "survey_rows": str(len(rows)),
@@ -160,7 +172,13 @@ def _write_survey(
         "100",
         "2",
     ]
-    trailer = ["1", str(ntrials), str(371001 + 2 * replica), str(replica)]
+    trailer = [
+        "1",
+        str(ntrials),
+        str(371001 + 2 * replica),
+        str(replica),
+        "0",
+    ]
     (directory / "survey_input.inp").write_text(
         "\n".join(legacy + trailer) + "\n", encoding="utf-8"
     )

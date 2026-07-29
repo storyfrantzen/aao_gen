@@ -1098,8 +1098,9 @@ Implemented on this development branch:
 - radiative run-control mode `0` retains legacy unweighted generation;
 - diagnostic mode `1` runs the unrestricted fixed-trial survey;
 - `build_final_candidate` is shared by the legacy and survey paths;
-- `aao-rad-survey-v1` records proposal, hard, final-particle, observed, and
-  cross-section fields;
+- `aao-rad-survey-v2` adds proposal-component and density-correction metadata
+  to the proposal, hard, final-particle, observed, and cross-section fields;
+  readers remain compatible with earlier v1 legacy-proposal surveys;
 - `radiative_survey.py` runs surveys and independently validates their
   normalization and final-particle coordinate parity.
 

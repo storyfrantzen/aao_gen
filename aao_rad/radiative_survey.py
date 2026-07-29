@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -14,10 +15,14 @@ from typing import Iterable
 
 
 PROTON_MASS_GEV = 0.9382720813
-SURVEY_SCHEMA = "aao-rad-survey-v1"
+GENERATOR_PROTON_MASS_GEV = 0.938
+PI0_MASS_GEV = 0.1349
+LEGACY_SURVEY_SCHEMA = "aao-rad-survey-v1"
+SURVEY_SCHEMA = "aao-rad-survey-v2"
 SURVEY_FILENAME = "aao_rad.survey.csv"
 NORM_FILENAME = "aao_rad.norm"
 LUND_FILENAME = "aao_rad.lund"
+ANALYSIS_CONFIG_FILENAME = "survey_analysis_config.json"
 
 INTEGER_COLUMNS = {
     "replica",
@@ -26,9 +31,14 @@ INTEGER_COLUMNS = {
     "candidate_status",
     "intreg",
     "helicity",
+    "proposal_component",
+    "proposal_q2_bin",
+    "proposal_xb_bin",
+    "proposal_t_bin",
+    "proposal_phi_bin",
 }
 
-SURVEY_COLUMNS = [
+SURVEY_COLUMNS_V1 = [
     "replica",
     "trial",
     "final_valid",
@@ -87,6 +97,24 @@ SURVEY_COLUMNS = [
     "outgoing_loss_fraction",
 ]
 
+SURVEY_COLUMNS = (
+    SURVEY_COLUMNS_V1[:6]
+    + [
+        "proposal_component",
+        "proposal_q2_bin",
+        "proposal_xb_bin",
+        "proposal_t_bin",
+        "proposal_phi_bin",
+        "proposal_density_ratio",
+    ]
+    + SURVEY_COLUMNS_V1[6:]
+)
+
+SURVEY_COLUMNS_BY_SCHEMA = {
+    LEGACY_SURVEY_SCHEMA: SURVEY_COLUMNS_V1,
+    SURVEY_SCHEMA: SURVEY_COLUMNS,
+}
+
 COORDINATE_TOLERANCES = {
     "q2_observed": 3.0e-5,
     "xb_observed": 3.0e-6,
@@ -99,6 +127,212 @@ COORDINATE_TOLERANCES = {
 
 class SurveyValidationError(RuntimeError):
     """Raised when a survey violates a required milestone-1 invariant."""
+
+
+def _records(text: str) -> list[str]:
+    return [
+        line.split("!", 1)[0].strip()
+        for line in text.splitlines()
+        if line.split("!", 1)[0].strip()
+    ]
+
+
+def _legacy_record_count(records: list[str], path: Path) -> int:
+    if len(records) < 17:
+        raise ValueError(f"{path}: expected at least 17 legacy AAO input records")
+    try:
+        theory = int(records[0].split()[0])
+        fmcall = float(records[16].split()[0])
+    except ValueError as error:
+        raise ValueError(f"{path}: cannot parse theory or fmcall") from error
+    return 17 + (1 if fmcall == 0.0 else 0) + (1 if theory > 10 else 0)
+
+
+def _strict_edges(values: object, name: str) -> list[float]:
+    if not isinstance(values, list):
+        raise ValueError(f"analysis config binning.{name} must be a list")
+    try:
+        edges = [float(value) for value in values]
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"analysis config binning.{name} contains a nonnumeric edge"
+        ) from error
+    if (
+        len(edges) < 2
+        or any(not math.isfinite(value) for value in edges)
+        or any(right <= left for left, right in zip(edges, edges[1:]))
+    ):
+        raise ValueError(
+            f"analysis config binning.{name} must have increasing finite edges"
+        )
+    if len(edges) - 1 > 64:
+        raise ValueError(f"analysis config binning.{name} exceeds 64 bins")
+    return edges
+
+
+def _load_balanced_config(
+    path: Path,
+    *,
+    legacy_input: str | None = None,
+    legacy_path: Path | None = None,
+) -> tuple[dict[str, object], bytes, str]:
+    raw = path.read_bytes()
+    try:
+        config = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{path}: invalid analysis JSON: {error}") from error
+    try:
+        target_mass = float(config["target_mass"])
+        binning = config["binning"]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"{path}: balanced survey requires target_mass and binning"
+        ) from error
+    if not math.isclose(
+        target_mass, PROTON_MASS_GEV, rel_tol=0.0, abs_tol=5.0e-7
+    ):
+        raise ValueError(
+            f"{path}: target_mass={target_mass} differs from "
+            f"{PROTON_MASS_GEV}"
+        )
+    edges = {
+        name: _strict_edges(binning.get(name), name)
+        for name in ("Q2", "xB", "minus_t", "phi_deg")
+    }
+    if edges["xB"][0] <= 0.0:
+        raise ValueError("balanced survey xB edges must be positive")
+    if edges["minus_t"][0] < 0.0:
+        raise ValueError("balanced survey -t edges must be nonnegative")
+    if not (
+        math.isclose(edges["phi_deg"][0], 0.0, abs_tol=1.0e-9)
+        and math.isclose(edges["phi_deg"][-1], 360.0, abs_tol=1.0e-9)
+    ):
+        raise ValueError("balanced survey phi_deg edges must span [0,360]")
+    if legacy_input is not None:
+        input_path = legacy_path or Path("<legacy-input>")
+        records = _records(legacy_input)
+        legacy_count = _legacy_record_count(records, input_path)
+        if len(records) != legacy_count:
+            raise ValueError(
+                f"{input_path}: pass a legacy input without an optional "
+                "sampling-mode trailer"
+            )
+        try:
+            q2_min, q2_max = (
+                float(value) for value in records[12].split()[:2]
+            )
+            beam_energy = float(records[11].split()[0])
+            epirea = int(records[4].split()[0])
+            npart = int(records[3].split()[0])
+        except (ValueError, IndexError) as error:
+            raise ValueError(
+                f"{input_path}: cannot parse balanced-survey settings"
+            ) from error
+        if edges["Q2"][0] < q2_min or edges["Q2"][-1] > q2_max:
+            raise ValueError(
+                "analysis Q2 edges must lie inside the generator Q2 range"
+            )
+        try:
+            analysis_beam_energy = float(config["beam_energy"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"{path}: balanced survey requires beam_energy"
+            ) from error
+        if not math.isclose(
+            analysis_beam_energy, beam_energy, rel_tol=2.0e-7
+        ):
+            raise ValueError(
+                "analysis and generator beam energies differ"
+            )
+        if epirea != 1 or npart != 4:
+            raise ValueError(
+                "balanced survey currently requires epirea=1 and npart=4"
+            )
+    return (
+        {"target_mass": target_mass, "binning": edges},
+        raw,
+        hashlib.sha256(raw).hexdigest(),
+    )
+
+
+def _survey_trailer(
+    trials: int,
+    seed: int,
+    replica: int,
+    *,
+    proposal: str,
+    legacy_fraction: float,
+    balanced_config: dict[str, object] | None,
+) -> str:
+    records = ["1", str(trials), str(seed), str(replica)]
+    if proposal == "legacy":
+        records.append("0")
+    else:
+        if balanced_config is None:
+            raise ValueError("balanced proposal requires an analysis config")
+        records.extend(["1", f"{legacy_fraction:.17g}"])
+        for name in ("Q2", "xB", "minus_t", "phi_deg"):
+            edges = balanced_config["binning"][name]
+            records.extend(
+                [
+                    str(len(edges) - 1),
+                    " ".join(f"{float(value):.17g}" for value in edges),
+                ]
+            )
+    return "\n".join(records) + "\n"
+
+
+def _parse_survey_input(path: Path) -> dict[str, object]:
+    records = _records(path.read_text(encoding="utf-8"))
+    legacy_count = _legacy_record_count(records, path)
+    trailer = records[legacy_count:]
+    if len(trailer) < 4 or trailer[0].split()[0] != "1":
+        raise SurveyValidationError(f"{path}: not a fixed-trial survey input")
+    try:
+        spec: dict[str, object] = {
+            "trials": int(trailer[1].split()[0]),
+            "seed": int(trailer[2].split()[0]),
+            "replica": int(trailer[3].split()[0]),
+            "mode": int(trailer[4].split()[0]) if len(trailer) >= 5 else 0,
+            "legacy_records": records[:legacy_count],
+        }
+    except (ValueError, IndexError) as error:
+        raise SurveyValidationError(
+            f"{path}: malformed fixed-trial survey trailer"
+        ) from error
+    if spec["mode"] == 0:
+        if len(trailer) not in (4, 5):
+            raise SurveyValidationError(
+                f"{path}: unexpected records after legacy survey proposal"
+            )
+        spec["legacy_fraction"] = 1.0
+        return spec
+    if spec["mode"] != 1 or len(trailer) != 14:
+        raise SurveyValidationError(
+            f"{path}: malformed balanced survey proposal trailer"
+        )
+    try:
+        spec["legacy_fraction"] = float(trailer[5].split()[0])
+        binning: dict[str, list[float]] = {}
+        position = 6
+        for name in ("Q2", "xB", "minus_t", "phi_deg"):
+            count = int(trailer[position].split()[0])
+            edges = [float(value) for value in trailer[position + 1].split()]
+            if len(edges) != count + 1:
+                raise SurveyValidationError(
+                    f"{path}: {name} trailer has {len(edges)} edges "
+                    f"for {count} bins"
+                )
+            binning[name] = _strict_edges(edges, name)
+            position += 2
+        spec["binning"] = binning
+    except (ValueError, IndexError) as error:
+        if isinstance(error, SurveyValidationError):
+            raise
+        raise SurveyValidationError(
+            f"{path}: malformed balanced survey proposal settings"
+        ) from error
+    return spec
 
 
 def parse_norm(path: Path) -> dict[str, str]:
@@ -125,11 +359,17 @@ def read_survey(path: Path) -> tuple[str, list[dict[str, int | float]]]:
     if not lines or not lines[0].startswith("# schema="):
         raise SurveyValidationError(f"{path}: missing '# schema=...' header")
     schema = lines[0].split("=", 1)[1].strip()
+    try:
+        expected_columns = SURVEY_COLUMNS_BY_SCHEMA[schema]
+    except KeyError as error:
+        raise SurveyValidationError(
+            f"{path}: unsupported survey schema {schema!r}"
+        ) from error
     reader = csv.DictReader(lines[1:])
-    if reader.fieldnames != SURVEY_COLUMNS:
+    if reader.fieldnames != expected_columns:
         raise SurveyValidationError(
             f"{path}: unexpected columns for {schema}; "
-            f"expected {SURVEY_COLUMNS}, found {reader.fieldnames}"
+            f"expected {expected_columns}, found {reader.fieldnames}"
         )
 
     rows: list[dict[str, int | float]] = []
@@ -209,14 +449,57 @@ def validate_survey(directory: Path) -> dict[str, object]:
     _require_norm_value(norm, "generator", "aao_rad")
     _require_norm_value(norm, "sampling_mode", "1")
     _require_norm_value(norm, "fixed_trial_survey", "1")
-    _require_norm_value(norm, "survey_schema", SURVEY_SCHEMA)
     _require_norm_value(norm, "survey_emits_lund", "0")
+    norm_schema = norm.get("survey_schema")
+    if norm_schema not in SURVEY_COLUMNS_BY_SCHEMA:
+        raise SurveyValidationError(
+            f"survey_schema={norm_schema!r} is unsupported"
+        )
 
     schema, rows = read_survey(survey_path)
-    if schema != SURVEY_SCHEMA:
+    if schema != norm_schema:
         raise SurveyValidationError(
-            f"survey schema is {schema!r}, expected {SURVEY_SCHEMA!r}"
+            f"CSV schema is {schema!r}, norm records {norm_schema!r}"
         )
+    proposal_spec = _parse_survey_input(directory / "survey_input.inp")
+    proposal_mode = int(proposal_spec["mode"])
+    if schema == LEGACY_SURVEY_SCHEMA and proposal_mode != 0:
+        raise SurveyValidationError(
+            "v1 survey schema cannot describe a balanced proposal"
+        )
+    if schema == SURVEY_SCHEMA:
+        _require_norm_value(
+            norm, "survey_proposal_mode", str(proposal_mode)
+        )
+        expected_name = (
+            "analysis_balanced_mixture" if proposal_mode == 1 else "legacy"
+        )
+        _require_norm_value(norm, "survey_proposal", expected_name)
+        _assert_close(
+            "survey legacy fraction",
+            _norm_float(norm, "survey_legacy_fraction"),
+            float(proposal_spec["legacy_fraction"]),
+            relative=2.0e-7,
+            absolute=1.0e-8,
+        )
+        if proposal_mode == 1:
+            config_path = directory / ANALYSIS_CONFIG_FILENAME
+            if not config_path.is_file():
+                raise SurveyValidationError(
+                    f"balanced survey is missing {config_path}"
+                )
+            frozen_config, raw_config, config_sha256 = _load_balanced_config(
+                config_path
+            )
+            if frozen_config["binning"] != proposal_spec["binning"]:
+                raise SurveyValidationError(
+                    "balanced survey input edges differ from frozen analysis config"
+                )
+            _require_norm_value(
+                norm, "survey_analysis_config_sha256", config_sha256
+            )
+            proposal_spec["analysis_config_sha256"] = config_sha256
+            proposal_spec["analysis_config_bytes"] = len(raw_config)
 
     ntrials = _norm_int(norm, "ntries")
     requested = _norm_int(norm, "survey_ntrials_requested")
@@ -245,6 +528,28 @@ def validate_survey(directory: Path) -> dict[str, object]:
         raise SurveyValidationError("CSV contains a trial outside the fixed trial range")
     if any(row["replica"] != replica for row in rows):
         raise SurveyValidationError("CSV replica IDs do not match survey_replica")
+    if (
+        int(proposal_spec["trials"]) != ntrials
+        or int(proposal_spec["seed"]) != _norm_int(norm, "survey_seed")
+        or int(proposal_spec["replica"]) != replica
+    ):
+        raise SurveyValidationError(
+            "survey input trailer disagrees with normalization metadata"
+        )
+    legacy_trials = (
+        _norm_int(norm, "survey_legacy_trials")
+        if schema == SURVEY_SCHEMA
+        else ntrials
+    )
+    balanced_trials = (
+        _norm_int(norm, "survey_balanced_trials")
+        if schema == SURVEY_SCHEMA
+        else 0
+    )
+    if legacy_trials + balanced_trials != ntrials:
+        raise SurveyValidationError(
+            "legacy and balanced trial counts do not sum to ntries"
+        )
 
     phase_volume = _norm_float(norm, "survey_phase_volume")
     internal_total = 0.0
@@ -253,10 +558,18 @@ def validate_survey(directory: Path) -> dict[str, object]:
     observed_square_total = 0.0
     max_internal_contribution = 0.0
     max_observed_contribution = 0.0
+    max_proposal_density_ratio = 0.0
     max_errors = {name: 0.0 for name in COORDINATE_TOLERANCES}
     for row in rows:
-        _validate_row_domains(row)
-        _validate_proposal_mapping(row, norm)
+        _validate_row_domains(row, schema=schema, proposal_spec=proposal_spec)
+        _validate_proposal_mapping(
+            row, norm, schema=schema, proposal_spec=proposal_spec
+        )
+        if schema == SURVEY_SCHEMA:
+            max_proposal_density_ratio = max(
+                max_proposal_density_ratio,
+                float(row["proposal_density_ratio"]),
+            )
         internal_integrand = float(row["integrand_internal"])
         observed_integrand = float(row["integrand_observed"])
         internal_contribution = float(row["trial_xsec_internal_microbarn"])
@@ -369,11 +682,17 @@ def validate_survey(directory: Path) -> dict[str, object]:
             f"survey mode must not emit LUND events, but {lund_path} has {lund_bytes} bytes"
         )
 
-    return {
+    result: dict[str, object] = {
         "passed": True,
         "schema": schema,
         "survey_seed": _norm_int(norm, "survey_seed"),
         "replica": replica,
+        "proposal": (
+            "legacy" if proposal_mode == 0 else "analysis_balanced_mixture"
+        ),
+        "legacy_fraction": float(proposal_spec["legacy_fraction"]),
+        "legacy_trials": legacy_trials,
+        "balanced_trials": balanced_trials,
         "proposals": ntrials,
         "internally_valid_rows": len(rows),
         "final_valid_rows": len(valid_rows),
@@ -390,9 +709,13 @@ def validate_survey(directory: Path) -> dict[str, object]:
         ),
         "max_internal_trial_contribution_microbarn": max_internal_contribution,
         "max_observed_trial_contribution_microbarn": max_observed_contribution,
+        "max_proposal_density_ratio": max_proposal_density_ratio,
         "max_coordinate_errors": max_errors,
         "lund_bytes": lund_bytes,
     }
+    if proposal_mode == 1:
+        result["allocation"] = _allocation_summary(rows, proposal_spec)
+    return result
 
 
 def run_survey(
@@ -402,6 +725,10 @@ def run_survey(
     trials: int,
     seed: int,
     replica: int,
+    *,
+    proposal: str = "legacy",
+    config_path: Path | None = None,
+    legacy_fraction: float = 0.25,
 ) -> dict[str, object]:
     """Run AAO in an empty output directory and validate its artifacts."""
 
@@ -411,6 +738,10 @@ def run_survey(
         raise ValueError("--seed must be nonzero")
     if replica < 0:
         raise ValueError("--replica must be nonnegative")
+    if proposal not in ("legacy", "balanced"):
+        raise ValueError("--proposal must be legacy or balanced")
+    if not 0.0 < legacy_fraction < 1.0:
+        raise ValueError("--legacy-fraction must lie strictly between zero and one")
     executable = executable.resolve()
     input_path = input_path.resolve()
     output_directory = output_directory.resolve()
@@ -421,6 +752,22 @@ def run_survey(
 
     base_input = input_path.read_text(encoding="utf-8")
     _validate_legacy_input_shape(base_input, input_path)
+    balanced_config: dict[str, object] | None = None
+    config_raw: bytes | None = None
+    config_sha256: str | None = None
+    if proposal == "balanced":
+        if config_path is None:
+            raise ValueError("--config is required with --proposal balanced")
+        config_path = config_path.resolve()
+        if not config_path.is_file():
+            raise FileNotFoundError(
+                f"analysis config does not exist: {config_path}"
+            )
+        balanced_config, config_raw, config_sha256 = _load_balanced_config(
+            config_path,
+            legacy_input=base_input,
+            legacy_path=input_path,
+        )
     output_directory.mkdir(parents=True, exist_ok=True)
     generated_names = (
         SURVEY_FILENAME,
@@ -431,6 +778,7 @@ def run_survey(
         "generator.stdout.txt",
         "generator.stderr.txt",
         "survey_input.inp",
+        ANALYSIS_CONFIG_FILENAME,
         "validation.json",
     )
     collisions = [name for name in generated_names if (output_directory / name).exists()]
@@ -439,11 +787,17 @@ def run_survey(
             f"{output_directory} already contains survey artifacts: {collisions}"
         )
 
-    survey_input = (
-        base_input.rstrip()
-        + f"\n1 ! fixed-trial survey mode\n{trials}\n{seed}\n{replica}\n"
+    survey_input = base_input.rstrip() + "\n" + _survey_trailer(
+        trials,
+        seed,
+        replica,
+        proposal=proposal,
+        legacy_fraction=legacy_fraction,
+        balanced_config=balanced_config,
     )
     (output_directory / "survey_input.inp").write_text(survey_input, encoding="utf-8")
+    if config_raw is not None:
+        (output_directory / ANALYSIS_CONFIG_FILENAME).write_bytes(config_raw)
     completed = subprocess.run(
         [str(executable)],
         input=survey_input,
@@ -463,6 +817,13 @@ def run_survey(
             f"AAO failed with exit code {completed.returncode}; see "
             f"{output_directory / 'generator.stderr.txt'}"
         )
+    if config_sha256 is not None:
+        with (output_directory / NORM_FILENAME).open(
+            "a", encoding="utf-8"
+        ) as norm_output:
+            norm_output.write(
+                f"survey_analysis_config_sha256={config_sha256}\n"
+            )
 
     result = validate_survey(output_directory)
     (output_directory / "validation.json").write_text(
@@ -471,13 +832,47 @@ def run_survey(
     return result
 
 
-def _validate_row_domains(row: dict[str, int | float]) -> None:
+def _validate_row_domains(
+    row: dict[str, int | float],
+    *,
+    schema: str,
+    proposal_spec: dict[str, object],
+) -> None:
     if row["final_valid"] not in (0, 1):
         raise SurveyValidationError("final_valid must be 0 or 1")
     if row["candidate_status"] not in (0, 1, 2, 3):
         raise SurveyValidationError("candidate_status must be in [0, 3]")
     if row["intreg"] not in range(1, 7):
         raise SurveyValidationError("intreg must be in [1, 6]")
+    if schema == SURVEY_SCHEMA:
+        component = int(row["proposal_component"])
+        mode = int(proposal_spec["mode"])
+        if component not in (0, 1):
+            raise SurveyValidationError("proposal_component must be zero or one")
+        if mode == 0 and component != 0:
+            raise SurveyValidationError(
+                "legacy survey row has a balanced proposal component"
+            )
+        bin_names = (
+            "proposal_q2_bin",
+            "proposal_xb_bin",
+            "proposal_t_bin",
+            "proposal_phi_bin",
+        )
+        if component == 0 and any(int(row[name]) != -1 for name in bin_names):
+            raise SurveyValidationError(
+                "legacy proposal component must use -1 target-bin indices"
+            )
+        if component == 1 and any(int(row[name]) < 0 for name in bin_names):
+            raise SurveyValidationError(
+                "balanced proposal component lacks target-bin indices"
+            )
+        ratio = float(row["proposal_density_ratio"])
+        maximum = 1.0 / float(proposal_spec["legacy_fraction"])
+        if not math.isfinite(ratio) or not 0.0 < ratio <= maximum * (1.0 + 1.0e-5):
+            raise SurveyValidationError(
+                "proposal_density_ratio is outside its full-support bound"
+            )
     for name in (
         "r_u",
         "r_ep",
@@ -510,7 +905,11 @@ def _validate_row_domains(row: dict[str, int | float]) -> None:
 
 
 def _validate_proposal_mapping(
-    row: dict[str, int | float], norm: dict[str, str]
+    row: dict[str, int | float],
+    norm: dict[str, str],
+    *,
+    schema: str,
+    proposal_spec: dict[str, object],
 ) -> None:
     q2_min = _norm_float(norm, "q2_min")
     q2_max = _norm_float(norm, "q2_max")
@@ -570,6 +969,41 @@ def _validate_proposal_mapping(
         relative=3.0e-6,
         absolute=1.0e-7,
     )
+    if schema == SURVEY_SCHEMA:
+        expected_ratio = _proposal_density_ratio(
+            row,
+            norm,
+            proposal_spec,
+        )
+        _assert_close(
+            "survey proposal density ratio",
+            float(row["proposal_density_ratio"]),
+            expected_ratio,
+            relative=2.0e-5,
+            absolute=2.0e-7,
+        )
+        if int(row["proposal_component"]) == 1:
+            binning = proposal_spec["binning"]
+            values = (
+                ("proposal_q2_bin", float(row["q2_leptonic"]), binning["Q2"]),
+                ("proposal_xb_bin", float(row["xb_leptonic"]), binning["xB"]),
+                (
+                    "proposal_t_bin",
+                    float(row["minus_t_hard"]),
+                    binning["minus_t"],
+                ),
+                (
+                    "proposal_phi_bin",
+                    float(row["phi_cm_deg"]) % 360.0,
+                    binning["phi_deg"],
+                ),
+            )
+            for column, value, edges in values:
+                expected_bin = _bin_index(value, edges)
+                if expected_bin != int(row[column]):
+                    raise SurveyValidationError(
+                        f"{column}={row[column]} disagrees with generated value"
+                    )
     if row["final_valid"] == 1:
         _assert_close(
             "final electron energy",
@@ -580,20 +1014,194 @@ def _validate_proposal_mapping(
         )
 
 
+def _bin_index(value: float, edges: list[float]) -> int | None:
+    for index, (lower, upper) in enumerate(zip(edges, edges[1:])):
+        if lower <= value < upper:
+            return index
+    return None
+
+
+def _allocation_summary(
+    rows: list[dict[str, int | float]],
+    proposal_spec: dict[str, object],
+) -> dict[str, object]:
+    """Summarize raw target and final-bin allocation without using weights."""
+
+    binning = proposal_spec["binning"]
+    axes = (
+        ("Q2", "proposal_q2_bin", "q2_observed"),
+        ("xB", "proposal_xb_bin", "xb_observed"),
+        ("minus_t", "proposal_t_bin", "minus_t_observed"),
+        ("phi_deg", "proposal_phi_bin", "phi_observed_deg"),
+    )
+    target_counts = {
+        axis: [0] * (len(binning[axis]) - 1)
+        for axis, _, _ in axes
+    }
+    observed_counts = {
+        axis: [0] * (len(binning[axis]) - 1)
+        for axis, _, _ in axes
+    }
+    target_joint: set[tuple[int, ...]] = set()
+    observed_joint: set[tuple[int, ...]] = set()
+    balanced_recorded_rows = 0
+    final_rows_inside = 0
+
+    for row in rows:
+        if int(row["proposal_component"]) == 1:
+            balanced_recorded_rows += 1
+            target_indices = tuple(
+                int(row[target_column])
+                for _, target_column, _ in axes
+            )
+            for (axis, _, _), index in zip(axes, target_indices):
+                target_counts[axis][index] += 1
+            target_joint.add(target_indices)
+
+        if int(row["final_valid"]) != 1:
+            continue
+        observed_indices = tuple(
+            _bin_index(
+                float(row[observed_column]) % 360.0
+                if axis == "phi_deg"
+                else float(row[observed_column]),
+                binning[axis],
+            )
+            for axis, _, observed_column in axes
+        )
+        if any(index is None for index in observed_indices):
+            continue
+        final_rows_inside += 1
+        integer_indices = tuple(int(index) for index in observed_indices)
+        for (axis, _, _), index in zip(axes, integer_indices):
+            observed_counts[axis][index] += 1
+        observed_joint.add(integer_indices)
+
+    total_joint = math.prod(len(binning[axis]) - 1 for axis, _, _ in axes)
+    return {
+        "note": (
+            "Raw row counts diagnose allocation only; cross-section "
+            "estimators and guard coverage still use corrected trial weights."
+        ),
+        "balanced_component_recorded_internal_rows": balanced_recorded_rows,
+        "balanced_target_axis_counts_in_recorded_internal_rows": target_counts,
+        "balanced_target_joint_strata_occupied_in_recorded_internal_rows": len(
+            target_joint
+        ),
+        "final_valid_rows_inside_analysis_binning": final_rows_inside,
+        "final_observed_axis_counts": observed_counts,
+        "final_observed_joint_strata_occupied": len(observed_joint),
+        "analysis_joint_strata_total": total_joint,
+    }
+
+
+def _radiative_t_jacobian(row: dict[str, int | float]) -> float:
+    es = float(row["energy_in_vertex"])
+    ep = float(row["energy_e_pre_external"])
+    q2 = float(row["q2_leptonic"])
+    photon_energy = float(row["energy_gamma"])
+    photon_cosine = float(row["cos_theta_gamma"])
+    nu = es - ep
+    if min(es, ep, q2) <= 0.0:
+        return 0.0
+    q_magnitude = math.sqrt(q2 + nu * nu)
+    hadron_energy = nu + GENERATOR_PROTON_MASS_GEV - photon_energy
+    hadron_momentum_squared = (
+        q_magnitude * q_magnitude
+        + photon_energy * photon_energy
+        - 2.0 * q_magnitude * photon_energy * photon_cosine
+    )
+    if hadron_energy <= 0.0 or hadron_momentum_squared <= 0.0:
+        return 0.0
+    w_squared = hadron_energy * hadron_energy - hadron_momentum_squared
+    threshold = GENERATOR_PROTON_MASS_GEV + PI0_MASS_GEV
+    if w_squared <= threshold * threshold:
+        return 0.0
+    w = math.sqrt(w_squared)
+    hadron_momentum = math.sqrt(hadron_momentum_squared)
+    beta = hadron_momentum / hadron_energy
+    gamma = hadron_energy / w
+    pstar_squared = (
+        (
+            w * w
+            - GENERATOR_PROTON_MASS_GEV**2
+            - PI0_MASS_GEV**2
+        )
+        ** 2
+        / 4.0
+        - (GENERATOR_PROTON_MASS_GEV * PI0_MASS_GEV) ** 2
+    ) / (w * w)
+    if pstar_squared <= 0.0:
+        return 0.0
+    return (
+        2.0
+        * PROTON_MASS_GEV
+        * gamma
+        * beta
+        * math.sqrt(pstar_squared)
+    )
+
+
+def _proposal_density_ratio(
+    row: dict[str, int | float],
+    norm: dict[str, str],
+    proposal_spec: dict[str, object],
+) -> float:
+    legacy_fraction = float(proposal_spec["legacy_fraction"])
+    if int(proposal_spec["mode"]) == 0:
+        return 1.0
+    q2 = float(row["q2_leptonic"])
+    xb = float(row["xb_leptonic"])
+    minus_t = float(row["minus_t_hard"])
+    phi = float(row["phi_cm_deg"]) % 360.0
+    binning = proposal_spec["binning"]
+    indices = (
+        _bin_index(q2, binning["Q2"]),
+        _bin_index(xb, binning["xB"]),
+        _bin_index(minus_t, binning["minus_t"]),
+        _bin_index(phi, binning["phi_deg"]),
+    )
+    if any(index is None for index in indices):
+        return 1.0 / legacy_fraction
+    iq2, ixb, it, iphi = (int(index) for index in indices)
+    q2_width = binning["Q2"][iq2 + 1] - binning["Q2"][iq2]
+    xb_width = binning["xB"][ixb + 1] - binning["xB"][ixb]
+    t_width = binning["minus_t"][it + 1] - binning["minus_t"][it]
+    phi_width = binning["phi_deg"][iphi + 1] - binning["phi_deg"][iphi]
+    inverse_q2_range = (
+        1.0 / _norm_float(norm, "q2_min")
+        - 1.0 / _norm_float(norm, "q2_max")
+    )
+    electron_energy_range = (
+        _norm_float(norm, "ep_max_effective")
+        - _norm_float(norm, "ep_min")
+    )
+    t_jacobian = _radiative_t_jacobian(row)
+    if t_jacobian <= 0.0:
+        return 1.0 / legacy_fraction
+    balanced_to_legacy = (
+        inverse_q2_range
+        * q2**2
+        / ((len(binning["Q2"]) - 1) * q2_width)
+        * electron_energy_range
+        * 2.0
+        * PROTON_MASS_GEV
+        * xb**2
+        / (q2 * (len(binning["xB"]) - 1) * xb_width)
+        * 2.0
+        * t_jacobian
+        / ((len(binning["minus_t"]) - 1) * t_width)
+        * 360.0
+        / ((len(binning["phi_deg"]) - 1) * phi_width)
+    )
+    return 1.0 / (
+        legacy_fraction + (1.0 - legacy_fraction) * balanced_to_legacy
+    )
+
+
 def _validate_legacy_input_shape(text: str, path: Path) -> None:
-    records = [
-        line.split("!", 1)[0].strip()
-        for line in text.splitlines()
-        if line.split("!", 1)[0].strip()
-    ]
-    if len(records) < 17:
-        raise ValueError(f"{path}: expected at least 17 legacy AAO input records")
-    try:
-        theory = int(records[0].split()[0])
-        fmcall = float(records[16].split()[0])
-    except ValueError as error:
-        raise ValueError(f"{path}: cannot parse theory or fmcall") from error
-    expected = 17 + (1 if fmcall == 0.0 else 0) + (1 if theory > 10 else 0)
+    records = _records(text)
+    expected = _legacy_record_count(records, path)
     if len(records) != expected:
         raise ValueError(
             f"{path}: expected {expected} legacy records, found {len(records)}; "
@@ -675,6 +1283,29 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--trials", type=int, required=True)
     run.add_argument("--seed", type=int, required=True)
     run.add_argument("--replica", type=int, required=True)
+    run.add_argument(
+        "--proposal",
+        choices=("legacy", "balanced"),
+        default="legacy",
+        help=(
+            "legacy proposal or a full-support mixture whose balanced "
+            "component allocates analysis-coordinate bins uniformly"
+        ),
+    )
+    run.add_argument(
+        "--config",
+        type=Path,
+        help="analysis config required by --proposal balanced",
+    )
+    run.add_argument(
+        "--legacy-fraction",
+        type=float,
+        default=0.25,
+        help=(
+            "full-support legacy-mixture probability for a balanced survey "
+            "(default: 0.25)"
+        ),
+    )
 
     validate = subparsers.add_parser("validate", help="validate an existing survey")
     validate.add_argument("--directory", type=Path, required=True)
@@ -692,6 +1323,9 @@ def main() -> int:
                 args.trials,
                 args.seed,
                 args.replica,
+                proposal=args.proposal,
+                config_path=args.config,
+                legacy_fraction=args.legacy_fraction,
             )
         else:
             result = validate_survey(args.directory)

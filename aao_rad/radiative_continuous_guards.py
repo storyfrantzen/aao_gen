@@ -1145,7 +1145,9 @@ def _build_study(
         "generator_revision": generator_revision,
         "generator_revision_source": generator_revision_source,
         "continuous_guard_learner_revision": learner_revision,
-        "survey_schema": radiative_survey.SURVEY_SCHEMA,
+        "survey_schema": training.base.norm_reference.get(
+            "survey_schema", radiative_survey.SURVEY_SCHEMA
+        ),
         "analysis_config_source": str(config_path.resolve()),
         "analysis_config_sha256": config_sha256,
         "analysis_selection": {

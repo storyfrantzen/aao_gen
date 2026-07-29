@@ -1109,7 +1109,9 @@ def _build_geometry_study(
         "generator_revision": generator_revision,
         "generator_revision_source": generator_revision_source,
         "geometry_learner_revision": learner_revision,
-        "survey_schema": radiative_survey.SURVEY_SCHEMA,
+        "survey_schema": training.norm_reference.get(
+            "survey_schema", radiative_survey.SURVEY_SCHEMA
+        ),
         "geometry_iteration": iteration,
         "legacy_input_sha256": training.input_signature,
         "legacy_generator_settings": training.legacy_input_settings,

@@ -154,6 +154,17 @@ c     and make a new version.
       real*8 survey_internal_contribution
       real*8 survey_observed_contribution
       real hydrogen_rad, vertex_x, vertex_y, vertex_z, vz
+      integer max_survey_bins
+      parameter (max_survey_bins=64)
+      real survey_q2_edges(max_survey_bins+1)
+      real survey_xb_edges(max_survey_bins+1)
+      real survey_t_edges(max_survey_bins+1)
+      real survey_phi_edges(max_survey_bins+1)
+      real survey_legacy_fraction,survey_balanced_fraction
+      real proposal_selector,proposal_density_ratio
+      real proposal_xb,proposal_minus_t,proposal_t_jacobian
+      real proposal_t_at_cosine_zero
+      real proposal_balanced_to_legacy
 
       integer dismc(6,100)
       integer intreg
@@ -167,6 +178,11 @@ c      integer iext
       integer mcall
       integer mcall_max
       integer sampling_mode,input_status
+      integer survey_proposal_mode
+      integer survey_nq2_bins,survey_nxb_bins
+      integer survey_nt_bins,survey_nphi_bins
+      integer proposal_component,proposal_q2_bin,proposal_xb_bin
+      integer proposal_t_bin,proposal_phi_bin,proposal_mapping_status
       integer candidate_status,coordinate_status,final_valid
       integer nprint,ntell,ntold
 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
@@ -178,6 +194,7 @@ cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
       integer*8 ntries
       integer*8 survey_ntrials,survey_seed,survey_replica
       integer*8 survey_rows,survey_final_valid
+      integer*8 survey_legacy_trials,survey_balanced_trials
       
       real cfac,asig
 
@@ -444,11 +461,20 @@ c
 c     Optional backward-compatible sampling trailer.  Legacy input files end
 c     above and therefore retain sampling_mode=0.  Fixed-trial survey mode 1
 c     requires an exact proposal count, explicit nonzero seed, and replica ID.
+c     A second optional survey record selects either the original proposal
+c     (0) or a full-support legacy/analysis-balanced mixture (1).
 
       sampling_mode=0
       survey_ntrials=0
       survey_seed=0
       survey_replica=0
+      survey_proposal_mode=0
+      survey_legacy_fraction=1.
+      survey_balanced_fraction=0.
+      survey_nq2_bins=0
+      survey_nxb_bins=0
+      survey_nt_bins=0
+      survey_nphi_bins=0
       read(5,*,iostat=input_status)sampling_mode
       if (input_status .lt. 0) sampling_mode=0
       if (input_status .gt. 0) then
@@ -475,6 +501,122 @@ c     requires an exact proposal count, explicit nonzero seed, and replica ID.
             write(6,*)'Survey mode requires a nonnegative replica ID'
             stop 2
          endif
+         read(5,*,iostat=input_status)survey_proposal_mode
+         if (input_status .lt. 0) survey_proposal_mode=0
+         if (input_status .gt. 0) then
+            write(6,*)'Invalid optional survey proposal mode'
+            stop 2
+         endif
+         if (survey_proposal_mode .ne. 0 .and.
+     *       survey_proposal_mode .ne. 1) then
+            write(6,*)'Survey proposal mode must be 0 or 1'
+            stop 2
+         endif
+         if (survey_proposal_mode .eq. 1) then
+            read(5,*,iostat=input_status)survey_legacy_fraction
+            if (input_status .ne. 0 .or.
+     *          survey_legacy_fraction .le. 0. .or.
+     *          survey_legacy_fraction .ge. 1.) then
+               write(6,*)'Balanced survey legacy fraction must be in (0,1)'
+               stop 2
+            endif
+            survey_balanced_fraction=1.-survey_legacy_fraction
+            read(5,*,iostat=input_status)survey_nq2_bins
+            if (input_status .ne. 0 .or. survey_nq2_bins .le. 0 .or.
+     *          survey_nq2_bins .gt. max_survey_bins) then
+               write(6,*)'Invalid balanced survey Q2 bin count'
+               stop 2
+            endif
+            read(5,*,iostat=input_status)
+     *         (survey_q2_edges(i),i=1,survey_nq2_bins+1)
+            if (input_status .ne. 0) then
+               write(6,*)'Cannot read balanced survey Q2 edges'
+               stop 2
+            endif
+            read(5,*,iostat=input_status)survey_nxb_bins
+            if (input_status .ne. 0 .or. survey_nxb_bins .le. 0 .or.
+     *          survey_nxb_bins .gt. max_survey_bins) then
+               write(6,*)'Invalid balanced survey xB bin count'
+               stop 2
+            endif
+            read(5,*,iostat=input_status)
+     *         (survey_xb_edges(i),i=1,survey_nxb_bins+1)
+            if (input_status .ne. 0) then
+               write(6,*)'Cannot read balanced survey xB edges'
+               stop 2
+            endif
+            read(5,*,iostat=input_status)survey_nt_bins
+            if (input_status .ne. 0 .or. survey_nt_bins .le. 0 .or.
+     *          survey_nt_bins .gt. max_survey_bins) then
+               write(6,*)'Invalid balanced survey -t bin count'
+               stop 2
+            endif
+            read(5,*,iostat=input_status)
+     *         (survey_t_edges(i),i=1,survey_nt_bins+1)
+            if (input_status .ne. 0) then
+               write(6,*)'Cannot read balanced survey -t edges'
+               stop 2
+            endif
+            read(5,*,iostat=input_status)survey_nphi_bins
+            if (input_status .ne. 0 .or.
+     *          survey_nphi_bins .le. 0 .or.
+     *          survey_nphi_bins .gt. max_survey_bins) then
+               write(6,*)'Invalid balanced survey phi bin count'
+               stop 2
+            endif
+            read(5,*,iostat=input_status)
+     *         (survey_phi_edges(i),i=1,survey_nphi_bins+1)
+            if (input_status .ne. 0) then
+               write(6,*)'Cannot read balanced survey phi edges'
+               stop 2
+            endif
+            do i=1,survey_nq2_bins
+               if (survey_q2_edges(i+1) .le.
+     *             survey_q2_edges(i)) then
+                  write(6,*)'Balanced survey Q2 edges not increasing'
+                  stop 2
+               endif
+            enddo
+            do i=1,survey_nxb_bins
+               if (survey_xb_edges(i+1) .le.
+     *             survey_xb_edges(i)) then
+                  write(6,*)'Balanced survey xB edges not increasing'
+                  stop 2
+               endif
+            enddo
+            do i=1,survey_nt_bins
+               if (survey_t_edges(i+1) .le. survey_t_edges(i)) then
+                  write(6,*)'Balanced survey -t edges not increasing'
+                  stop 2
+               endif
+            enddo
+            do i=1,survey_nphi_bins
+               if (survey_phi_edges(i+1) .le.
+     *             survey_phi_edges(i)) then
+                  write(6,*)'Balanced survey phi edges not increasing'
+                  stop 2
+               endif
+            enddo
+            if (survey_q2_edges(1) .lt. q2_min .or.
+     *          survey_q2_edges(survey_nq2_bins+1) .gt. q2_max) then
+               write(6,*)'Balanced survey Q2 edges exceed input range'
+               stop 2
+            endif
+            if (survey_xb_edges(1) .le. 0.) then
+               write(6,*)'Balanced survey xB edges must be positive'
+               stop 2
+            endif
+            if (survey_t_edges(1) .lt. 0.) then
+               write(6,*)'Balanced survey -t edges must be nonnegative'
+               stop 2
+            endif
+            if (abs(survey_phi_edges(1)) .gt. 1.e-5 .or.
+     *          abs(survey_phi_edges(survey_nphi_bins+1)-360.)
+     *          .gt. 1.e-4) then
+               write(6,*)'Balanced survey phi edges must span 0 to 360'
+               stop 2
+            endif
+         endif
          if (epirea .ne. 1 .or. npart .ne. 4) then
             write(6,*)'Survey mode currently requires pi0 and npart=4'
             stop 2
@@ -482,6 +624,8 @@ c     requires an exact proposal count, explicit nonzero seed, and replica ID.
          write(6,*)'Fixed-trial radiative survey mode:',survey_ntrials
          write(6,*)'Explicit survey seed:',survey_seed
          write(6,*)'Survey replica ID:',survey_replica
+         write(6,*)'Survey proposal mode:',survey_proposal_mode
+         write(6,*)'Survey legacy fraction:',survey_legacy_fraction
       endif
 c
  1    mcall_max	= 0
@@ -490,6 +634,8 @@ c
       survey_rows=0
       survey_final_valid=0
       survey_sig_internal_tot=0.
+      survey_legacy_trials=0
+      survey_balanced_trials=0
 
 c     Use the internal clock to initialize the random number generator
 
@@ -562,9 +708,11 @@ c     filerz=aaoradgen-pi0-1.6-0811.rz.0, for example.
       open(unit=13,file=lund_out)
       if (sampling_mode .eq. 1) then
          open(unit=16,file=file_survey,status='replace')
-         write(16,'(A)')'# schema=aao-rad-survey-v1'
+         write(16,'(A)')'# schema=aao-rad-survey-v2'
          write(16,'(A)')'replica,trial,final_valid,candidate_status,'
-     *   //'intreg,helicity,r_u,r_ep,u_gamma,channel_selector,'
+     *   //'intreg,helicity,proposal_component,proposal_q2_bin,'
+     *   //'proposal_xb_bin,proposal_t_bin,proposal_phi_bin,'
+     *   //'proposal_density_ratio,r_u,r_ep,u_gamma,channel_selector,'
      *   //'vertex_fraction,incoming_loss_base,'
      *   //'incoming_loss_accept_test,photon_side_base,'
      *   //'photon_cosine_base,photon_phi_base,'
@@ -742,6 +890,29 @@ c     distributed according to the Mo-Tsai integrand.
       if (sampling_mode .eq. 1 .and.
      *    ntries .ge. survey_ntrials) go to 50
       ntries	= ntries+1
+      proposal_component=0
+      proposal_q2_bin=0
+      proposal_xb_bin=0
+      proposal_t_bin=0
+      proposal_phi_bin=0
+      proposal_density_ratio=1.
+      proposal_balanced_to_legacy=0.
+      proposal_xb=0.
+      proposal_minus_t=0.
+      proposal_t_jacobian=0.
+      proposal_t_at_cosine_zero=0.
+      if (sampling_mode .eq. 1 .and.
+     *    survey_proposal_mode .eq. 1) then
+         proposal_selector=myran()
+         if (proposal_selector .ge. survey_legacy_fraction) then
+            proposal_component=1
+            survey_balanced_trials=survey_balanced_trials+1
+         else
+            survey_legacy_trials=survey_legacy_trials+1
+         endif
+      elseif (sampling_mode .eq. 1) then
+         survey_legacy_trials=survey_legacy_trials+1
+      endif
       if(flag_ehel.eq.1) ehel = get_spin(idum)
 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
       hel       = ehel
@@ -790,20 +961,37 @@ c     Cut off the incident energy at e_s=ebeam/4.
       ps	= sqrt(es**2-mel**2)
       rs	= ps/es
 
-      uq2	= uq2_min+uq2rng*myran()
-      q2	= 1./uq2
-      r_u	= (uq2-uq2_min)/uq2rng
+      if (proposal_component .eq. 1) then
+         proposal_q2_bin=min(int(survey_nq2_bins*myran())+1,
+     *      survey_nq2_bins)
+         q2=survey_q2_edges(proposal_q2_bin)+
+     *      (survey_q2_edges(proposal_q2_bin+1)-
+     *       survey_q2_edges(proposal_q2_bin))*myran()
+         proposal_xb_bin=min(int(survey_nxb_bins*myran())+1,
+     *      survey_nxb_bins)
+         proposal_xb=survey_xb_edges(proposal_xb_bin)+
+     *      (survey_xb_edges(proposal_xb_bin+1)-
+     *       survey_xb_edges(proposal_xb_bin))*myran()
+         ep=es-q2/(2.*real(analysis_mp)*proposal_xb)
+         uq2=1./q2
+         r_u=(uq2-uq2_min)/uq2rng
+         r_ep=(epmax-ep)/eprng
+      else
+         uq2=uq2_min+uq2rng*myran()
+         q2=1./uq2
+         r_u=(uq2-uq2_min)/uq2rng
 
-c     calculate the energy and momentum of the scattered electron,
-c     and calculate Q**2
+c        calculate the energy and momentum of the scattered electron,
+c        and calculate Q**2
 
-      ep	= epmax-eprng*myran()
-      r_ep	= (epmax-ep)/eprng
+         ep=epmax-eprng*myran()
+         r_ep=(epmax-ep)/eprng
+      endif
       
 c     check to see if the scattered electron energy is below the
 c     detector threshold
 
-      if (ep .lt. ep_min)go to 20
+      if (ep .lt. ep_min .or. ep .gt. epmax)go to 20
 
       q0	= es-ep
       s		= q2/4/es/ep
@@ -997,10 +1185,41 @@ c     choose ek by making a change of variables
       
       if (ek .gt. ekmax)go to 20
 
-      hadron_cosine_base=myran()
-      hadron_phi_base=myran()
-      csthcm	= -1.+2.*hadron_cosine_base
-      phicm	= 360.*hadron_phi_base
+      if (sampling_mode .eq. 1 .and.
+     *    survey_proposal_mode .eq. 1) then
+         call radiative_t_mapping(es,ep,th0,ek,cstk,mpi,0.938D0,
+     *      analysis_mp,proposal_t_at_cosine_zero,
+     *      proposal_t_jacobian,proposal_mapping_status)
+         if (proposal_mapping_status .ne. 0)go to 20
+      endif
+
+      if (proposal_component .eq. 1) then
+         proposal_t_bin=min(int(survey_nt_bins*myran())+1,
+     *      survey_nt_bins)
+         proposal_minus_t=survey_t_edges(proposal_t_bin)+
+     *      (survey_t_edges(proposal_t_bin+1)-
+     *       survey_t_edges(proposal_t_bin))*myran()
+         csthcm=(proposal_t_at_cosine_zero-proposal_minus_t)/
+     *      proposal_t_jacobian
+         if (csthcm .lt. -1. .or. csthcm .gt. 1.)go to 20
+         hadron_cosine_base=(csthcm+1.)/2.
+         proposal_phi_bin=min(int(survey_nphi_bins*myran())+1,
+     *      survey_nphi_bins)
+         phicm=survey_phi_edges(proposal_phi_bin)+
+     *      (survey_phi_edges(proposal_phi_bin+1)-
+     *       survey_phi_edges(proposal_phi_bin))*myran()
+         hadron_phi_base=phicm/360.
+      else
+         hadron_cosine_base=myran()
+         hadron_phi_base=myran()
+         csthcm=-1.+2.*hadron_cosine_base
+         phicm=360.*hadron_phi_base
+         if (sampling_mode .eq. 1 .and.
+     *       survey_proposal_mode .eq. 1) then
+            proposal_minus_t=proposal_t_at_cosine_zero-
+     *         proposal_t_jacobian*csthcm
+         endif
+      endif
       
 c********************************** Ek < Delta ****************************************      
 
@@ -1155,6 +1374,24 @@ c     Fixed-trial mode constructs exactly one post-external-loss candidate
 c     for every internally valid proposal.  It records the original proposal
 c     integrand and gives invalid final candidates zero observed contribution.
 
+      if (sampling_mode .eq. 1 .and.
+     *    survey_proposal_mode .eq. 1) then
+         proposal_xb=0.
+         if (es-ep .gt. 0.) then
+            proposal_xb=q2/(2.*real(analysis_mp)*real(es-ep))
+         endif
+         proposal_minus_t=ppx**2+ppy**2+ppz**2
+     *      -(real(analysis_mp)-eprot)**2
+         call balanced_proposal_ratio(q2,proposal_xb,
+     *      proposal_minus_t,phicm,proposal_t_jacobian,
+     *      uq2rng,eprng,analysis_mp,survey_legacy_fraction,
+     *      survey_nq2_bins,survey_q2_edges,survey_nxb_bins,
+     *      survey_xb_edges,survey_nt_bins,survey_t_edges,
+     *      survey_nphi_bins,survey_phi_edges,
+     *      proposal_balanced_to_legacy,proposal_density_ratio)
+         sigr=sigr*proposal_density_ratio
+      endif
+
       if (sampling_mode .eq. 1) then
          ep_sav=ep
          q2_lep=q2
@@ -1222,6 +1459,9 @@ c     integrand and gives invalid final candidates zero observed contribution.
          survey_rows=survey_rows+1
          write(16,9001)survey_replica,ntries,final_valid,
      *      candidate_status,intreg,ehel,
+     *      proposal_component,proposal_q2_bin-1,proposal_xb_bin-1,
+     *      proposal_t_bin-1,proposal_phi_bin-1,
+     *      proposal_density_ratio,
      *      r_u,r_ep,uek,csran,
      *      vertex_fraction,incoming_loss_base,
      *      incoming_loss_accept_test,photon_side_base,
@@ -1455,6 +1695,8 @@ Clcs      call hrend('aaoradgen')
          write(6,*)' Internally valid survey rows =',survey_rows
          write(6,*)' Valid final survey candidates =',
      *      survey_final_valid
+         write(6,*)' Survey legacy/balanced trials =',
+     *      survey_legacy_trials,survey_balanced_trials
          write(6,*)' Survey internal cross section =',
      *      survey_sig_internal_tot*analysis_volume/tries,
      *      ' micro-barns'
@@ -1464,6 +1706,8 @@ Clcs      call hrend('aaoradgen')
          write(12,*)' Internally valid survey rows =',survey_rows
          write(12,*)' Valid final survey candidates =',
      *      survey_final_valid
+         write(12,*)' Survey legacy/balanced trials =',
+     *      survey_legacy_trials,survey_balanced_trials
          write(12,*)' Survey internal cross section =',
      *      survey_sig_internal_tot*analysis_volume/tries,
      *      ' micro-barns'
@@ -1533,11 +1777,26 @@ Clcs      call hrend('aaoradgen')
       write(15,*)'res_opt=',res_opt
       write(15,*)'fmcall=',fmcall
       if (sampling_mode .eq. 1)then
-         write(15,*)'survey_schema=aao-rad-survey-v1'
+         write(15,*)'survey_schema=aao-rad-survey-v2'
          write(15,*)'survey_file=',file_survey
          write(15,*)'survey_seed=',survey_seed
          write(15,*)'survey_replica=',survey_replica
          write(15,*)'survey_ntrials_requested=',survey_ntrials
+         write(15,*)'survey_proposal_mode=',survey_proposal_mode
+         if (survey_proposal_mode .eq. 1)then
+            write(15,*)'survey_proposal=analysis_balanced_mixture'
+         else
+            write(15,*)'survey_proposal=legacy'
+         endif
+         write(15,*)'survey_legacy_fraction=',survey_legacy_fraction
+         write(15,*)'survey_balanced_fraction=',
+     *      survey_balanced_fraction
+         write(15,*)'survey_legacy_trials=',survey_legacy_trials
+         write(15,*)'survey_balanced_trials=',survey_balanced_trials
+         write(15,*)'survey_balance_q2_bins=',survey_nq2_bins
+         write(15,*)'survey_balance_xb_bins=',survey_nxb_bins
+         write(15,*)'survey_balance_t_bins=',survey_nt_bins
+         write(15,*)'survey_balance_phi_bins=',survey_nphi_bins
          write(15,*)'survey_rows=',survey_rows
          write(15,*)'survey_final_valid=',survey_final_valid
          write(15,*)'survey_phase_volume=',analysis_volume
@@ -1556,7 +1815,7 @@ Clcs      call hrend('aaoradgen')
       enddo
 
  1410 format(' Distribution of mcall values, region', i2 /10(1x,10i7/))
- 9001 format(I0,5(',',I0),50(',',ES24.16E3))
+ 9001 format(I0,10(',',I0),51(',',ES24.16E3))
 
       close(14)
 Cvpk      CALL bos_end(recname)
@@ -1565,6 +1824,133 @@ Cvpk      CALL bos_end(recname)
 
        write(6,*)' END OF LOOP'
       stop
+      end
+
+c   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+      subroutine radiative_t_mapping(es,ep,th0,ephot,cstk,mpi,mp,
+     * analysis_mp,t_at_cosine_zero,t_jacobian,status)
+
+c     At fixed lepton and internal-photon kinematics, -t is affine in the
+c     pion center-of-mass cosine:
+c
+c       -t(cos(theta*)) = t_at_cosine_zero - t_jacobian*cos(theta*).
+c
+c     This lets the balanced survey sample an analysis -t bin directly while
+c     retaining the exact legacy cosine density in the proposal correction.
+
+      implicit none
+
+      real*8 es,ep,ephot,mpi,mp,analysis_mp
+      real th0,cstk,t_at_cosine_zero,t_jacobian
+      real*8 mel,ps,pp,nu,q2,qvec,pwr2,pwr
+      real*8 ewreal,wreal2,wreal,beta,gamma,pstar2,pstar,epcm
+      integer status
+
+      status=1
+      t_at_cosine_zero=0.
+      t_jacobian=0.
+      mel=0.511D-3
+      if (es .le. mel .or. ep .le. mel) return
+      ps=sqrt(es**2-mel**2)
+      pp=sqrt(ep**2-mel**2)
+      nu=es-ep
+      q2=2.D0*es*ep-2.D0*ps*pp*dcos(dble(th0))-2.D0*mel**2
+      if (q2 .le. 0.D0) return
+      qvec=sqrt(q2+nu**2)
+      ewreal=nu+mp-ephot
+      pwr2=qvec**2+ephot**2-2.D0*qvec*ephot*dble(cstk)
+      if (pwr2 .le. 0.D0 .or. ewreal .le. 0.D0) return
+      pwr=sqrt(pwr2)
+      wreal2=ewreal**2-pwr2
+      if (wreal2 .le. (mp+mpi)**2) return
+      wreal=sqrt(wreal2)
+      beta=pwr/ewreal
+      gamma=ewreal/wreal
+      if (beta .le. 0.D0 .or. beta .ge. 1.D0) return
+      pstar2=((wreal**2-mp**2-mpi**2)**2/4.D0-
+     *   (mp*mpi)**2)/wreal**2
+      if (pstar2 .le. 0.D0) return
+      pstar=sqrt(pstar2)
+      epcm=sqrt(pstar**2+mp**2)
+      t_at_cosine_zero=real(2.D0*analysis_mp*gamma*epcm-
+     *   analysis_mp**2-mp**2)
+      t_jacobian=real(2.D0*analysis_mp*gamma*beta*pstar)
+      if (t_jacobian .le. 0.) return
+      status=0
+      return
+      end
+
+c   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+      subroutine balanced_proposal_ratio(q2,xb,minus_t,phicm,
+     * t_jacobian,uq2rng,eprng,analysis_mp,legacy_fraction,
+     * nq2,q2_edges,nxb,xb_edges,nt,t_edges,nphi,phi_edges,
+     * balanced_to_legacy,density_ratio)
+
+c     Return q_legacy/q_mixture for
+c
+c       q_mixture = legacy_fraction*q_legacy
+c                 + (1-legacy_fraction)*q_balanced.
+c
+c     q_balanced chooses analysis Q2, xB, -t, and phi bins uniformly,
+c     then samples uniformly inside the chosen bin.  The xB-to-E' and
+c     -t-to-cos(theta*) Jacobians are included explicitly.  A point outside
+c     the configured balanced support has q_balanced=0 and therefore receives
+c     density_ratio=1/legacy_fraction.
+
+      implicit none
+
+      integer nq2,nxb,nt,nphi
+      integer iq2,ixb,it,iphi,i
+      real q2,xb,minus_t,phicm,t_jacobian,uq2rng,eprng
+      real legacy_fraction,q2_edges(*),xb_edges(*),t_edges(*)
+      real phi_edges(*),balanced_to_legacy,density_ratio
+      real dq,dx,dt,dphi,phi_wrapped
+      real*8 analysis_mp
+
+      iq2=0
+      ixb=0
+      it=0
+      iphi=0
+      balanced_to_legacy=0.
+      density_ratio=1./legacy_fraction
+      if (q2 .le. 0. .or. xb .le. 0. .or.
+     *    t_jacobian .le. 0.) return
+
+      do i=1,nq2
+         if (q2 .ge. q2_edges(i) .and.
+     *       q2 .lt. q2_edges(i+1)) iq2=i
+      enddo
+      do i=1,nxb
+         if (xb .ge. xb_edges(i) .and.
+     *       xb .lt. xb_edges(i+1)) ixb=i
+      enddo
+      do i=1,nt
+         if (minus_t .ge. t_edges(i) .and.
+     *       minus_t .lt. t_edges(i+1)) it=i
+      enddo
+      phi_wrapped=modulo(phicm,360.)
+      do i=1,nphi
+         if (phi_wrapped .ge. phi_edges(i) .and.
+     *       phi_wrapped .lt. phi_edges(i+1)) iphi=i
+      enddo
+      if (iq2 .eq. 0 .or. ixb .eq. 0 .or.
+     *    it .eq. 0 .or. iphi .eq. 0) return
+
+      dq=q2_edges(iq2+1)-q2_edges(iq2)
+      dx=xb_edges(ixb+1)-xb_edges(ixb)
+      dt=t_edges(it+1)-t_edges(it)
+      dphi=phi_edges(iphi+1)-phi_edges(iphi)
+      balanced_to_legacy=
+     *   uq2rng*q2**2/(real(nq2)*dq)*
+     *   eprng*2.*real(analysis_mp)*xb**2/
+     *      (q2*real(nxb)*dx)*
+     *   2.*t_jacobian/(real(nt)*dt)*
+     *   360./(real(nphi)*dphi)
+      density_ratio=1./(legacy_fraction+
+     *   (1.-legacy_fraction)*balanced_to_legacy)
+      return
       end
 
 c   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
