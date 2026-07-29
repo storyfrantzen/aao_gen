@@ -1145,7 +1145,7 @@ See `RADIATIVE_SURVEY.md` for executable commands. Manifests intentionally set
 `production_ready` to false until milestone 3 implements the exact proposal
 correction and radiative unweighting.
 
-## Milestones 2b–2d: hard-parent migration and core-geometry diagnostics
+## Milestones 2b–2e: migration and core-geometry diagnostics
 
 The independent proposal-cell learner is a general baseline, but it does not
 share the Born-like structure of neighboring radiative strata.
@@ -1167,6 +1167,12 @@ After selecting channel-marginalized spatial geometry,
 boundary-template fallbacks for low-support or empty final-LUND strata. It
 also records exact reconstruction recipes and keeps the required future
 full-support tail explicit.
+
+`radiative_continuous_guards.py` uses those diagnostics to move away from
+analysis-sized cell dilation. It fits cross-section-weighted joint boxes in
+AAO's normalized native proposal coordinates, regularizes sparse strata with
+neighboring final-LUND strata, and compares continuous outward padding on
+held-out development replicas. See `CONTINUOUS_GUARDS.md`.
 
 The migration matrix is diagnostic and `production_ready` remains false. It
 does not assume that the radiative integrand can already be sampled in hard

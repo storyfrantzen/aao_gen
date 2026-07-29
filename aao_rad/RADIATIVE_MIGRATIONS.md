@@ -1,4 +1,4 @@
-# Milestones 2b–2d hard-parent migration diagnostics
+# Milestones 2b–2e radiative guard diagnostics
 
 `radiative_migrations.py` tests a physically motivated middle ground between
 the exact Born analysis strata and an independent high-dimensional
@@ -389,10 +389,28 @@ Replicas 3 and 4 are development data because their earlier results motivated
 these candidates. Use them to compare the recipes, but validate any selected
 geometry on fresh replicas before implementing the production proposal.
 
-Run all milestone-2b through milestone-2d unit tests with:
+Run all milestone-2b through milestone-2e unit tests with:
 
 ```bash
 python3 -m unittest -v \
   test_radiative_migrations.py \
-  test_radiative_guard_geometries.py
+  test_radiative_guard_geometries.py \
+  test_radiative_continuous_guards.py
 ```
+
+## Milestone 2e: continuous native-coordinate guards
+
+The hard-parent cell studies establish the migration structure but do not
+require the production proposal to retain analysis-sized hard-coordinate
+cells. `radiative_continuous_guards.py` instead fits one weighted joint box
+per final-LUND analysis stratum in AAO's normalized native proposal
+coordinates.
+
+Faces are optimized at empirical weighted-CDF breakpoints, low-support
+strata use ESS-controlled neighbor pooling, phi remains circular, and held-out
+replicas compare continuous outward-padding values. The resulting normalized
+box volumes can be used in an exact future core-plus-global-tail proposal
+density.
+
+See `CONTINUOUS_GUARDS.md` for the algorithm, RGK commands, artifacts, and
+validation requirements.

@@ -252,7 +252,7 @@ This is still a learning artifact: `production_ready` is false. The manifest
 does not alter radiative sampling or LUND output until milestone 3 implements
 the exact core-plus-tail proposal correction and unweighting.
 
-## Milestones 2b–2d: hard-parent migrations and guard geometry
+## Milestones 2b–2e: migrations and guard geometry
 
 The independent proposal-cell guard is deliberately general but can be sparse.
 `radiative_migrations.py` provides a complementary, physically organized
@@ -262,3 +262,8 @@ the final-LUND analysis strata. The follow-on
 channel-marginalized core guards without changing AAO sampling. See
 [`RADIATIVE_MIGRATIONS.md`](RADIATIVE_MIGRATIONS.md) for the coordinate
 definitions, farm commands, artifacts, and interpretation.
+
+`radiative_continuous_guards.py` then replaces whole-cell dilation with
+weighted joint boxes in the normalized native proposal coordinates and
+compares continuous padding values. See
+[`CONTINUOUS_GUARDS.md`](CONTINUOUS_GUARDS.md).
