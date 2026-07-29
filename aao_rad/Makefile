@@ -18,7 +18,11 @@ clean:
 	rm -f build/aao_rad $(addprefix build/, $(OBJ)) $(addprefix build/, $(OBJC))
 
 test: aao_rad
-	python3 -m unittest -v test_radiative_survey.py test_radiative_guards.py test_radiative_migrations.py
+	python3 -m unittest -v \
+		test_radiative_survey.py \
+		test_radiative_guards.py \
+		test_radiative_migrations.py \
+		test_radiative_guard_geometries.py
 
 
 

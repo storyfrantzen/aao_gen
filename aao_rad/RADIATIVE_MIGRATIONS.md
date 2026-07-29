@@ -1,4 +1,4 @@
-# Milestones 2b–2c hard-parent migration diagnostics
+# Milestones 2b–2d hard-parent migration diagnostics
 
 `radiative_migrations.py` tests a physically motivated middle ground between
 the exact Born analysis strata and an independent high-dimensional
@@ -305,4 +305,94 @@ Run the unit tests with:
 
 ```bash
 python3 -m unittest -v test_radiative_migrations.py
+```
+
+## Milestone 2d: compare support-adaptive core guards
+
+Milestone 2c selects `channel_marginalized` as the spatial representation.
+Milestone 2d keeps that representation fixed and tests how low-support or
+empty final-LUND strata should obtain a core hard-parent guard. The
+`radiative_guard_geometries.py` diagnostic compares:
+
+| Identifier | Core construction |
+|---|---|
+| `independent_frozen` | Each target uses only its own training footprint |
+| `independent_all_axis_dilation` | Independent footprint plus one hard-cell step along any axis |
+| `hierarchical_neighbor_offsets` | Low/empty targets borrow translated hard-minus-target offsets from neighboring supported targets, with boundary/global fallback templates |
+| `hierarchical_neighbor_offsets_qx_dilation` | Hierarchical core plus one hard-cell step along `Q2` or `xB` |
+
+All candidate cores are frozen using the training replicas only. Borrowing
+uses offsets in bin-index space:
+
+```text
+hard-parent index - donor final-LUND target index
+```
+
+The same offset is translated to the recipient target. Hard phi is periodic.
+Boundary templates are learned separately for lower, interior, and upper
+positions in observed `Q2`, `xB`, and `-t`. They are cross-section weighted and
+come from well-supported training strata when those exist. The recipe records
+every donor, seed parent, template, support threshold, and construction rule.
+
+This is still a **core-guard diagnostic**, not a hard physics restriction.
+Every future production proposal must mix the selected core with a nonzero
+full-support tail and use the exact mixture density in its unweighting
+Jacobian.
+
+Run the geometry comparison from `aao_rad`:
+
+```bash
+python3 radiative_guard_geometries.py compare \
+  --config ../../../configs/analysis/rgk/6.535.json \
+  --training-survey \
+    survey_rgk_replica000 \
+    survey_rgk_replica001 \
+    survey_rgk_replica002 \
+  --validation-survey \
+    survey_rgk_replica003 \
+    survey_rgk_replica004 \
+  --target-parent-fraction 0.995 \
+  --neighbor-radius 1 \
+  --iteration 0 \
+  --minimum-training-rows 10 \
+  --minimum-training-ess 5 \
+  --minimum-parent-coverage 0.98 \
+  --generator-revision 54f5ba8d59b86b8cabb2229e5c2cf2be5de1ff00 \
+  --output migration_rgk_guard_geometries_iteration000
+```
+
+As in the preceding studies, the default applies the configured final-LUND
+`Q2` and `W` selection and no analysis-level `y` cut.
+
+Render the comparison:
+
+```bash
+python3 radiative_guard_geometries.py plot \
+  --comparison \
+    migration_rgk_guard_geometries_iteration000/guard_geometry_comparison.json \
+  --output migration_rgk_guard_geometries_iteration000_plots
+```
+
+The immutable, checksummed outputs are:
+
+- `guard_geometry_comparison.json`: aggregate and per-support-class held-out
+  coverage, purity proxy, compactness, native-`intreg` coverage, material-bin
+  coverage, and pass/fail counts for every candidate;
+- `guard_geometry_recipes.json`: exact training seeds, neighbor donors,
+  boundary/global offset templates, and per-stratum construction traces;
+- `guard_geometry_strata.csv`: one row per
+  `(final-LUND analysis stratum, candidate)`;
+- `guard_geometry_comparison.pdf`: coverage, core-size/purity, support-class,
+  and per-stratum pass/fail plots.
+
+Replicas 3 and 4 are development data because their earlier results motivated
+these candidates. Use them to compare the recipes, but validate any selected
+geometry on fresh replicas before implementing the production proposal.
+
+Run all milestone-2b through milestone-2d unit tests with:
+
+```bash
+python3 -m unittest -v \
+  test_radiative_migrations.py \
+  test_radiative_guard_geometries.py
 ```
