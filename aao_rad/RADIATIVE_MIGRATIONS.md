@@ -234,14 +234,63 @@ python3 radiative_migrations.py plot-representations \
 The comparison writes immutable, checksummed artifacts:
 
 - `representation_comparison.json`: aggregate training and held-out coverage,
-  one-more-dilation recovery, compactness, purity proxy, material-stratum
-  coverage, and coverage separately for every native `intreg`;
+  one-more-dilation recovery, compactness, frozen and one-more-dilation purity
+  proxies, the number of strata passing the requested coverage before and
+  after dilation, material-stratum coverage, coverage separately for every
+  native `intreg`, and residual-offset summaries;
 - `representation_footprints.json`: the exact frozen training footprint for
   every analysis stratum and representation;
 - `representation_strata.csv`: one row per
-  `(analysis stratum, representation)` for detailed inspection;
+  `(analysis stratum, representation)`, including frozen and expanded coverage
+  and purity;
+- `representation_residual_offsets.csv`: cross-section-weighted validation
+  contributions grouped by representation, training-support status, native
+  `intreg`, target-bin boundary position, and the exact hard-minus-observed
+  bin offset;
 - `representation_comparison.pdf`: optional plotted comparison from
   `plot-representations`.
+
+The offset tuple is ordered as
+`(hard Q2 bin - observed Q2 bin, hard xB bin - observed xB bin,
+hard -t bin - observed -t bin, wrapped hard phi bin - observed phi bin)`.
+The phi offset is periodic. Hard-parent underflow and overflow in `Q2`, `xB`,
+or `-t` are retained explicitly through the corresponding `hard_*_region`
+columns rather than being merged into ordinary edge bins.
+
+For each offset, `selected` means it is inside the frozen footprint,
+`frozen_tail` means it is outside that footprint, `recovered` means the next
+spatial dilation adds it, and `residual` means it remains outside even after
+that dilation. The JSON also pools these residuals by training-support status,
+native `intreg`, target-bin boundary position, and one coordinate at a time.
+This makes it possible to distinguish a generally too-small dilation from a
+localized feed-in tail, channel-specific effect, or undersampled training
+stratum.
+
+Because comparison outputs are immutable, rerun the same five surveys under a
+new iteration/output name after updating this diagnostic:
+
+```bash
+python3 radiative_migrations.py compare-representations \
+  --config ../../../configs/analysis/rgk/6.535.json \
+  --training-survey \
+    survey_rgk_replica000 \
+    survey_rgk_replica001 \
+    survey_rgk_replica002 \
+  --validation-survey \
+    survey_rgk_replica003 \
+    survey_rgk_replica004 \
+  --target-parent-fraction 0.995 \
+  --parent-dilation 0 \
+  --iteration 1 \
+  --minimum-parent-coverage 0.98 \
+  --generator-revision 54f5ba8d59b86b8cabb2229e5c2cf2be5de1ff00 \
+  --output migration_rgk_representations_iteration001
+
+python3 radiative_migrations.py plot-representations \
+  --comparison \
+    migration_rgk_representations_iteration001/representation_comparison.json \
+  --output migration_rgk_representations_iteration001_plots
+```
 
 The command ranks representations first by cross-section-weighted held-out
 coverage and then by the number of selected native components. That ranking is

@@ -28,13 +28,16 @@ MANIFEST_SCHEMA = "aao-rad-migration-v1"
 VALIDATION_SCHEMA = "aao-rad-migration-validation-v1"
 PLOT_SCHEMA = "aao-rad-migration-plots-v1"
 REPRESENTATION_COMPARISON_SCHEMA = (
+    "aao-rad-migration-representation-comparison-v2"
+)
+LEGACY_REPRESENTATION_COMPARISON_SCHEMA = (
     "aao-rad-migration-representation-comparison-v1"
 )
 REPRESENTATION_FOOTPRINT_SCHEMA = (
     "aao-rad-migration-representation-footprints-v1"
 )
 REPRESENTATION_PLOT_SCHEMA = (
-    "aao-rad-migration-representation-plots-v1"
+    "aao-rad-migration-representation-plots-v2"
 )
 HARD_COORDINATE_DEFINITION = "hard_vertex_born_parent"
 OBSERVED_COORDINATE_DEFINITION = "final_lund_analysis"
@@ -2222,6 +2225,410 @@ def _campaign_comparison_metadata(
     }
 
 
+def _target_boundary_position(index: int, bins: int) -> str:
+    if bins <= 1:
+        return "both_boundaries"
+    if index == 0:
+        return "lower_boundary"
+    if index == bins - 1:
+        return "upper_boundary"
+    return "interior"
+
+
+def _migration_offset_key(
+    parent_id: str,
+    target: guards.Stratum,
+    parent_grid: ParentGrid,
+) -> tuple[str, str, str, str, int, int, int, int]:
+    parent = parent_from_identifier(parent_id, parent_grid)
+    metadata = parent_metadata(parent, parent_grid)["coordinates"]
+    relationship, _ = parent_relationship(
+        parent, target, parent_grid
+    )
+    phi_bins = len(parent_grid.phi_edges) - 1
+    signed_phi_delta = (
+        (parent.iphi - target.iphi + phi_bins // 2) % phi_bins
+        - phi_bins // 2
+    )
+    return (
+        relationship,
+        str(metadata["Q2"]["region"]),
+        str(metadata["xB"]["region"]),
+        str(metadata["minus_t"]["region"]),
+        parent.iq2 - target.iq2,
+        parent.ixb - target.ixb,
+        parent.it - target.it,
+        signed_phi_delta,
+    )
+
+
+def _offset_key_metadata(
+    key: tuple[str, str, str, str, int, int, int, int],
+) -> dict[str, object]:
+    (
+        relationship,
+        q2_region,
+        xb_region,
+        t_region,
+        delta_q2,
+        delta_xb,
+        delta_t,
+        delta_phi,
+    ) = key
+    return {
+        "relationship": relationship,
+        "hard_q2_region": q2_region,
+        "hard_xb_region": xb_region,
+        "hard_minus_t_region": t_region,
+        "delta_q2_index": delta_q2,
+        "delta_xb_index": delta_xb,
+        "delta_minus_t_index": delta_t,
+        "delta_phi_index": delta_phi,
+    }
+
+
+def _empty_offset_accumulator() -> dict[str, guards.Moment]:
+    return {
+        "total": guards.Moment(),
+        "selected": guards.Moment(),
+        "frozen_tail": guards.Moment(),
+        "expanded": guards.Moment(),
+        "recovered": guards.Moment(),
+        "residual": guards.Moment(),
+    }
+
+
+def _add_offset_accumulator(
+    target: dict[str, guards.Moment],
+    source: dict[str, guards.Moment],
+) -> None:
+    for name in target:
+        _add_moment(target[name], source[name])
+
+
+def _offset_metrics(
+    accumulator: dict[str, guards.Moment],
+    *,
+    proposals: int,
+    inside_total: float,
+    residual_total: float,
+) -> dict[str, object]:
+    total = accumulator["total"]
+    selected = accumulator["selected"]
+    expanded = accumulator["expanded"]
+    return {
+        "total": guards._compact_metrics(total, proposals),
+        "selected_parents": guards._compact_metrics(
+            selected, proposals
+        ),
+        "frozen_tail": guards._compact_metrics(
+            accumulator["frozen_tail"], proposals
+        ),
+        "one_more_dilation": guards._compact_metrics(
+            expanded, proposals
+        ),
+        "recovered_by_one_more_dilation": guards._compact_metrics(
+            accumulator["recovered"], proposals
+        ),
+        "residual_after_one_more_dilation": guards._compact_metrics(
+            accumulator["residual"], proposals
+        ),
+        "frozen_parent_fraction": (
+            selected.total / total.total if total.total > 0.0 else None
+        ),
+        "one_more_dilation_fraction": (
+            expanded.total / total.total if total.total > 0.0 else None
+        ),
+        "fraction_of_inside_analysis_cross_section": (
+            total.total / inside_total if inside_total > 0.0 else None
+        ),
+        "fraction_of_residual_after_one_more_dilation": (
+            accumulator["residual"].total / residual_total
+            if residual_total > 0.0
+            else None
+        ),
+    }
+
+
+def _residual_offset_summary(
+    detailed: dict[
+        tuple[
+            str,
+            int,
+            str,
+            str,
+            str,
+            str,
+            str,
+            str,
+            str,
+            int,
+            int,
+            int,
+            int,
+        ],
+        dict[str, guards.Moment],
+    ],
+    *,
+    proposals: int,
+    limit: int = 50,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    pooled: dict[
+        tuple[str, str, str, str, int, int, int, int],
+        dict[str, guards.Moment],
+    ] = {}
+    by_status = {
+        status: _empty_offset_accumulator()
+        for status in (
+            "learned",
+            "learned_low_support",
+            "no_training_contribution",
+        )
+    }
+    by_channel = {
+        channel: _empty_offset_accumulator()
+        for channel in range(1, 7)
+    }
+    by_boundary: dict[
+        str, dict[str, dict[str, guards.Moment]]
+    ] = {
+        "Q2": {},
+        "xB": {},
+        "minus_t": {},
+    }
+    rows: list[dict[str, object]] = []
+    total_accumulator = _empty_offset_accumulator()
+
+    for key, accumulator in detailed.items():
+        (
+            status,
+            channel,
+            q2_position,
+            xb_position,
+            t_position,
+            *offset_values,
+        ) = key
+        offset_key = tuple(offset_values)
+        pooled_entry = pooled.setdefault(
+            offset_key, _empty_offset_accumulator()
+        )
+        _add_offset_accumulator(pooled_entry, accumulator)
+        status_entry = by_status[status]
+        _add_offset_accumulator(status_entry, accumulator)
+        channel_entry = by_channel[channel]
+        _add_offset_accumulator(channel_entry, accumulator)
+        for axis, position in (
+            ("Q2", q2_position),
+            ("xB", xb_position),
+            ("minus_t", t_position),
+        ):
+            boundary_entry = by_boundary[axis].setdefault(
+                position, _empty_offset_accumulator()
+            )
+            _add_offset_accumulator(boundary_entry, accumulator)
+        _add_offset_accumulator(total_accumulator, accumulator)
+
+    inside_total = total_accumulator["total"].total
+    residual_total = total_accumulator["residual"].total
+    for key, accumulator in sorted(detailed.items()):
+        (
+            status,
+            channel,
+            q2_position,
+            xb_position,
+            t_position,
+            *offset_values,
+        ) = key
+        metrics = _offset_metrics(
+            accumulator,
+            proposals=proposals,
+            inside_total=inside_total,
+            residual_total=residual_total,
+        )
+        row = {
+            "training_status": status,
+            "native_intreg": channel,
+            "target_q2_position": q2_position,
+            "target_xb_position": xb_position,
+            "target_minus_t_position": t_position,
+            **_offset_key_metadata(tuple(offset_values)),
+            "contributing_rows": metrics["total"]["contributing_rows"],
+            "total_cross_section_microbarn": metrics["total"][
+                "cross_section_microbarn"
+            ],
+            "selected_cross_section_microbarn": metrics[
+                "selected_parents"
+            ]["cross_section_microbarn"],
+            "frozen_tail_cross_section_microbarn": metrics[
+                "frozen_tail"
+            ]["cross_section_microbarn"],
+            "one_more_dilation_cross_section_microbarn": metrics[
+                "one_more_dilation"
+            ]["cross_section_microbarn"],
+            "recovered_cross_section_microbarn": metrics[
+                "recovered_by_one_more_dilation"
+            ]["cross_section_microbarn"],
+            "residual_cross_section_microbarn": metrics[
+                "residual_after_one_more_dilation"
+            ]["cross_section_microbarn"],
+            "frozen_parent_fraction": metrics["frozen_parent_fraction"],
+            "one_more_dilation_fraction": metrics[
+                "one_more_dilation_fraction"
+            ],
+            "fraction_of_inside_analysis_cross_section": metrics[
+                "fraction_of_inside_analysis_cross_section"
+            ],
+            "fraction_of_residual_after_one_more_dilation": metrics[
+                "fraction_of_residual_after_one_more_dilation"
+            ],
+        }
+        rows.append(row)
+
+    pooled_metrics = [
+        {
+            **_offset_key_metadata(key),
+            **_offset_metrics(
+                accumulator,
+                proposals=proposals,
+                inside_total=inside_total,
+                residual_total=residual_total,
+            ),
+        }
+        for key, accumulator in pooled.items()
+    ]
+    pooled_metrics.sort(
+        key=lambda item: (
+            -float(
+                item["residual_after_one_more_dilation"][
+                    "cross_section_microbarn"
+                ]
+            ),
+            item["relationship"],
+            item["delta_q2_index"],
+            item["delta_xb_index"],
+            item["delta_minus_t_index"],
+            item["delta_phi_index"],
+        )
+    )
+
+    marginal_by_axis: dict[str, list[dict[str, object]]] = {}
+    axis_positions = {
+        "Q2": (1, 4),
+        "xB": (2, 5),
+        "minus_t": (3, 6),
+        "phi_deg": (None, 7),
+    }
+    for axis, (region_position, delta_position) in axis_positions.items():
+        marginal: dict[
+            tuple[str, int], dict[str, guards.Moment]
+        ] = {}
+        for key, accumulator in pooled.items():
+            region = (
+                "analysis_bin"
+                if region_position is None
+                else str(key[region_position])
+            )
+            delta = int(key[delta_position])
+            entry = marginal.setdefault(
+                (region, delta), _empty_offset_accumulator()
+            )
+            _add_offset_accumulator(entry, accumulator)
+        items = [
+            {
+                "hard_region": region,
+                "delta_index": delta,
+                **_offset_metrics(
+                    accumulator,
+                    proposals=proposals,
+                    inside_total=inside_total,
+                    residual_total=residual_total,
+                ),
+            }
+            for (region, delta), accumulator in marginal.items()
+        ]
+        items.sort(
+            key=lambda item: (
+                -float(
+                    item["residual_after_one_more_dilation"][
+                        "cross_section_microbarn"
+                    ]
+                ),
+                item["hard_region"],
+                item["delta_index"],
+            )
+        )
+        marginal_by_axis[axis] = items
+
+    residual_values = [
+        float(
+            item["residual_after_one_more_dilation"][
+                "cross_section_microbarn"
+            ]
+        )
+        for item in pooled_metrics
+    ]
+    residual_cross_section = residual_total / proposals
+    concentration = {
+        f"top_{count}_offsets": (
+            sum(residual_values[:count]) / residual_cross_section
+            if residual_cross_section > 0.0
+            else None
+        )
+        for count in (1, 5, 10, 20, 50)
+    }
+    summary = {
+        "all_offsets": _offset_metrics(
+            total_accumulator,
+            proposals=proposals,
+            inside_total=inside_total,
+            residual_total=residual_total,
+        ),
+        "top_residual_offsets": [
+            item
+            for item in pooled_metrics
+            if float(
+                item["residual_after_one_more_dilation"][
+                    "cross_section_microbarn"
+                ]
+            )
+            > 0.0
+        ][:limit],
+        "residual_concentration": concentration,
+        "by_training_status": {
+            status: _offset_metrics(
+                accumulator,
+                proposals=proposals,
+                inside_total=inside_total,
+                residual_total=residual_total,
+            )
+            for status, accumulator in sorted(by_status.items())
+        },
+        "by_native_intreg": {
+            f"intreg_{channel}": _offset_metrics(
+                accumulator,
+                proposals=proposals,
+                inside_total=inside_total,
+                residual_total=residual_total,
+            )
+            for channel, accumulator in sorted(by_channel.items())
+        },
+        "by_target_boundary_position": {
+            axis: {
+                position: _offset_metrics(
+                    accumulator,
+                    proposals=proposals,
+                    inside_total=inside_total,
+                    residual_total=residual_total,
+                )
+                for position, accumulator in sorted(values.items())
+            }
+            for axis, values in by_boundary.items()
+        },
+        "marginal_by_axis_offset": marginal_by_axis,
+    }
+    return summary, rows
+
+
 def _build_representation_study(
     *,
     config: dict,
@@ -2239,7 +2646,12 @@ def _build_representation_study(
     generator_revision: str,
     generator_revision_source: str,
     learner_revision: str,
-) -> tuple[dict, dict, list[dict[str, object]]]:
+) -> tuple[
+    dict,
+    dict,
+    list[dict[str, object]],
+    list[dict[str, object]],
+]:
     parent_grid = ParentGrid.from_config(config)
     catalog = guards.enumerate_strata(config)
     accumulators: dict[str, dict[str, object]] = {}
@@ -2261,8 +2673,13 @@ def _build_representation_study(
             },
             "training_purity_numerator": 0.0,
             "training_purity_denominator": 0.0,
+            "training_expanded_purity_numerator": 0.0,
+            "training_expanded_purity_denominator": 0.0,
             "validation_purity_numerator": 0.0,
             "validation_purity_denominator": 0.0,
+            "validation_expanded_purity_numerator": 0.0,
+            "validation_expanded_purity_denominator": 0.0,
+            "validation_offsets": {},
             "seed_parent_groups": 0,
             "selected_parent_groups": 0,
             "selected_hard_cells": 0,
@@ -2274,6 +2691,8 @@ def _build_representation_study(
             "assessed_strata": 0,
             "passed_strata": 0,
             "failed_strata": 0,
+            "expanded_passed_strata": 0,
+            "expanded_failed_strata": 0,
             "training_strata_without_holdout_contribution": 0,
         }
 
@@ -2317,6 +2736,15 @@ def _build_representation_study(
             "validation_total": validation_total.total,
             "representations": {},
         }
+        q2_position = _target_boundary_position(
+            stratum.iq2, len(parent_grid.q2_edges) - 1
+        )
+        xb_position = _target_boundary_position(
+            stratum.ixb, len(parent_grid.xb_edges) - 1
+        )
+        t_position = _target_boundary_position(
+            stratum.it, len(parent_grid.minus_t_edges) - 1
+        )
 
         for representation in CHANNEL_REPRESENTATIONS:
             identifier = representation.identifier
@@ -2391,17 +2819,35 @@ def _build_representation_study(
             validation_purity_denominator = _purity_denominator(
                 validation.parent_totals, selected_native
             )
+            training_expanded_purity_denominator = _purity_denominator(
+                training.parent_totals, expanded_native
+            )
+            validation_expanded_purity_denominator = _purity_denominator(
+                validation.parent_totals, expanded_native
+            )
             accumulator["training_purity_numerator"] += (
                 training_selected.total
             )
             accumulator["training_purity_denominator"] += (
                 training_purity_denominator
             )
+            accumulator["training_expanded_purity_numerator"] += (
+                training_expanded.total
+            )
+            accumulator["training_expanded_purity_denominator"] += (
+                training_expanded_purity_denominator
+            )
             accumulator["validation_purity_numerator"] += (
                 validation_selected.total
             )
             accumulator["validation_purity_denominator"] += (
                 validation_purity_denominator
+            )
+            accumulator["validation_expanded_purity_numerator"] += (
+                validation_expanded.total
+            )
+            accumulator["validation_expanded_purity_denominator"] += (
+                validation_expanded_purity_denominator
             )
 
             if training_total.total > 0.0:
@@ -2433,18 +2879,65 @@ def _build_representation_study(
                 coverage_passed = (
                     selected_fraction >= minimum_parent_coverage
                 )
+                expanded_fraction = (
+                    validation_expanded.total / validation_total.total
+                )
+                expanded_coverage_passed = (
+                    expanded_fraction >= minimum_parent_coverage
+                )
                 accumulator["assessed_strata"] += 1
                 accumulator["passed_strata"] += int(coverage_passed)
                 accumulator["failed_strata"] += int(
                     not coverage_passed
                 )
+                accumulator["expanded_passed_strata"] += int(
+                    expanded_coverage_passed
+                )
+                accumulator["expanded_failed_strata"] += int(
+                    not expanded_coverage_passed
+                )
             else:
                 selected_fraction = None
+                expanded_fraction = None
                 coverage_passed = None
+                expanded_coverage_passed = None
                 if training_total.total > 0.0:
                     accumulator[
                         "training_strata_without_holdout_contribution"
                     ] += 1
+
+            validation_offsets = accumulator["validation_offsets"]
+            for component, moment in validation_moments.items():
+                parent_id, channel = component
+                offset_key = _migration_offset_key(
+                    parent_id, stratum, parent_grid
+                )
+                detailed_key = (
+                    status,
+                    channel,
+                    q2_position,
+                    xb_position,
+                    t_position,
+                    *offset_key,
+                )
+                offset_accumulator = validation_offsets.setdefault(
+                    detailed_key, _empty_offset_accumulator()
+                )
+                _add_moment(offset_accumulator["total"], moment)
+                if component in selected_native:
+                    _add_moment(offset_accumulator["selected"], moment)
+                else:
+                    _add_moment(
+                        offset_accumulator["frozen_tail"], moment
+                    )
+                if component in expanded_native:
+                    _add_moment(offset_accumulator["expanded"], moment)
+                    if component not in selected_native:
+                        _add_moment(
+                            offset_accumulator["recovered"], moment
+                        )
+                else:
+                    _add_moment(offset_accumulator["residual"], moment)
 
             for channel in range(1, 7):
                 channel_total = _combined(
@@ -2490,9 +2983,7 @@ def _build_representation_study(
                 else None
             )
             validation_expanded_fraction = (
-                validation_expanded.total / validation_total.total
-                if validation_total.total > 0.0
-                else None
+                expanded_fraction
             )
             training_purity = (
                 training_selected.total / training_purity_denominator
@@ -2502,6 +2993,18 @@ def _build_representation_study(
             validation_purity = (
                 validation_selected.total / validation_purity_denominator
                 if validation_purity_denominator > 0.0
+                else None
+            )
+            training_expanded_purity = (
+                training_expanded.total
+                / training_expanded_purity_denominator
+                if training_expanded_purity_denominator > 0.0
+                else None
+            )
+            validation_expanded_purity = (
+                validation_expanded.total
+                / validation_expanded_purity_denominator
+                if validation_expanded_purity_denominator > 0.0
                 else None
             )
 
@@ -2563,6 +3066,9 @@ def _build_representation_study(
                         training_expanded_fraction
                     ),
                     "training_selected_parent_purity": training_purity,
+                    "training_one_more_dilation_purity": (
+                        training_expanded_purity
+                    ),
                     "validation_selected_parent_fraction": (
                         selected_fraction
                     ),
@@ -2572,7 +3078,13 @@ def _build_representation_study(
                     "validation_selected_parent_purity": (
                         validation_purity
                     ),
+                    "validation_one_more_dilation_purity": (
+                        validation_expanded_purity
+                    ),
                     "coverage_passed": coverage_passed,
+                    "one_more_dilation_coverage_passed": (
+                        expanded_coverage_passed
+                    ),
                 }
             )
 
@@ -2580,6 +3092,7 @@ def _build_representation_study(
         material_records.append(material_record)
 
     representation_results: dict[str, object] = {}
+    residual_offset_rows: list[dict[str, object]] = []
     for representation in CHANNEL_REPRESENTATIONS:
         identifier = representation.identifier
         accumulator = accumulators[identifier]
@@ -2616,6 +3129,12 @@ def _build_representation_study(
         validation_purity_denominator = float(
             accumulator["validation_purity_denominator"]
         )
+        training_expanded_purity_denominator = float(
+            accumulator["training_expanded_purity_denominator"]
+        )
+        validation_expanded_purity_denominator = float(
+            accumulator["validation_expanded_purity_denominator"]
+        )
         per_channel: dict[str, object] = {}
         validation_inside_total = accumulator["validation"]["total"].total
         for channel in range(1, 7):
@@ -2635,6 +3154,20 @@ def _build_representation_study(
             )
             per_channel[f"intreg_{channel}"] = channel_coverage
 
+        residual_summary, representation_offset_rows = (
+            _residual_offset_summary(
+                accumulator["validation_offsets"],
+                proposals=validation.proposals,
+            )
+        )
+        residual_offset_rows.extend(
+            {
+                "representation": identifier,
+                **row,
+            }
+            for row in representation_offset_rows
+        )
+
         representation_results[identifier] = {
             **representation.metadata(),
             "training": {
@@ -2645,6 +3178,16 @@ def _build_representation_study(
                     if training_purity_denominator > 0.0
                     else None
                 ),
+                "aggregate_one_more_dilation_purity_proxy": (
+                    float(
+                        accumulator[
+                            "training_expanded_purity_numerator"
+                        ]
+                    )
+                    / training_expanded_purity_denominator
+                    if training_expanded_purity_denominator > 0.0
+                    else None
+                ),
             },
             "validation": {
                 **validation_coverage,
@@ -2652,6 +3195,16 @@ def _build_representation_study(
                     float(accumulator["validation_purity_numerator"])
                     / validation_purity_denominator
                     if validation_purity_denominator > 0.0
+                    else None
+                ),
+                "aggregate_one_more_dilation_purity_proxy": (
+                    float(
+                        accumulator[
+                            "validation_expanded_purity_numerator"
+                        ]
+                    )
+                    / validation_expanded_purity_denominator
+                    if validation_expanded_purity_denominator > 0.0
                     else None
                 ),
             },
@@ -2673,11 +3226,18 @@ def _build_representation_study(
                     material_records, identifier
                 )
             ),
+            "validation_residual_offsets": residual_summary,
             "coverage_summary": {
                 "minimum_parent_coverage": minimum_parent_coverage,
                 "assessed_strata": int(accumulator["assessed_strata"]),
                 "passed_strata": int(accumulator["passed_strata"]),
                 "failed_strata": int(accumulator["failed_strata"]),
+                "one_more_dilation_passed_strata": int(
+                    accumulator["expanded_passed_strata"]
+                ),
+                "one_more_dilation_failed_strata": int(
+                    accumulator["expanded_failed_strata"]
+                ),
                 "training_strata_without_holdout_contribution": int(
                     accumulator[
                         "training_strata_without_holdout_contribution"
@@ -2687,6 +3247,10 @@ def _build_representation_study(
                     int(accumulator["assessed_strata"]) > 0
                     and int(accumulator["failed_strata"]) == 0
                 ),
+                "all_assessed_strata_passed_after_one_more_dilation": (
+                    int(accumulator["assessed_strata"]) > 0
+                    and int(accumulator["expanded_failed_strata"]) == 0
+                ),
                 "aggregate_coverage_meets_minimum": (
                     validation_coverage[
                         "cross_section_weighted_selected_parent_fraction"
@@ -2695,6 +3259,18 @@ def _build_representation_study(
                     and float(
                         validation_coverage[
                             "cross_section_weighted_selected_parent_fraction"
+                        ]
+                    )
+                    >= minimum_parent_coverage
+                ),
+                "aggregate_one_more_dilation_coverage_meets_minimum": (
+                    validation_coverage[
+                        "cross_section_weighted_one_more_dilation_fraction"
+                    ]
+                    is not None
+                    and float(
+                        validation_coverage[
+                            "cross_section_weighted_one_more_dilation_fraction"
                         ]
                     )
                     >= minimum_parent_coverage
@@ -2846,7 +3422,7 @@ def _build_representation_study(
         },
         "strata": footprints,
     }
-    return comparison, footprint_payload, rows
+    return comparison, footprint_payload, rows, residual_offset_rows
 
 
 def _write_representation_rows(
@@ -2871,10 +3447,49 @@ def _write_representation_rows(
         "training_selected_parent_fraction",
         "training_one_more_dilation_fraction",
         "training_selected_parent_purity",
+        "training_one_more_dilation_purity",
         "validation_selected_parent_fraction",
         "validation_one_more_dilation_fraction",
         "validation_selected_parent_purity",
+        "validation_one_more_dilation_purity",
         "coverage_passed",
+        "one_more_dilation_coverage_passed",
+    )
+    with path.open("w", encoding="utf-8", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_residual_offset_rows(
+    path: Path, rows: list[dict[str, object]]
+) -> None:
+    fields = (
+        "representation",
+        "training_status",
+        "native_intreg",
+        "target_q2_position",
+        "target_xb_position",
+        "target_minus_t_position",
+        "relationship",
+        "hard_q2_region",
+        "hard_xb_region",
+        "hard_minus_t_region",
+        "delta_q2_index",
+        "delta_xb_index",
+        "delta_minus_t_index",
+        "delta_phi_index",
+        "contributing_rows",
+        "total_cross_section_microbarn",
+        "selected_cross_section_microbarn",
+        "frozen_tail_cross_section_microbarn",
+        "one_more_dilation_cross_section_microbarn",
+        "recovered_cross_section_microbarn",
+        "residual_cross_section_microbarn",
+        "frozen_parent_fraction",
+        "one_more_dilation_fraction",
+        "fraction_of_inside_analysis_cross_section",
+        "fraction_of_residual_after_one_more_dilation",
     )
     with path.open("w", encoding="utf-8", newline="") as output:
         writer = csv.DictWriter(output, fieldnames=fields)
@@ -2941,7 +3556,12 @@ def compare_representations(args: argparse.Namespace) -> dict:
 
     learner_revision = guards._current_revision()
     generator_revision = args.generator_revision or learner_revision
-    comparison, footprints, rows = _build_representation_study(
+    (
+        comparison,
+        footprints,
+        rows,
+        residual_offset_rows,
+    ) = _build_representation_study(
         config=config,
         config_path=args.config,
         config_sha256=config_sha256,
@@ -2976,6 +3596,9 @@ def compare_representations(args: argparse.Namespace) -> dict:
             footprint_path.read_bytes()
         ).hexdigest(),
         "stratum_comparison": "representation_strata.csv",
+        "residual_offset_comparison": (
+            "representation_residual_offsets.csv"
+        ),
         "hash_sidecar_suffix": ".sha256",
     }
     comparison_path = output / "representation_comparison.json"
@@ -2985,14 +3608,22 @@ def compare_representations(args: argparse.Namespace) -> dict:
     )
     row_path = output / "representation_strata.csv"
     _write_representation_rows(row_path, rows)
+    residual_offset_path = (
+        output / "representation_residual_offsets.csv"
+    )
+    _write_residual_offset_rows(
+        residual_offset_path, residual_offset_rows
+    )
     guards._write_sha256(comparison_path)
     guards._write_sha256(row_path)
+    guards._write_sha256(residual_offset_path)
     return {
         "passed": True,
         "schema": REPRESENTATION_COMPARISON_SCHEMA,
         "comparison": str(comparison_path),
         "footprints": str(footprint_path),
         "stratum_comparison": str(row_path),
+        "residual_offset_comparison": str(residual_offset_path),
         "training_replicas": sorted(training_replicas),
         "validation_replicas": sorted(validation_replicas),
         "ranking_by_heldout_coverage_then_compactness": comparison[
@@ -3009,6 +3640,15 @@ def compare_representations(args: argparse.Namespace) -> dict:
                 "aggregate_selected_parent_purity_proxy": values[
                     "validation"
                 ]["aggregate_selected_parent_purity_proxy"],
+                "aggregate_one_more_dilation_purity_proxy": values[
+                    "validation"
+                ]["aggregate_one_more_dilation_purity_proxy"],
+                "one_more_dilation_passed_strata": values[
+                    "coverage_summary"
+                ]["one_more_dilation_passed_strata"],
+                "one_more_dilation_failed_strata": values[
+                    "coverage_summary"
+                ]["one_more_dilation_failed_strata"],
                 "total_selected_hard_cells": values["compactness"][
                     "total_selected_hard_cells"
                 ],
@@ -3315,7 +3955,10 @@ def plot_representations(args: argparse.Namespace) -> dict:
         raise MigrationError(
             f"cannot read representation comparison: {error}"
         ) from error
-    if comparison.get("schema") != REPRESENTATION_COMPARISON_SCHEMA:
+    if comparison.get("schema") not in {
+        REPRESENTATION_COMPARISON_SCHEMA,
+        LEGACY_REPRESENTATION_COMPARISON_SCHEMA,
+    }:
         raise MigrationError("representation comparison has the wrong schema")
     try:
         import matplotlib
@@ -3425,6 +4068,18 @@ def plot_representations(args: argparse.Namespace) -> dict:
             )
             for identifier in identifiers
         ]
+        expanded_purities = [
+            float(
+                representations[identifier]["validation"].get(
+                    "aggregate_one_more_dilation_purity_proxy",
+                    representations[identifier]["validation"][
+                        "aggregate_selected_parent_purity_proxy"
+                    ],
+                )
+                or 0.0
+            )
+            for identifier in identifiers
+        ]
         figure, axes = plt.subplots(1, 2, figsize=(12, 5))
         axes[0].bar(
             [position - width / 2 for position in positions],
@@ -3444,15 +4099,98 @@ def plot_representations(args: argparse.Namespace) -> dict:
         axes[0].set_title("Footprint compactness")
         axes[0].grid(axis="y", alpha=0.25)
         axes[0].legend()
-        axes[1].bar(positions, purities)
+        axes[1].bar(
+            [position - width / 2 for position in positions],
+            purities,
+            width=width,
+            label="Frozen footprint",
+        )
+        axes[1].bar(
+            [position + width / 2 for position in positions],
+            expanded_purities,
+            width=width,
+            label="One more spatial dilation",
+        )
         axes[1].set_xticks(positions, labels, rotation=15, ha="right")
         axes[1].set_ylim(0.0, 1.0)
         axes[1].set_ylabel("Held-out aggregate purity proxy")
-        axes[1].set_title("Selectivity of frozen footprints")
+        axes[1].set_title("Coverage-versus-purity cost of dilation")
         axes[1].grid(axis="y", alpha=0.25)
+        axes[1].legend()
         figure.tight_layout()
         pdf.savefig(figure)
         plt.close(figure)
+
+        best_identifier = comparison.get(
+            "best_heldout_coverage_representation"
+        )
+        if best_identifier in representations:
+            residual_offsets = representations[best_identifier].get(
+                "validation_residual_offsets", {}
+            ).get("top_residual_offsets", [])
+            residual_offsets = [
+                item
+                for item in residual_offsets[:10]
+                if float(
+                    item["residual_after_one_more_dilation"][
+                        "cross_section_microbarn"
+                    ]
+                )
+                > 0.0
+            ]
+            if residual_offsets:
+                residual_offsets.reverse()
+                offset_labels = []
+                residual_fractions = []
+                for item in residual_offsets:
+                    label = (
+                        "Δ=("
+                        f"{item['delta_q2_index']},"
+                        f"{item['delta_xb_index']},"
+                        f"{item['delta_minus_t_index']},"
+                        f"{item['delta_phi_index']})"
+                    )
+                    if item["relationship"] == (
+                        "hard_parent_underflow_or_overflow"
+                    ):
+                        regions = "/".join(
+                            str(item[name])
+                            for name in (
+                                "hard_q2_region",
+                                "hard_xb_region",
+                                "hard_minus_t_region",
+                            )
+                            if item[name] != "analysis_bin"
+                        )
+                        label = f"{label} [{regions}]"
+                    offset_labels.append(label)
+                    residual_fractions.append(
+                        float(
+                            item[
+                                "fraction_of_residual_after_one_more_dilation"
+                            ]
+                            or 0.0
+                        )
+                    )
+                figure, axis = plt.subplots(figsize=(11, 6))
+                axis.barh(offset_labels, residual_fractions)
+                axis.set_xlim(
+                    0.0,
+                    max(residual_fractions) * 1.08
+                    if residual_fractions
+                    else 1.0,
+                )
+                axis.set_xlabel(
+                    "Fraction of residual cross section after one more dilation"
+                )
+                axis.set_title(
+                    "Largest remaining hard-minus-observed offsets\n"
+                    f"{representations[best_identifier]['label']}"
+                )
+                axis.grid(axis="x", alpha=0.25)
+                figure.tight_layout()
+                pdf.savefig(figure)
+                plt.close(figure)
 
         figure, axis = plt.subplots(figsize=(12, 5.5))
         channel_positions = list(range(1, 7))

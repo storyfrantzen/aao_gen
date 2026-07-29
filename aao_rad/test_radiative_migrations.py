@@ -71,6 +71,24 @@ class ParentIndexTests(unittest.TestCase):
         self.assertEqual(
             metadata["coordinates"]["Q2"]["region"], "underflow"
         )
+        target = [
+            stratum
+            for stratum in radiative_migrations.guards.enumerate_strata(
+                config
+            )
+            if stratum.iq2 == 0 and stratum.iphi == 1
+        ][0]
+        offset = radiative_migrations._migration_offset_key(
+            radiative_migrations.parent_identifier(
+                outside_parent, config
+            ),
+            target,
+            radiative_migrations.ParentGrid.from_config(config),
+        )
+        self.assertEqual(offset[0], "hard_parent_underflow_or_overflow")
+        self.assertEqual(offset[1], "underflow")
+        self.assertEqual(offset[4], -1)
+        self.assertEqual(offset[7], -1)
 
     def test_parent_dilation_wraps_phi_but_not_channel(self) -> None:
         config = _config()
@@ -188,6 +206,57 @@ class MigrationWorkflowTests(unittest.TestCase):
                 ],
                 1.0,
             )
+            self.assertAlmostEqual(
+                representations["channel_marginalized"]["validation"][
+                    "cross_section_weighted_one_more_dilation_fraction"
+                ],
+                1.0,
+            )
+            self.assertAlmostEqual(
+                representations["channel_marginalized"]["validation"][
+                    "aggregate_one_more_dilation_purity_proxy"
+                ],
+                1.0,
+            )
+            self.assertEqual(
+                representations["channel_marginalized"][
+                    "coverage_summary"
+                ]["one_more_dilation_passed_strata"],
+                1,
+            )
+            four_group_residual = representations["four_group"][
+                "validation_residual_offsets"
+            ]
+            self.assertAlmostEqual(
+                four_group_residual["all_offsets"][
+                    "residual_after_one_more_dilation"
+                ]["cross_section_microbarn"],
+                3.0 / 100.0,
+            )
+            self.assertAlmostEqual(
+                four_group_residual["residual_concentration"][
+                    "top_1_offsets"
+                ],
+                1.0,
+            )
+            self.assertEqual(
+                four_group_residual["top_residual_offsets"][0][
+                    "delta_q2_index"
+                ],
+                1,
+            )
+            self.assertAlmostEqual(
+                four_group_residual["by_native_intreg"]["intreg_2"][
+                    "residual_after_one_more_dilation"
+                ]["cross_section_microbarn"],
+                3.0 / 100.0,
+            )
+            self.assertEqual(
+                representations["channel_marginalized"][
+                    "validation_residual_offsets"
+                ]["top_residual_offsets"],
+                [],
+            )
             self.assertEqual(
                 comparison[
                     "ranking_by_heldout_coverage_then_compactness"
@@ -215,6 +284,42 @@ class MigrationWorkflowTests(unittest.TestCase):
             ).open(newline="", encoding="utf-8") as source:
                 rows = list(csv.DictReader(source))
             self.assertEqual(len(rows), 16)
+            self.assertIn(
+                "validation_one_more_dilation_purity", rows[0]
+            )
+            self.assertIn(
+                "one_more_dilation_coverage_passed", rows[0]
+            )
+            residual_path = (
+                output / "representation_residual_offsets.csv"
+            )
+            self.assertTrue(residual_path.is_file())
+            self.assertTrue(
+                (
+                    output
+                    / "representation_residual_offsets.csv.sha256"
+                ).is_file()
+            )
+            with residual_path.open(
+                newline="", encoding="utf-8"
+            ) as source:
+                residual_rows = list(csv.DictReader(source))
+            four_group_rows = [
+                row
+                for row in residual_rows
+                if row["representation"] == "four_group"
+                and row["native_intreg"] == "2"
+                and row["delta_q2_index"] == "1"
+            ]
+            self.assertEqual(len(four_group_rows), 1)
+            self.assertAlmostEqual(
+                float(
+                    four_group_rows[0][
+                        "residual_cross_section_microbarn"
+                    ]
+                ),
+                3.0 / 100.0,
+            )
 
             plot_output = root / "representation_plots"
             plotted = radiative_migrations.plot_representations(
