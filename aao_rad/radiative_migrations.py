@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Learn and validate hard-parent radiative migration footprints.
+"""Learn, validate, and compare hard-parent radiative migration footprints.
 
-This milestone-2b diagnostic relates the Born-like hard-vertex coordinates of
-an unrestricted fixed-trial survey to the final-LUND analysis stratum.  It is
-diagnostic only: it does not change AAO sampling, perform unweighting, or emit
-LUND events.
+The milestone-2b/2c diagnostics relate the Born-like hard-vertex coordinates
+of an unrestricted fixed-trial survey to the final-LUND analysis stratum and
+compare alternative intreg groupings.  They are diagnostic only: they do not
+change AAO sampling, perform unweighting, or emit LUND events.
 """
 
 from __future__ import annotations
@@ -27,6 +27,15 @@ import radiative_survey
 MANIFEST_SCHEMA = "aao-rad-migration-v1"
 VALIDATION_SCHEMA = "aao-rad-migration-validation-v1"
 PLOT_SCHEMA = "aao-rad-migration-plots-v1"
+REPRESENTATION_COMPARISON_SCHEMA = (
+    "aao-rad-migration-representation-comparison-v1"
+)
+REPRESENTATION_FOOTPRINT_SCHEMA = (
+    "aao-rad-migration-representation-footprints-v1"
+)
+REPRESENTATION_PLOT_SCHEMA = (
+    "aao-rad-migration-representation-plots-v1"
+)
 HARD_COORDINATE_DEFINITION = "hard_vertex_born_parent"
 OBSERVED_COORDINATE_DEFINITION = "final_lund_analysis"
 PARENT_AXES = ("Q2", "xB", "minus_t", "phi_deg")
@@ -87,6 +96,143 @@ class ParentGrid:
             len(self.minus_t_edges) + 1,
             len(self.phi_edges) - 1,
         )
+
+
+@dataclass(frozen=True)
+class ChannelGroup:
+    identifier: str
+    label: str
+    channels: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class ChannelRepresentation:
+    identifier: str
+    label: str
+    description: str
+    groups: tuple[ChannelGroup, ...]
+
+    def group_for_channel(self, channel: int) -> str:
+        for group in self.groups:
+            if channel in group.channels:
+                return group.identifier
+        raise MigrationError(
+            f"{self.identifier}: intreg={channel} is not assigned"
+        )
+
+    def channels_for_group(self, identifier: str) -> tuple[int, ...]:
+        for group in self.groups:
+            if identifier == group.identifier:
+                return group.channels
+        raise MigrationError(
+            f"{self.identifier}: unknown channel group {identifier!r}"
+        )
+
+    def metadata(self) -> dict[str, object]:
+        return {
+            "identifier": self.identifier,
+            "label": self.label,
+            "description": self.description,
+            "channel_groups": [
+                {
+                    "identifier": group.identifier,
+                    "label": group.label,
+                    "native_intreg": list(group.channels),
+                }
+                for group in self.groups
+            ],
+        }
+
+
+CHANNEL_REPRESENTATIONS = (
+    ChannelRepresentation(
+        identifier="six_channel",
+        label="Six native intreg channels",
+        description=(
+            "Milestone-2b baseline: every hard-parent/intreg pair is learned "
+            "independently."
+        ),
+        groups=tuple(
+            ChannelGroup(
+                identifier=f"intreg_{channel}",
+                label=f"intreg {channel}",
+                channels=(channel,),
+            )
+            for channel in range(1, 7)
+        ),
+    ),
+    ChannelRepresentation(
+        identifier="four_group",
+        label="Four radiative-region groups",
+        description=(
+            "Combines each narrow photon-angle peak with its surrounding "
+            "region, while retaining wide-angle and soft groups."
+        ),
+        groups=(
+            ChannelGroup("peak_a", "peak A: intreg 1 and 3", (1, 3)),
+            ChannelGroup("peak_b", "peak B: intreg 2 and 4", (2, 4)),
+            ChannelGroup("wide_angle", "wide angle: intreg 5", (5,)),
+            ChannelGroup("soft", "soft: intreg 6", (6,)),
+        ),
+    ),
+    ChannelRepresentation(
+        identifier="soft_resolved",
+        label="Soft versus resolved",
+        description=(
+            "Learns one spatial footprint for resolved radiation and a "
+            "separate footprint for the soft branch."
+        ),
+        groups=(
+            ChannelGroup(
+                "resolved",
+                "resolved: intreg 1 through 5",
+                (1, 2, 3, 4, 5),
+            ),
+            ChannelGroup("soft", "soft: intreg 6", (6,)),
+        ),
+    ),
+    ChannelRepresentation(
+        identifier="channel_marginalized",
+        label="Channel marginalized",
+        description=(
+            "Learns hard-parent geometry after summing over intreg; every "
+            "native channel remains eligible in each selected hard cell."
+        ),
+        groups=(
+            ChannelGroup(
+                "all_channels",
+                "all native intreg channels",
+                (1, 2, 3, 4, 5, 6),
+            ),
+        ),
+    ),
+)
+
+
+def _validate_channel_representations() -> None:
+    identifiers = [
+        representation.identifier
+        for representation in CHANNEL_REPRESENTATIONS
+    ]
+    if len(set(identifiers)) != len(identifiers):
+        raise MigrationError("channel representation IDs must be unique")
+    expected = list(range(1, 7))
+    for representation in CHANNEL_REPRESENTATIONS:
+        group_ids = [group.identifier for group in representation.groups]
+        if len(set(group_ids)) != len(group_ids):
+            raise MigrationError(
+                f"{representation.identifier}: channel-group IDs repeat"
+            )
+        channels = [
+            channel
+            for group in representation.groups
+            for channel in group.channels
+        ]
+        if sorted(channels) != expected:
+            raise MigrationError(
+                f"{representation.identifier}: channel groups must partition "
+                "native intreg values 1 through 6"
+            )
 
 
 @dataclass
@@ -300,6 +446,13 @@ def _component_neighbors(
     component: tuple[str, int], config_or_grid: dict | ParentGrid
 ) -> Iterator[tuple[str, int]]:
     parent_id, channel = component
+    for neighbor in _parent_neighbors(parent_id, config_or_grid):
+        yield neighbor, channel
+
+
+def _parent_neighbors(
+    parent_id: str, config_or_grid: dict | ParentGrid
+) -> Iterator[str]:
     parent = parent_from_identifier(parent_id, config_or_grid)
     indices = [parent.iq2 + 1, parent.ixb + 1, parent.it + 1, parent.iphi]
     shape = _parent_shape(config_or_grid)
@@ -318,7 +471,7 @@ def _component_neighbors(
                 neighbor[2] - 1,
                 neighbor[3],
             )
-            yield parent_identifier(neighbor_parent, config_or_grid), channel
+            yield parent_identifier(neighbor_parent, config_or_grid)
 
 
 def dilate_components(
@@ -344,6 +497,87 @@ def dilate_components(
         if not frontier:
             break
     return result
+
+
+def dilate_parent_groups(
+    seeds: set[tuple[str, str]],
+    config_or_grid: dict | ParentGrid,
+    radius: int,
+) -> set[tuple[str, str]]:
+    """Dilate spatial parent cells without crossing channel groups."""
+    if radius < 0:
+        raise MigrationError("parent dilation must be nonnegative")
+    result = set(seeds)
+    frontier = set(seeds)
+    for _ in range(radius):
+        additions = {
+            (neighbor, group)
+            for parent_id, group in frontier
+            for neighbor in _parent_neighbors(
+                parent_id, config_or_grid
+            )
+        }
+        additions -= result
+        result.update(additions)
+        frontier = additions
+        if not frontier:
+            break
+    return result
+
+
+def _grouped_moments(
+    moments: dict[tuple[str, int], guards.Moment],
+    representation: ChannelRepresentation,
+) -> dict[tuple[str, str], guards.Moment]:
+    grouped: dict[tuple[str, str], list[guards.Moment]] = {}
+    for (parent_id, channel), moment in moments.items():
+        key = (parent_id, representation.group_for_channel(channel))
+        grouped.setdefault(key, []).append(moment)
+    return {
+        key: _combined(parts)
+        for key, parts in grouped.items()
+    }
+
+
+def _select_seed_parent_groups(
+    moments: dict[tuple[str, str], guards.Moment],
+    target_fraction: float,
+) -> set[tuple[str, str]]:
+    total = sum(moment.total for moment in moments.values())
+    if total <= 0.0:
+        return set()
+    selected: set[tuple[str, str]] = set()
+    retained = 0.0
+    for key, moment in sorted(
+        moments.items(), key=lambda item: (-item[1].total, item[0])
+    ):
+        if moment.total <= 0.0:
+            continue
+        selected.add(key)
+        retained += moment.total
+        if retained >= target_fraction * total:
+            break
+    return selected
+
+
+def _native_components_for_parent_groups(
+    parent_groups: set[tuple[str, str]],
+    representation: ChannelRepresentation,
+) -> set[tuple[str, int]]:
+    return {
+        (parent_id, channel)
+        for parent_id, group in parent_groups
+        for channel in representation.channels_for_group(group)
+    }
+
+
+def _serialized_parent_groups(
+    parent_groups: set[tuple[str, str]],
+) -> list[dict[str, str]]:
+    return [
+        {"parent_id": parent_id, "channel_group": group}
+        for parent_id, group in sorted(parent_groups)
+    ]
 
 
 def _target_lookup(config: dict) -> dict[str, guards.Stratum]:
@@ -1830,6 +2064,965 @@ def summarize(args: argparse.Namespace) -> dict:
     return summary
 
 
+def _add_moment(target: guards.Moment, source: guards.Moment) -> None:
+    target.count += source.count
+    target.total += source.total
+    target.square_total += source.square_total
+    target.maximum = max(target.maximum, source.maximum)
+
+
+def _coverage_from_moments(
+    *,
+    total: guards.Moment,
+    selected: guards.Moment,
+    tail: guards.Moment,
+    expanded: guards.Moment,
+    proposals: int,
+) -> dict[str, object]:
+    return {
+        "total": guards._compact_metrics(total, proposals),
+        "selected_parents": guards._compact_metrics(
+            selected, proposals
+        ),
+        "tail": guards._compact_metrics(tail, proposals),
+        "one_more_dilation": guards._compact_metrics(
+            expanded, proposals
+        ),
+        "cross_section_weighted_selected_parent_fraction": (
+            selected.total / total.total if total.total > 0.0 else None
+        ),
+        "cross_section_weighted_tail_fraction": (
+            tail.total / total.total if total.total > 0.0 else None
+        ),
+        "cross_section_weighted_one_more_dilation_fraction": (
+            expanded.total / total.total if total.total > 0.0 else None
+        ),
+        "extra_cross_section_fraction_recovered_by_one_more_dilation": (
+            (expanded.total - selected.total) / total.total
+            if total.total > 0.0
+            else None
+        ),
+    }
+
+
+def _empty_coverage_accumulator() -> dict[str, guards.Moment]:
+    return {
+        "total": guards.Moment(),
+        "selected": guards.Moment(),
+        "tail": guards.Moment(),
+        "expanded": guards.Moment(),
+    }
+
+
+def _accumulate_coverage(
+    accumulator: dict[str, guards.Moment],
+    *,
+    total: guards.Moment,
+    selected: guards.Moment,
+    tail: guards.Moment,
+    expanded: guards.Moment,
+) -> None:
+    for name, moment in (
+        ("total", total),
+        ("selected", selected),
+        ("tail", tail),
+        ("expanded", expanded),
+    ):
+        _add_moment(accumulator[name], moment)
+
+
+def _serialized_coverage(
+    accumulator: dict[str, guards.Moment], proposals: int
+) -> dict[str, object]:
+    return _coverage_from_moments(
+        total=accumulator["total"],
+        selected=accumulator["selected"],
+        tail=accumulator["tail"],
+        expanded=accumulator["expanded"],
+        proposals=proposals,
+    )
+
+
+def _purity_denominator(
+    parent_totals: dict[tuple[str, int], guards.Moment],
+    selected: set[tuple[str, int]],
+) -> float:
+    return sum(
+        parent_totals.get(component, guards.Moment()).total
+        for component in selected
+    )
+
+
+def _representation_material_coverage(
+    material_records: list[dict[str, object]],
+    representation: str,
+    *,
+    targets: tuple[float, ...] = (0.5, 0.9, 0.95, 0.99),
+) -> dict[str, object]:
+    contributing = [
+        record
+        for record in material_records
+        if float(record["validation_total"]) > 0.0
+    ]
+    contributing.sort(
+        key=lambda record: -float(record["validation_total"])
+    )
+    total = sum(
+        float(record["validation_total"]) for record in contributing
+    )
+    result: dict[str, object] = {}
+    for target in targets:
+        retained = selected = expanded = 0.0
+        count = 0
+        for record in contributing:
+            count += 1
+            retained += float(record["validation_total"])
+            values = record["representations"][representation]
+            selected += float(values["selected"])
+            expanded += float(values["expanded"])
+            if retained >= target * total:
+                break
+        result[f"top_{100.0 * target:g}_percent_cross_section"] = {
+            "strata": count,
+            "actual_fraction_of_inside_cross_section": (
+                retained / total if total > 0.0 else None
+            ),
+            "cross_section_weighted_selected_parent_fraction": (
+                selected / retained if retained > 0.0 else None
+            ),
+            "cross_section_weighted_one_more_dilation_fraction": (
+                expanded / retained if retained > 0.0 else None
+            ),
+        }
+    return result
+
+
+def _campaign_comparison_metadata(
+    campaign: MigrationCampaign,
+) -> dict[str, object]:
+    inside = _combined(campaign.strata.values())
+    return {
+        "replica_ids": [item["replica"] for item in campaign.replicas],
+        "replicas": campaign.replicas,
+        "total_proposals": campaign.proposals,
+        "recorded_rows": campaign.rows,
+        "final_valid_rows": campaign.final_valid_rows,
+        "global_observed": guards._compact_metrics(
+            campaign.global_observed, campaign.proposals
+        ),
+        "inside_analysis_partition": guards._compact_metrics(
+            inside, campaign.proposals
+        ),
+        "hard_parent_relationships_inside_analysis": _fraction_metrics(
+            campaign.relationships, campaign.proposals
+        ),
+        "radiative_channels_inside_analysis": _fraction_metrics(
+            campaign.channels, campaign.proposals
+        ),
+    }
+
+
+def _build_representation_study(
+    *,
+    config: dict,
+    config_path: Path,
+    config_sha256: str,
+    training: MigrationCampaign,
+    validation: MigrationCampaign,
+    target_parent_fraction: float,
+    parent_dilation: int,
+    iteration: int,
+    minimum_training_rows: int,
+    minimum_training_ess: float,
+    minimum_parent_coverage: float,
+    apply_y_max: bool,
+    generator_revision: str,
+    generator_revision_source: str,
+    learner_revision: str,
+) -> tuple[dict, dict, list[dict[str, object]]]:
+    parent_grid = ParentGrid.from_config(config)
+    catalog = guards.enumerate_strata(config)
+    accumulators: dict[str, dict[str, object]] = {}
+    for representation in CHANNEL_REPRESENTATIONS:
+        accumulators[representation.identifier] = {
+            "training": _empty_coverage_accumulator(),
+            "validation": _empty_coverage_accumulator(),
+            "validation_by_status": {
+                status: _empty_coverage_accumulator()
+                for status in (
+                    "learned",
+                    "learned_low_support",
+                    "no_training_contribution",
+                )
+            },
+            "validation_by_channel": {
+                channel: _empty_coverage_accumulator()
+                for channel in range(1, 7)
+            },
+            "training_purity_numerator": 0.0,
+            "training_purity_denominator": 0.0,
+            "validation_purity_numerator": 0.0,
+            "validation_purity_denominator": 0.0,
+            "seed_parent_groups": 0,
+            "selected_parent_groups": 0,
+            "selected_hard_cells": 0,
+            "selected_native_components": 0,
+            "expanded_parent_groups": 0,
+            "expanded_hard_cells": 0,
+            "expanded_native_components": 0,
+            "footprints": 0,
+            "assessed_strata": 0,
+            "passed_strata": 0,
+            "failed_strata": 0,
+            "training_strata_without_holdout_contribution": 0,
+        }
+
+    footprints: dict[str, object] = {}
+    rows: list[dict[str, object]] = []
+    material_records: list[dict[str, object]] = []
+    learned = low_support = empty = 0
+
+    for stratum in catalog:
+        stratum_id = stratum.identifier
+        training_total = training.strata.get(
+            stratum_id, guards.Moment()
+        )
+        validation_total = validation.strata.get(
+            stratum_id, guards.Moment()
+        )
+        training_moments = training.migrations.get(stratum_id, {})
+        validation_moments = validation.migrations.get(stratum_id, {})
+        if training_total.total <= 0.0:
+            status = "no_training_contribution"
+            empty += 1
+        else:
+            supported = (
+                training_total.count >= minimum_training_rows
+                and guards._ess(training_total) >= minimum_training_ess
+            )
+            status = "learned" if supported else "learned_low_support"
+            learned += int(supported)
+            low_support += int(not supported)
+
+        footprint_record: dict[str, object] = {
+            **guards._stratum_metadata(stratum),
+            "training_status": status,
+            "training_total": guards._compact_metrics(
+                training_total, training.proposals
+            ),
+            "representations": {},
+        }
+        material_record: dict[str, object] = {
+            "stratum_id": stratum_id,
+            "validation_total": validation_total.total,
+            "representations": {},
+        }
+
+        for representation in CHANNEL_REPRESENTATIONS:
+            identifier = representation.identifier
+            accumulator = accumulators[identifier]
+            grouped = _grouped_moments(
+                training_moments, representation
+            )
+            seeds = _select_seed_parent_groups(
+                grouped, target_parent_fraction
+            )
+            selected_groups = dilate_parent_groups(
+                seeds, parent_grid, parent_dilation
+            )
+            expanded_groups = dilate_parent_groups(
+                seeds, parent_grid, parent_dilation + 1
+            )
+            selected_native = _native_components_for_parent_groups(
+                selected_groups, representation
+            )
+            expanded_native = _native_components_for_parent_groups(
+                expanded_groups, representation
+            )
+
+            training_selected = _subset(
+                training_moments, selected_native
+            )
+            training_tail = _combined(
+                moment
+                for component, moment in training_moments.items()
+                if component not in selected_native
+            )
+            training_expanded = _subset(
+                training_moments, expanded_native
+            )
+            validation_selected = _subset(
+                validation_moments, selected_native
+            )
+            validation_tail = _combined(
+                moment
+                for component, moment in validation_moments.items()
+                if component not in selected_native
+            )
+            validation_expanded = _subset(
+                validation_moments, expanded_native
+            )
+
+            _accumulate_coverage(
+                accumulator["training"],
+                total=training_total,
+                selected=training_selected,
+                tail=training_tail,
+                expanded=training_expanded,
+            )
+            _accumulate_coverage(
+                accumulator["validation"],
+                total=validation_total,
+                selected=validation_selected,
+                tail=validation_tail,
+                expanded=validation_expanded,
+            )
+            _accumulate_coverage(
+                accumulator["validation_by_status"][status],
+                total=validation_total,
+                selected=validation_selected,
+                tail=validation_tail,
+                expanded=validation_expanded,
+            )
+
+            training_purity_denominator = _purity_denominator(
+                training.parent_totals, selected_native
+            )
+            validation_purity_denominator = _purity_denominator(
+                validation.parent_totals, selected_native
+            )
+            accumulator["training_purity_numerator"] += (
+                training_selected.total
+            )
+            accumulator["training_purity_denominator"] += (
+                training_purity_denominator
+            )
+            accumulator["validation_purity_numerator"] += (
+                validation_selected.total
+            )
+            accumulator["validation_purity_denominator"] += (
+                validation_purity_denominator
+            )
+
+            if training_total.total > 0.0:
+                accumulator["footprints"] += 1
+                accumulator["seed_parent_groups"] += len(seeds)
+                accumulator["selected_parent_groups"] += len(
+                    selected_groups
+                )
+                accumulator["selected_hard_cells"] += len(
+                    {parent_id for parent_id, _ in selected_groups}
+                )
+                accumulator["selected_native_components"] += len(
+                    selected_native
+                )
+                accumulator["expanded_parent_groups"] += len(
+                    expanded_groups
+                )
+                accumulator["expanded_hard_cells"] += len(
+                    {parent_id for parent_id, _ in expanded_groups}
+                )
+                accumulator["expanded_native_components"] += len(
+                    expanded_native
+                )
+
+            if validation_total.total > 0.0:
+                selected_fraction = (
+                    validation_selected.total / validation_total.total
+                )
+                coverage_passed = (
+                    selected_fraction >= minimum_parent_coverage
+                )
+                accumulator["assessed_strata"] += 1
+                accumulator["passed_strata"] += int(coverage_passed)
+                accumulator["failed_strata"] += int(
+                    not coverage_passed
+                )
+            else:
+                selected_fraction = None
+                coverage_passed = None
+                if training_total.total > 0.0:
+                    accumulator[
+                        "training_strata_without_holdout_contribution"
+                    ] += 1
+
+            for channel in range(1, 7):
+                channel_total = _combined(
+                    moment
+                    for (_, native_channel), moment
+                    in validation_moments.items()
+                    if native_channel == channel
+                )
+                channel_selected = _combined(
+                    moment
+                    for component, moment in validation_moments.items()
+                    if component[1] == channel
+                    and component in selected_native
+                )
+                channel_tail = _combined(
+                    moment
+                    for component, moment in validation_moments.items()
+                    if component[1] == channel
+                    and component not in selected_native
+                )
+                channel_expanded = _combined(
+                    moment
+                    for component, moment in validation_moments.items()
+                    if component[1] == channel
+                    and component in expanded_native
+                )
+                _accumulate_coverage(
+                    accumulator["validation_by_channel"][channel],
+                    total=channel_total,
+                    selected=channel_selected,
+                    tail=channel_tail,
+                    expanded=channel_expanded,
+                )
+
+            training_selected_fraction = (
+                training_selected.total / training_total.total
+                if training_total.total > 0.0
+                else None
+            )
+            training_expanded_fraction = (
+                training_expanded.total / training_total.total
+                if training_total.total > 0.0
+                else None
+            )
+            validation_expanded_fraction = (
+                validation_expanded.total / validation_total.total
+                if validation_total.total > 0.0
+                else None
+            )
+            training_purity = (
+                training_selected.total / training_purity_denominator
+                if training_purity_denominator > 0.0
+                else None
+            )
+            validation_purity = (
+                validation_selected.total / validation_purity_denominator
+                if validation_purity_denominator > 0.0
+                else None
+            )
+
+            footprint_record["representations"][identifier] = {
+                "seed_parent_groups": _serialized_parent_groups(seeds),
+                "dilation_axis_steps": parent_dilation,
+                "selected_parent_group_count": len(selected_groups),
+                "selected_hard_cell_count": len(
+                    {parent_id for parent_id, _ in selected_groups}
+                ),
+                "selected_native_component_count": len(selected_native),
+                "one_more_dilation_parent_group_count": len(
+                    expanded_groups
+                ),
+                "one_more_dilation_hard_cell_count": len(
+                    {parent_id for parent_id, _ in expanded_groups}
+                ),
+                "one_more_dilation_native_component_count": len(
+                    expanded_native
+                ),
+            }
+            material_record["representations"][identifier] = {
+                "selected": validation_selected.total,
+                "expanded": validation_expanded.total,
+            }
+            rows.append(
+                {
+                    "stratum_id": stratum_id,
+                    "flat_index": stratum.flat_index,
+                    "training_status": status,
+                    "representation": identifier,
+                    "training_cross_section_microbarn": (
+                        training_total.total / training.proposals
+                    ),
+                    "training_ess": guards._ess(training_total),
+                    "validation_cross_section_microbarn": (
+                        validation_total.total / validation.proposals
+                    ),
+                    "validation_ess": guards._ess(validation_total),
+                    "seed_parent_groups": len(seeds),
+                    "selected_parent_groups": len(selected_groups),
+                    "selected_hard_cells": len(
+                        {parent_id for parent_id, _ in selected_groups}
+                    ),
+                    "selected_native_components": len(selected_native),
+                    "one_more_dilation_parent_groups": len(
+                        expanded_groups
+                    ),
+                    "one_more_dilation_hard_cells": len(
+                        {parent_id for parent_id, _ in expanded_groups}
+                    ),
+                    "one_more_dilation_native_components": len(
+                        expanded_native
+                    ),
+                    "training_selected_parent_fraction": (
+                        training_selected_fraction
+                    ),
+                    "training_one_more_dilation_fraction": (
+                        training_expanded_fraction
+                    ),
+                    "training_selected_parent_purity": training_purity,
+                    "validation_selected_parent_fraction": (
+                        selected_fraction
+                    ),
+                    "validation_one_more_dilation_fraction": (
+                        validation_expanded_fraction
+                    ),
+                    "validation_selected_parent_purity": (
+                        validation_purity
+                    ),
+                    "coverage_passed": coverage_passed,
+                }
+            )
+
+        footprints[stratum_id] = footprint_record
+        material_records.append(material_record)
+
+    representation_results: dict[str, object] = {}
+    for representation in CHANNEL_REPRESENTATIONS:
+        identifier = representation.identifier
+        accumulator = accumulators[identifier]
+        training_coverage = _serialized_coverage(
+            accumulator["training"], training.proposals
+        )
+        validation_coverage = _serialized_coverage(
+            accumulator["validation"], validation.proposals
+        )
+        footprints_count = int(accumulator["footprints"])
+        compactness = {
+            "contributing_training_strata": footprints_count,
+        }
+        for name in (
+            "seed_parent_groups",
+            "selected_parent_groups",
+            "selected_hard_cells",
+            "selected_native_components",
+            "expanded_parent_groups",
+            "expanded_hard_cells",
+            "expanded_native_components",
+        ):
+            value = int(accumulator[name])
+            compactness[f"total_{name}"] = value
+            compactness[f"mean_{name}_per_contributing_stratum"] = (
+                value / footprints_count
+                if footprints_count > 0
+                else None
+            )
+
+        training_purity_denominator = float(
+            accumulator["training_purity_denominator"]
+        )
+        validation_purity_denominator = float(
+            accumulator["validation_purity_denominator"]
+        )
+        per_channel: dict[str, object] = {}
+        validation_inside_total = accumulator["validation"]["total"].total
+        for channel in range(1, 7):
+            channel_coverage = _serialized_coverage(
+                accumulator["validation_by_channel"][channel],
+                validation.proposals,
+            )
+            channel_total = accumulator["validation_by_channel"][
+                channel
+            ]["total"].total
+            channel_coverage[
+                "fraction_of_inside_analysis_cross_section"
+            ] = (
+                channel_total / validation_inside_total
+                if validation_inside_total > 0.0
+                else None
+            )
+            per_channel[f"intreg_{channel}"] = channel_coverage
+
+        representation_results[identifier] = {
+            **representation.metadata(),
+            "training": {
+                **training_coverage,
+                "aggregate_selected_parent_purity_proxy": (
+                    float(accumulator["training_purity_numerator"])
+                    / training_purity_denominator
+                    if training_purity_denominator > 0.0
+                    else None
+                ),
+            },
+            "validation": {
+                **validation_coverage,
+                "aggregate_selected_parent_purity_proxy": (
+                    float(accumulator["validation_purity_numerator"])
+                    / validation_purity_denominator
+                    if validation_purity_denominator > 0.0
+                    else None
+                ),
+            },
+            "compactness": compactness,
+            "validation_by_training_status": {
+                status: _serialized_coverage(
+                    accumulator["validation_by_status"][status],
+                    validation.proposals,
+                )
+                for status in (
+                    "learned",
+                    "learned_low_support",
+                    "no_training_contribution",
+                )
+            },
+            "validation_by_native_intreg": per_channel,
+            "validation_material_strata": (
+                _representation_material_coverage(
+                    material_records, identifier
+                )
+            ),
+            "coverage_summary": {
+                "minimum_parent_coverage": minimum_parent_coverage,
+                "assessed_strata": int(accumulator["assessed_strata"]),
+                "passed_strata": int(accumulator["passed_strata"]),
+                "failed_strata": int(accumulator["failed_strata"]),
+                "training_strata_without_holdout_contribution": int(
+                    accumulator[
+                        "training_strata_without_holdout_contribution"
+                    ]
+                ),
+                "all_assessed_strata_passed": (
+                    int(accumulator["assessed_strata"]) > 0
+                    and int(accumulator["failed_strata"]) == 0
+                ),
+                "aggregate_coverage_meets_minimum": (
+                    validation_coverage[
+                        "cross_section_weighted_selected_parent_fraction"
+                    ]
+                    is not None
+                    and float(
+                        validation_coverage[
+                            "cross_section_weighted_selected_parent_fraction"
+                        ]
+                    )
+                    >= minimum_parent_coverage
+                ),
+            },
+        }
+
+    ranked = sorted(
+        representation_results,
+        key=lambda identifier: (
+            -float(
+                representation_results[identifier]["validation"][
+                    "cross_section_weighted_selected_parent_fraction"
+                ]
+                or 0.0
+            ),
+            int(
+                representation_results[identifier]["compactness"][
+                    "total_selected_native_components"
+                ]
+            ),
+            identifier,
+        ),
+    )
+    training_metadata = _campaign_comparison_metadata(training)
+    validation_metadata = _campaign_comparison_metadata(validation)
+    training_inside = training_metadata["inside_analysis_partition"]
+    validation_inside = validation_metadata["inside_analysis_partition"]
+    comparison = {
+        "schema": REPRESENTATION_COMPARISON_SCHEMA,
+        "created_utc": _now(),
+        "passed": True,
+        "study_completed": True,
+        "production_ready": False,
+        "production_readiness_note": (
+            "Milestone 2c compares frozen guard representations only. It "
+            "does not activate mode 4 or change AAO channel sampling."
+        ),
+        "analysis_config_source": str(config_path.resolve()),
+        "analysis_config_sha256": config_sha256,
+        "analysis_selection": {
+            "edge_convention": "lower_inclusive_upper_exclusive",
+            "phi_periodic": True,
+            "q2_minimum": float(
+                config["phase_space"].get(
+                    "Q2_min", config["binning"]["Q2"][0]
+                )
+            ),
+            "w_minimum": float(config["phase_space"]["W_min"]),
+            "apply_y_max": apply_y_max,
+            "y_maximum": (
+                float(config["phase_space"]["y_max"])
+                if apply_y_max
+                else None
+            ),
+            "no_implicit_y_minimum": True,
+        },
+        "coordinate_definitions": {
+            "hard_parent": HARD_COORDINATE_DEFINITION,
+            "hard_columns": HARD_COLUMNS,
+            "observed_target": OBSERVED_COORDINATE_DEFINITION,
+        },
+        "generator_revision": generator_revision,
+        "generator_revision_source": generator_revision_source,
+        "migration_learner_revision": learner_revision,
+        "survey_schema": radiative_survey.SURVEY_SCHEMA,
+        "representation_iteration": iteration,
+        "legacy_input_sha256": training.input_signature,
+        "legacy_generator_settings": training.legacy_input_settings,
+        "legacy_channel_probabilities": training.channel_probabilities,
+        "learning": {
+            "target_parent_fraction_before_dilation": (
+                target_parent_fraction
+            ),
+            "parent_dilation_axis_steps": parent_dilation,
+            "minimum_training_rows_for_supported_label": (
+                minimum_training_rows
+            ),
+            "minimum_training_ess_for_supported_label": (
+                minimum_training_ess
+            ),
+            "minimum_validation_parent_coverage": (
+                minimum_parent_coverage
+            ),
+            "learned_strata": learned,
+            "learned_low_support_strata": low_support,
+            "no_training_contribution_strata": empty,
+        },
+        "representation_interpretation": {
+            "channel_grouping_scope": (
+                "Grouping changes only how spatial footprints are learned. "
+                "Native intreg probabilities and Jacobians remain unchanged."
+            ),
+            "purity_proxy": (
+                "Sum of selected target contributions divided by the sum of "
+                "global observed contributions from each target's selected "
+                "parents. Parent contributions are intentionally counted once "
+                "per target footprint."
+            ),
+            "selection_ranking": (
+                "Representations are ranked first by held-out selected-parent "
+                "coverage, then by fewer selected native components."
+            ),
+        },
+        "training": training_metadata,
+        "validation": validation_metadata,
+        "inside_training_holdout_relative_difference": (
+            (
+                float(validation_inside["cross_section_microbarn"])
+                - float(training_inside["cross_section_microbarn"])
+            )
+            / float(training_inside["cross_section_microbarn"])
+            if float(training_inside["cross_section_microbarn"]) > 0.0
+            else None
+        ),
+        "inside_training_holdout_difference_z_score": (
+            guards._difference_z_score(
+                float(training_inside["cross_section_microbarn"]),
+                training_inside["cross_section_sem_microbarn"],
+                float(validation_inside["cross_section_microbarn"]),
+                validation_inside["cross_section_sem_microbarn"],
+            )
+        ),
+        "representations": representation_results,
+        "ranking_by_heldout_coverage_then_compactness": ranked,
+        "best_heldout_coverage_representation": (
+            ranked[0] if ranked else None
+        ),
+    }
+    footprint_payload = {
+        "schema": REPRESENTATION_FOOTPRINT_SCHEMA,
+        "created_utc": comparison["created_utc"],
+        "production_ready": False,
+        "analysis_config": config,
+        "analysis_config_source": str(config_path.resolve()),
+        "analysis_config_sha256": config_sha256,
+        "generator_revision": generator_revision,
+        "migration_learner_revision": learner_revision,
+        "representation_iteration": iteration,
+        "legacy_input_sha256": training.input_signature,
+        "legacy_generator_settings": training.legacy_input_settings,
+        "legacy_channel_probabilities": training.channel_probabilities,
+        "training_replica_ids": training_metadata["replica_ids"],
+        "target_parent_fraction_before_dilation": target_parent_fraction,
+        "parent_dilation_axis_steps": parent_dilation,
+        "representations": {
+            representation.identifier: representation.metadata()
+            for representation in CHANNEL_REPRESENTATIONS
+        },
+        "strata": footprints,
+    }
+    return comparison, footprint_payload, rows
+
+
+def _write_representation_rows(
+    path: Path, rows: list[dict[str, object]]
+) -> None:
+    fields = (
+        "stratum_id",
+        "flat_index",
+        "training_status",
+        "representation",
+        "training_cross_section_microbarn",
+        "training_ess",
+        "validation_cross_section_microbarn",
+        "validation_ess",
+        "seed_parent_groups",
+        "selected_parent_groups",
+        "selected_hard_cells",
+        "selected_native_components",
+        "one_more_dilation_parent_groups",
+        "one_more_dilation_hard_cells",
+        "one_more_dilation_native_components",
+        "training_selected_parent_fraction",
+        "training_one_more_dilation_fraction",
+        "training_selected_parent_purity",
+        "validation_selected_parent_fraction",
+        "validation_one_more_dilation_fraction",
+        "validation_selected_parent_purity",
+        "coverage_passed",
+    )
+    with path.open("w", encoding="utf-8", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def compare_representations(args: argparse.Namespace) -> dict:
+    _validate_channel_representations()
+    output = args.output.resolve()
+    if output.exists():
+        raise FileExistsError(
+            f"{output} already exists; representation artifacts are immutable"
+        )
+    if not 0.0 < args.target_parent_fraction <= 1.0:
+        raise MigrationError("--target-parent-fraction must be in (0,1]")
+    if args.parent_dilation < 0:
+        raise MigrationError("--parent-dilation must be nonnegative")
+    if args.iteration < 0:
+        raise MigrationError("--iteration must be nonnegative")
+    if args.minimum_training_rows < 1 or args.minimum_training_ess < 0.0:
+        raise MigrationError("training support thresholds are invalid")
+    if not 0.0 <= args.minimum_parent_coverage <= 1.0:
+        raise MigrationError("--minimum-parent-coverage must be in [0,1]")
+    try:
+        config, config_sha256 = guards.load_analysis_config(
+            args.config.resolve()
+        )
+    except guards.GuardLearningError as error:
+        raise MigrationError(str(error)) from error
+
+    training = aggregate_surveys(
+        args.training_survey,
+        config,
+        apply_y_max=args.apply_y_max,
+    )
+    validation = aggregate_surveys(
+        args.validation_survey,
+        config,
+        apply_y_max=args.apply_y_max,
+    )
+    if training.input_signature != validation.input_signature:
+        raise MigrationError(
+            "training and validation surveys have different legacy inputs"
+        )
+    training_replicas = {
+        int(item["replica"]) for item in training.replicas
+    }
+    validation_replicas = {
+        int(item["replica"]) for item in validation.replicas
+    }
+    overlap = training_replicas & validation_replicas
+    if overlap:
+        raise MigrationError(
+            f"validation replicas overlap training replicas: {sorted(overlap)}"
+        )
+    for campaign in (training, validation):
+        if not math.isclose(
+            float(config["beam_energy"]),
+            float(campaign.norm_reference["ebeam"]),
+            rel_tol=2.0e-7,
+        ):
+            raise MigrationError("analysis and survey beam energies differ")
+
+    learner_revision = guards._current_revision()
+    generator_revision = args.generator_revision or learner_revision
+    comparison, footprints, rows = _build_representation_study(
+        config=config,
+        config_path=args.config,
+        config_sha256=config_sha256,
+        training=training,
+        validation=validation,
+        target_parent_fraction=args.target_parent_fraction,
+        parent_dilation=args.parent_dilation,
+        iteration=args.iteration,
+        minimum_training_rows=args.minimum_training_rows,
+        minimum_training_ess=args.minimum_training_ess,
+        minimum_parent_coverage=args.minimum_parent_coverage,
+        apply_y_max=args.apply_y_max,
+        generator_revision=generator_revision,
+        generator_revision_source=(
+            "user_supplied"
+            if args.generator_revision
+            else "assumed_current_checkout"
+        ),
+        learner_revision=learner_revision,
+    )
+
+    output.mkdir(parents=True)
+    footprint_path = output / "representation_footprints.json"
+    footprint_path.write_text(
+        json.dumps(footprints, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    guards._write_sha256(footprint_path)
+    comparison["artifacts"] = {
+        "frozen_footprints": footprint_path.name,
+        "frozen_footprints_sha256": hashlib.sha256(
+            footprint_path.read_bytes()
+        ).hexdigest(),
+        "stratum_comparison": "representation_strata.csv",
+        "hash_sidecar_suffix": ".sha256",
+    }
+    comparison_path = output / "representation_comparison.json"
+    comparison_path.write_text(
+        json.dumps(comparison, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    row_path = output / "representation_strata.csv"
+    _write_representation_rows(row_path, rows)
+    guards._write_sha256(comparison_path)
+    guards._write_sha256(row_path)
+    return {
+        "passed": True,
+        "schema": REPRESENTATION_COMPARISON_SCHEMA,
+        "comparison": str(comparison_path),
+        "footprints": str(footprint_path),
+        "stratum_comparison": str(row_path),
+        "training_replicas": sorted(training_replicas),
+        "validation_replicas": sorted(validation_replicas),
+        "ranking_by_heldout_coverage_then_compactness": comparison[
+            "ranking_by_heldout_coverage_then_compactness"
+        ],
+        "representations": {
+            identifier: {
+                "heldout_selected_parent_fraction": values["validation"][
+                    "cross_section_weighted_selected_parent_fraction"
+                ],
+                "heldout_one_more_dilation_fraction": values["validation"][
+                    "cross_section_weighted_one_more_dilation_fraction"
+                ],
+                "aggregate_selected_parent_purity_proxy": values[
+                    "validation"
+                ]["aggregate_selected_parent_purity_proxy"],
+                "total_selected_hard_cells": values["compactness"][
+                    "total_selected_hard_cells"
+                ],
+                "total_selected_native_components": values["compactness"][
+                    "total_selected_native_components"
+                ],
+            }
+            for identifier, values in comparison[
+                "representations"
+            ].items()
+        },
+    }
+
+
 def _load_plot_inputs(
     manifest_path: Path, validation_path: Path
 ) -> tuple[dict, dict, Path]:
@@ -2106,6 +3299,265 @@ def plot(args: argparse.Namespace) -> dict:
     }
 
 
+def plot_representations(args: argparse.Namespace) -> dict:
+    _validate_channel_representations()
+    comparison_path = args.comparison.resolve()
+    output = args.output.resolve()
+    if output.exists():
+        raise FileExistsError(
+            f"{output} already exists; representation plots are immutable"
+        )
+    try:
+        comparison = json.loads(
+            comparison_path.read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as error:
+        raise MigrationError(
+            f"cannot read representation comparison: {error}"
+        ) from error
+    if comparison.get("schema") != REPRESENTATION_COMPARISON_SCHEMA:
+        raise MigrationError("representation comparison has the wrong schema")
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_pdf import PdfPages
+    except ImportError as error:
+        raise MigrationError(
+            "plotting requires matplotlib"
+        ) from error
+
+    identifiers = [
+        representation.identifier
+        for representation in CHANNEL_REPRESENTATIONS
+    ]
+    representations = comparison["representations"]
+    if set(identifiers) != set(representations):
+        raise MigrationError(
+            "representation comparison does not contain the expected models"
+        )
+    labels = [
+        str(representations[identifier]["label"])
+        for identifier in identifiers
+    ]
+    positions = list(range(len(identifiers)))
+    selected = [
+        float(
+            representations[identifier]["validation"][
+                "cross_section_weighted_selected_parent_fraction"
+            ]
+            or 0.0
+        )
+        for identifier in identifiers
+    ]
+    expanded = [
+        float(
+            representations[identifier]["validation"][
+                "cross_section_weighted_one_more_dilation_fraction"
+            ]
+            or 0.0
+        )
+        for identifier in identifiers
+    ]
+    minimum = float(
+        comparison["learning"]["minimum_validation_parent_coverage"]
+    )
+
+    output.mkdir(parents=True)
+    pdf_path = output / "representation_comparison.pdf"
+    with PdfPages(pdf_path) as pdf:
+        figure, axis = plt.subplots(figsize=(11, 5.5))
+        width = 0.36
+        axis.bar(
+            [position - width / 2 for position in positions],
+            selected,
+            width=width,
+            label="Frozen footprint",
+        )
+        axis.bar(
+            [position + width / 2 for position in positions],
+            expanded,
+            width=width,
+            label="One more spatial dilation",
+        )
+        axis.axhline(
+            minimum,
+            color="black",
+            linestyle="--",
+            linewidth=1,
+            label=f"Requested minimum ({minimum:.1%})",
+        )
+        axis.set_xticks(positions, labels, rotation=12, ha="right")
+        axis.set_ylim(0.0, 1.03)
+        axis.set_ylabel(
+            "Cross-section-weighted held-out parent coverage"
+        )
+        axis.set_title("Native-intreg representation comparison")
+        axis.grid(axis="y", alpha=0.25)
+        axis.legend()
+        figure.tight_layout()
+        pdf.savefig(figure)
+        plt.close(figure)
+
+        hard_cells = [
+            int(
+                representations[identifier]["compactness"][
+                    "total_selected_hard_cells"
+                ]
+            )
+            for identifier in identifiers
+        ]
+        native_components = [
+            int(
+                representations[identifier]["compactness"][
+                    "total_selected_native_components"
+                ]
+            )
+            for identifier in identifiers
+        ]
+        purities = [
+            float(
+                representations[identifier]["validation"][
+                    "aggregate_selected_parent_purity_proxy"
+                ]
+                or 0.0
+            )
+            for identifier in identifiers
+        ]
+        figure, axes = plt.subplots(1, 2, figsize=(12, 5))
+        axes[0].bar(
+            [position - width / 2 for position in positions],
+            hard_cells,
+            width=width,
+            label="Hard cells",
+        )
+        axes[0].bar(
+            [position + width / 2 for position in positions],
+            native_components,
+            width=width,
+            label="Native components",
+        )
+        axes[0].set_yscale("log")
+        axes[0].set_xticks(positions, labels, rotation=15, ha="right")
+        axes[0].set_ylabel("Total selected across training strata")
+        axes[0].set_title("Footprint compactness")
+        axes[0].grid(axis="y", alpha=0.25)
+        axes[0].legend()
+        axes[1].bar(positions, purities)
+        axes[1].set_xticks(positions, labels, rotation=15, ha="right")
+        axes[1].set_ylim(0.0, 1.0)
+        axes[1].set_ylabel("Held-out aggregate purity proxy")
+        axes[1].set_title("Selectivity of frozen footprints")
+        axes[1].grid(axis="y", alpha=0.25)
+        figure.tight_layout()
+        pdf.savefig(figure)
+        plt.close(figure)
+
+        figure, axis = plt.subplots(figsize=(12, 5.5))
+        channel_positions = list(range(1, 7))
+        channel_width = 0.18
+        for representation_index, identifier in enumerate(identifiers):
+            offset = (
+                representation_index - (len(identifiers) - 1) / 2
+            ) * channel_width
+            channel_coverages = [
+                float(
+                    representations[identifier][
+                        "validation_by_native_intreg"
+                    ][f"intreg_{channel}"][
+                        "cross_section_weighted_selected_parent_fraction"
+                    ]
+                    or 0.0
+                )
+                for channel in channel_positions
+            ]
+            axis.bar(
+                [channel + offset for channel in channel_positions],
+                channel_coverages,
+                width=channel_width,
+                label=labels[representation_index],
+            )
+        axis.set_xticks(channel_positions)
+        axis.set_xlabel("Native intreg")
+        axis.set_ylabel("Held-out selected-parent coverage")
+        axis.set_ylim(0.0, 1.03)
+        axis.set_title("Coverage retained separately by native intreg")
+        axis.grid(axis="y", alpha=0.25)
+        axis.legend(fontsize="small")
+        figure.tight_layout()
+        pdf.savefig(figure)
+        plt.close(figure)
+
+        material_keys = (
+            "top_50_percent_cross_section",
+            "top_90_percent_cross_section",
+            "top_95_percent_cross_section",
+            "top_99_percent_cross_section",
+        )
+        material_labels = ("Top 50%", "Top 90%", "Top 95%", "Top 99%")
+        figure, axis = plt.subplots(figsize=(12, 5.5))
+        material_width = 0.18
+        material_positions = list(range(len(material_keys)))
+        for representation_index, identifier in enumerate(identifiers):
+            offset = (
+                representation_index - (len(identifiers) - 1) / 2
+            ) * material_width
+            values = [
+                float(
+                    representations[identifier][
+                        "validation_material_strata"
+                    ][key][
+                        "cross_section_weighted_selected_parent_fraction"
+                    ]
+                    or 0.0
+                )
+                for key in material_keys
+            ]
+            axis.bar(
+                [
+                    position + offset
+                    for position in material_positions
+                ],
+                values,
+                width=material_width,
+                label=labels[representation_index],
+            )
+        axis.set_xticks(material_positions, material_labels)
+        axis.set_ylim(0.0, 1.03)
+        axis.set_ylabel("Held-out selected-parent coverage")
+        axis.set_title("Coverage in cross-section-dominant strata")
+        axis.grid(axis="y", alpha=0.25)
+        axis.legend(fontsize="small")
+        figure.tight_layout()
+        pdf.savefig(figure)
+        plt.close(figure)
+
+    guards._write_sha256(pdf_path)
+    summary = {
+        "schema": REPRESENTATION_PLOT_SCHEMA,
+        "created_utc": _now(),
+        "comparison": str(comparison_path),
+        "comparison_sha256": hashlib.sha256(
+            comparison_path.read_bytes()
+        ).hexdigest(),
+        "pdf": pdf_path.name,
+        "representations": identifiers,
+    }
+    summary_path = output / "plot_summary.json"
+    summary_path.write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    guards._write_sha256(summary_path)
+    return {
+        "passed": True,
+        "schema": REPRESENTATION_PLOT_SCHEMA,
+        "output": str(output),
+        "pdf": str(pdf_path),
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2167,6 +3619,53 @@ def _build_parser() -> argparse.ArgumentParser:
         help="number of lowest-coverage validation strata to show",
     )
 
+    comparison_parser = subparsers.add_parser(
+        "compare-representations",
+        help=(
+            "compare native-intreg groupings using frozen training and "
+            "held-out replicas"
+        ),
+    )
+    comparison_parser.add_argument("--config", type=Path, required=True)
+    comparison_parser.add_argument(
+        "--training-survey", type=Path, nargs="+", required=True
+    )
+    comparison_parser.add_argument(
+        "--validation-survey", type=Path, nargs="+", required=True
+    )
+    comparison_parser.add_argument("--output", type=Path, required=True)
+    comparison_parser.add_argument(
+        "--target-parent-fraction", type=float, default=0.995
+    )
+    comparison_parser.add_argument(
+        "--parent-dilation", type=int, default=0
+    )
+    comparison_parser.add_argument("--iteration", type=int, default=0)
+    comparison_parser.add_argument(
+        "--minimum-training-rows", type=int, default=10
+    )
+    comparison_parser.add_argument(
+        "--minimum-training-ess", type=float, default=5.0
+    )
+    comparison_parser.add_argument(
+        "--minimum-parent-coverage", type=float, default=0.98
+    )
+    comparison_parser.add_argument(
+        "--apply-y-max",
+        action="store_true",
+        help=(
+            "apply phase_space.y_max in both training and validation; the "
+            "default applies no y cut"
+        ),
+    )
+    comparison_parser.add_argument(
+        "--generator-revision",
+        help=(
+            "Git revision that produced the surveys; defaults to the current "
+            "checkout and is recorded as an assumption"
+        ),
+    )
+
     plot_parser = subparsers.add_parser(
         "plot", help="render migration coverage and hard-parent diagnostics"
     )
@@ -2178,6 +3677,16 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=6,
         help="number of highest-cross-section strata to plot individually",
+    )
+    representation_plot_parser = subparsers.add_parser(
+        "plot-representations",
+        help="render the milestone-2c representation comparison",
+    )
+    representation_plot_parser.add_argument(
+        "--comparison", type=Path, required=True
+    )
+    representation_plot_parser.add_argument(
+        "--output", type=Path, required=True
     )
     return parser
 
@@ -2191,6 +3700,10 @@ def main() -> int:
             result = validate(args)
         elif args.command == "summarize":
             result = summarize(args)
+        elif args.command == "compare-representations":
+            result = compare_representations(args)
+        elif args.command == "plot-representations":
+            result = plot_representations(args)
         else:
             result = plot(args)
     except (

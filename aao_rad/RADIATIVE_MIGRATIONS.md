@@ -1,4 +1,4 @@
-# Milestone 2b hard-parent migration diagnostic
+# Milestones 2b–2c hard-parent migration diagnostics
 
 `radiative_migrations.py` tests a physically motivated middle ground between
 the exact Born analysis strata and an independent high-dimensional
@@ -175,3 +175,85 @@ A useful parent representation must balance:
 The parent footprint is not a hard physics cut. A future mode-4 proposal must
 retain a nonzero full-support tail and apply the exact proposal-density
 correction before unweighting.
+
+## Milestone 2c: compare `intreg` representations
+
+Milestone 2b showed that learning every `(hard parent, intreg)` component
+independently can memorize the finite training survey. Milestone 2c tests
+whether the hard-parent geometry generalizes better when the six native
+importance-sampling regions are grouped more coarsely.
+
+The comparison freezes four representations from the training replicas:
+
+| Identifier | Channel groups used for footprint learning |
+|---|---|
+| `six_channel` | `{1}`, `{2}`, `{3}`, `{4}`, `{5}`, `{6}` |
+| `four_group` | `{1,3}`, `{2,4}`, wide-angle `{5}`, soft `{6}` |
+| `soft_resolved` | resolved `{1,2,3,4,5}`, soft `{6}` |
+| `channel_marginalized` | `{1,2,3,4,5,6}` |
+
+Grouping affects only the spatial footprint learned by this diagnostic.
+It does **not** change AAO's native `intreg` probabilities, photon-angle
+Jacobians, or radiative cross section. For example, a selected
+`channel_marginalized` hard cell admits all native channels through AAO's
+existing sampling law; it does not sample the six labels uniformly.
+
+Run the comparison from `aao_rad` using the existing five surveys:
+
+```bash
+python3 radiative_migrations.py compare-representations \
+  --config ../../../configs/analysis/rgk/6.535.json \
+  --training-survey \
+    survey_rgk_replica000 \
+    survey_rgk_replica001 \
+    survey_rgk_replica002 \
+  --validation-survey \
+    survey_rgk_replica003 \
+    survey_rgk_replica004 \
+  --target-parent-fraction 0.995 \
+  --parent-dilation 0 \
+  --iteration 0 \
+  --minimum-parent-coverage 0.98 \
+  --generator-revision 54f5ba8d59b86b8cabb2229e5c2cf2be5de1ff00 \
+  --output migration_rgk_representations_iteration000
+```
+
+As in milestone 2b, the default applies the configured observed `Q2` and `W`
+selection but no analysis-level `y` cut. Add `--apply-y-max` only after the
+RGK upper-`y` selection is finalized.
+
+Render the comparison:
+
+```bash
+python3 radiative_migrations.py plot-representations \
+  --comparison \
+    migration_rgk_representations_iteration000/representation_comparison.json \
+  --output migration_rgk_representations_iteration000_plots
+```
+
+The comparison writes immutable, checksummed artifacts:
+
+- `representation_comparison.json`: aggregate training and held-out coverage,
+  one-more-dilation recovery, compactness, purity proxy, material-stratum
+  coverage, and coverage separately for every native `intreg`;
+- `representation_footprints.json`: the exact frozen training footprint for
+  every analysis stratum and representation;
+- `representation_strata.csv`: one row per
+  `(analysis stratum, representation)` for detailed inspection;
+- `representation_comparison.pdf`: optional plotted comparison from
+  `plot-representations`.
+
+The command ranks representations first by cross-section-weighted held-out
+coverage and then by the number of selected native components. That ranking is
+a diagnostic convenience, not an automatic production decision. Purity and
+footprint size must be considered alongside completeness.
+
+Replicas 3 and 4 become **development data** once their results are used to
+choose a representation. A later, final assessment must use fresh survey
+replicas that were not consulted during representation design.
+
+Run the unit tests with:
+
+```bash
+python3 -m unittest -v test_radiative_migrations.py
+```

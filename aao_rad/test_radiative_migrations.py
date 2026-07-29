@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for the milestone-2b hard-parent migration diagnostic."""
+"""Unit tests for the milestone-2b/2c migration diagnostics."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ def _migration_row(
     trial: int,
     weight: float,
     q2_hard: float,
+    channel: int = 1,
 ) -> dict[str, str | int | float]:
     row = _row(
         replica=replica,
@@ -30,6 +31,7 @@ def _migration_row(
     )
     row.update(
         {
+            "intreg": channel,
             "q2_hard": q2_hard,
             "xb_hard": 0.2,
             "minus_t_hard": 0.2,
@@ -89,6 +91,146 @@ class ParentIndexTests(unittest.TestCase):
 
 
 class MigrationWorkflowTests(unittest.TestCase):
+    def test_channel_representation_comparison_uses_frozen_footprints(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(_config()), encoding="utf-8")
+            training = root / "training"
+            _write_survey(
+                training,
+                replica=0,
+                rows=[
+                    _migration_row(
+                        replica=0,
+                        trial=1,
+                        weight=8.0,
+                        q2_hard=1.5,
+                        channel=1,
+                    ),
+                    _migration_row(
+                        replica=0,
+                        trial=2,
+                        weight=2.0,
+                        q2_hard=2.5,
+                        channel=2,
+                    ),
+                ],
+            )
+            validation = root / "validation"
+            _write_survey(
+                validation,
+                replica=1,
+                rows=[
+                    _migration_row(
+                        replica=1,
+                        trial=1,
+                        weight=7.0,
+                        q2_hard=1.5,
+                        channel=3,
+                    ),
+                    _migration_row(
+                        replica=1,
+                        trial=2,
+                        weight=3.0,
+                        q2_hard=2.5,
+                        channel=2,
+                    ),
+                ],
+            )
+            output = root / "representation_study"
+            result = radiative_migrations.compare_representations(
+                argparse.Namespace(
+                    config=config_path,
+                    training_survey=[training],
+                    validation_survey=[validation],
+                    output=output,
+                    target_parent_fraction=0.7,
+                    parent_dilation=0,
+                    iteration=0,
+                    minimum_training_rows=1,
+                    minimum_training_ess=0.0,
+                    minimum_parent_coverage=0.65,
+                    apply_y_max=False,
+                    generator_revision="test-revision",
+                )
+            )
+            self.assertTrue(result["passed"])
+            comparison_path = output / "representation_comparison.json"
+            comparison = json.loads(
+                comparison_path.read_text(encoding="utf-8")
+            )
+            representations = comparison["representations"]
+            self.assertAlmostEqual(
+                representations["six_channel"]["validation"][
+                    "cross_section_weighted_selected_parent_fraction"
+                ],
+                0.0,
+            )
+            for identifier in (
+                "four_group",
+                "soft_resolved",
+                "channel_marginalized",
+            ):
+                self.assertAlmostEqual(
+                    representations[identifier]["validation"][
+                        "cross_section_weighted_selected_parent_fraction"
+                    ],
+                    0.7,
+                )
+            self.assertAlmostEqual(
+                representations["four_group"][
+                    "validation_by_native_intreg"
+                ]["intreg_3"][
+                    "cross_section_weighted_selected_parent_fraction"
+                ],
+                1.0,
+            )
+            self.assertEqual(
+                comparison[
+                    "ranking_by_heldout_coverage_then_compactness"
+                ][0],
+                "four_group",
+            )
+            footprints = json.loads(
+                (
+                    output / "representation_footprints.json"
+                ).read_text(encoding="utf-8")
+            )
+            four_group_seeds = footprints["strata"]["s00000"][
+                "representations"
+            ]["four_group"]["seed_parent_groups"]
+            self.assertEqual(
+                four_group_seeds[0]["channel_group"], "peak_a"
+            )
+            self.assertTrue(
+                (
+                    output / "representation_comparison.json.sha256"
+                ).is_file()
+            )
+            with (
+                output / "representation_strata.csv"
+            ).open(newline="", encoding="utf-8") as source:
+                rows = list(csv.DictReader(source))
+            self.assertEqual(len(rows), 16)
+
+            plot_output = root / "representation_plots"
+            plotted = radiative_migrations.plot_representations(
+                argparse.Namespace(
+                    comparison=comparison_path,
+                    output=plot_output,
+                )
+            )
+            self.assertTrue(plotted["passed"])
+            self.assertGreater(
+                (
+                    plot_output / "representation_comparison.pdf"
+                ).stat().st_size,
+                0,
+            )
+
     def test_weighted_parent_learning_validation_summary_and_plots(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
