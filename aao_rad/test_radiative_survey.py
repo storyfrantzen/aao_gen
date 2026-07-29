@@ -155,6 +155,43 @@ class InputValidationTests(unittest.TestCase):
 
 
 class ProposalDensityTests(unittest.TestCase):
+    def test_declared_bin_allows_only_small_boundary_roundoff(self) -> None:
+        edges = [0.09, 1.0, 1.5, 2.0]
+
+        self.assertTrue(
+            radiative_survey._declared_bin_contains(
+                1.5 - 2.0e-6,
+                edges,
+                2,
+                tolerance=3.0e-5,
+            )
+        )
+        self.assertTrue(
+            radiative_survey._declared_bin_contains(
+                2.0 + 2.0e-6,
+                edges,
+                2,
+                tolerance=3.0e-5,
+            )
+        )
+        self.assertFalse(
+            radiative_survey._declared_bin_contains(
+                1.49,
+                edges,
+                2,
+                tolerance=3.0e-5,
+            )
+        )
+        self.assertTrue(
+            radiative_survey._declared_bin_contains(
+                360.0,
+                [0.0, 180.0, 360.0],
+                1,
+                tolerance=3.0e-4,
+                periodic=True,
+            )
+        )
+
     def test_global_tail_bounds_density_ratio_outside_balanced_support(self) -> None:
         row = {
             "q2_leptonic": 4.0,

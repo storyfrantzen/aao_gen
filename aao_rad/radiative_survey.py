@@ -985,24 +985,57 @@ def _validate_proposal_mapping(
         if int(row["proposal_component"]) == 1:
             binning = proposal_spec["binning"]
             values = (
-                ("proposal_q2_bin", float(row["q2_leptonic"]), binning["Q2"]),
-                ("proposal_xb_bin", float(row["xb_leptonic"]), binning["xB"]),
+                (
+                    "proposal_q2_bin",
+                    float(row["q2_leptonic"]),
+                    binning["Q2"],
+                    COORDINATE_TOLERANCES["q2_observed"],
+                    False,
+                ),
+                (
+                    "proposal_xb_bin",
+                    float(row["xb_leptonic"]),
+                    binning["xB"],
+                    COORDINATE_TOLERANCES["xb_observed"],
+                    False,
+                ),
                 (
                     "proposal_t_bin",
                     float(row["minus_t_hard"]),
                     binning["minus_t"],
+                    COORDINATE_TOLERANCES["minus_t_observed"],
+                    False,
                 ),
                 (
                     "proposal_phi_bin",
-                    float(row["phi_cm_deg"]) % 360.0,
+                    float(row["phi_cm_deg"]),
                     binning["phi_deg"],
+                    COORDINATE_TOLERANCES["phi_observed_deg"],
+                    True,
                 ),
             )
-            for column, value, edges in values:
-                expected_bin = _bin_index(value, edges)
-                if expected_bin != int(row[column]):
+            for column, value, edges, tolerance, periodic in values:
+                declared_bin = int(row[column])
+                if not _declared_bin_contains(
+                    value,
+                    edges,
+                    declared_bin,
+                    tolerance=tolerance,
+                    periodic=periodic,
+                ):
+                    lower = (
+                        edges[declared_bin]
+                        if 0 <= declared_bin < len(edges) - 1
+                        else math.nan
+                    )
+                    upper = (
+                        edges[declared_bin + 1]
+                        if 0 <= declared_bin < len(edges) - 1
+                        else math.nan
+                    )
                     raise SurveyValidationError(
-                        f"{column}={row[column]} disagrees with generated value"
+                        f"{column}={declared_bin} declares [{lower}, {upper}], "
+                        f"but the generated value is {value:.17g}"
                     )
     if row["final_valid"] == 1:
         _assert_close(
@@ -1019,6 +1052,30 @@ def _bin_index(value: float, edges: list[float]) -> int | None:
         if lower <= value < upper:
             return index
     return None
+
+
+def _declared_bin_contains(
+    value: float,
+    edges: list[float],
+    index: int,
+    *,
+    tolerance: float,
+    periodic: bool = False,
+) -> bool:
+    """Allow only numerical boundary spillover around a declared proposal bin."""
+
+    if index < 0 or index >= len(edges) - 1:
+        return False
+    candidates = [value]
+    if periodic:
+        period = edges[-1] - edges[0]
+        wrapped = (value - edges[0]) % period + edges[0]
+        candidates = [wrapped, wrapped - period, wrapped + period]
+    lower, upper = edges[index], edges[index + 1]
+    return any(
+        lower - tolerance <= candidate <= upper + tolerance
+        for candidate in candidates
+    )
 
 
 def _allocation_summary(
