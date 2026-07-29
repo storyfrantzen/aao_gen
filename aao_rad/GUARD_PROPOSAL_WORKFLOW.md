@@ -1145,6 +1145,27 @@ See `RADIATIVE_SURVEY.md` for executable commands. Manifests intentionally set
 `production_ready` to false until milestone 3 implements the exact proposal
 correction and radiative unweighting.
 
+## Milestone 2b: hard-parent migration diagnostic
+
+The independent proposal-cell learner is a general baseline, but it does not
+share the Born-like structure of neighboring radiative strata.
+`radiative_migrations.py` therefore builds a complementary
+cross-section-weighted mapping from
+
+```text
+(Q2_hard, xB_hard, minus_t_hard, phi_cm, intreg)
+```
+
+to each final-LUND analysis stratum. Hard coordinates use the analysis edges
+plus explicit nonperiodic underflow and overflow parents, so generator-level
+radiative feed-in remains visible. Training selects compact parent/channel
+footprints; independent replicas measure their completeness, cross-section
+purity, extra-dilation recovery, and stability.
+
+The migration matrix is diagnostic and `production_ready` remains false. It
+does not assume that the radiative integrand can already be sampled in hard
+coordinates. See `RADIATIVE_MIGRATIONS.md` for commands and artifacts.
+
 ## Milestone 3: core-plus-tail radiative mode 4
 
 - Read a frozen guard table prepared from the manifest.

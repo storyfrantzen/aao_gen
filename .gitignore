@@ -8,6 +8,7 @@ aao_rad/aao_rad.survey.csv
 aao_rad/generator.stderr.txt
 aao_rad/generator.stdout.txt
 aao_rad/survey_*/
+aao_rad/migration_*/
 aao_norad/build/
 
 # Generated AAO scan plots/results.

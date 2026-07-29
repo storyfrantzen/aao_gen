@@ -251,3 +251,12 @@ calculation failed.
 This is still a learning artifact: `production_ready` is false. The manifest
 does not alter radiative sampling or LUND output until milestone 3 implements
 the exact core-plus-tail proposal correction and unweighting.
+
+## Milestone 2b: hard-parent migrations
+
+The independent proposal-cell guard is deliberately general but can be sparse.
+`radiative_migrations.py` provides a complementary, physically organized
+diagnostic that maps Born-like hard-parent strata and radiative channels into
+the final-LUND analysis strata. See
+[`RADIATIVE_MIGRATIONS.md`](RADIATIVE_MIGRATIONS.md) for the coordinate
+definitions, farm commands, artifacts, and interpretation.
