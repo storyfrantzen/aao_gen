@@ -131,6 +131,7 @@ def _prepare_args(
         command="prepare",
         config=config,
         recipes=recipes,
+        refinements=None,
         input=legacy,
         output=root / "campaign",
         candidate="padding_0p035",
@@ -155,6 +156,7 @@ def _calibration_args(
         command="prepare-calibration",
         config=config,
         recipes=recipes,
+        refinements=None,
         input=legacy,
         output=root / "calibration",
         candidate="padding_0p035",
@@ -253,6 +255,61 @@ class ProposalTests(unittest.TestCase):
         self.assertEqual(box.nonperiodic["u_gamma"], (0.25, 1.0))
         self.assertAlmostEqual(box.volume, 0.7 * 0.75)
 
+    def test_refinement_expands_only_requested_final_faces(self) -> None:
+        box = radiative_mode4.GuardBox(
+            nonperiodic={
+                "r_u": (0.2, 0.6),
+                "r_ep": (0.3, 0.7),
+                "u_gamma": (0.1, 1.0),
+                "hadron_cosine_base": (0.4, 0.8),
+            },
+            phi_origin=0.9,
+            phi_relative=(-0.1, 0.1),
+        )
+        specification = {
+            "rationale": "Independent calibration crossed two nearby faces.",
+            "evidence": [{"path": "evidence.json", "sha256": "a" * 64}],
+            "faces": {
+                "r_u": {"upper": 0.67},
+                "r_ep": {"lower": 0.275},
+            },
+        }
+        refined, record = radiative_mode4.apply_guard_refinement(
+            box, specification, stratum_id="s04468"
+        )
+        self.assertEqual(refined.nonperiodic["r_u"], (0.2, 0.67))
+        self.assertEqual(refined.nonperiodic["r_ep"], (0.275, 0.7))
+        self.assertEqual(refined.nonperiodic["u_gamma"], (0.1, 1.0))
+        self.assertEqual(box.nonperiodic["r_u"], (0.2, 0.6))
+        self.assertGreater(refined.volume, box.volume)
+        self.assertEqual(len(record["applied_face_changes"]), 2)
+        self.assertEqual(
+            record["coordinate_space"],
+            radiative_mode4.REFINEMENT_COORDINATE_SPACE,
+        )
+
+    def test_refinement_rejects_guard_contraction(self) -> None:
+        box = radiative_mode4.GuardBox(
+            nonperiodic={
+                name: (0.2, 0.8)
+                for name in radiative_mode4.AXES[:-1]
+            },
+            phi_origin=0.0,
+            phi_relative=(-0.2, 0.2),
+        )
+        with self.assertRaisesRegex(ValueError, "would contract"):
+            radiative_mode4.apply_guard_refinement(
+                box,
+                {
+                    "rationale": "Invalid inward movement.",
+                    "evidence": [
+                        {"path": "evidence.json", "sha256": "b" * 64}
+                    ],
+                    "faces": {"r_u": {"upper": 0.7}},
+                },
+                stratum_id="s00000",
+            )
+
 
 class WorkflowTests(unittest.TestCase):
     def test_prepare_snapshots_provenance_and_writes_mode4_trailer(self) -> None:
@@ -302,6 +359,83 @@ class WorkflowTests(unittest.TestCase):
                     (manifest_path.parent / "analysis_config.json").read_bytes()
                 ).hexdigest(),
                 manifest["analysis_config_sha256"],
+            )
+
+    def test_create_and_prepare_refinement_freezes_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, recipes, legacy = _fixtures(root)
+            evidence = root / "calibration.json"
+            evidence.write_text(
+                '{"diagnosis":"upper r_u escape"}\n', encoding="utf-8"
+            )
+            refinement_path = radiative_mode4.create_refinement(
+                argparse.Namespace(
+                    config=config,
+                    recipes=recipes,
+                    candidate="padding_0p035",
+                    output=root / "refinement.json",
+                    stratum="s00000",
+                    face=["r_u:upper:0.87"],
+                    rationale=(
+                        "Independent complement calibration crossed r_u."
+                    ),
+                    evidence=[evidence],
+                    overwrite=False,
+                )
+            )
+            refinement = json.loads(
+                refinement_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                refinement["schema"], radiative_mode4.REFINEMENT_SCHEMA
+            )
+            self.assertEqual(
+                refinement["strata"]["s00000"]["evidence"][0]["sha256"],
+                hashlib.sha256(evidence.read_bytes()).hexdigest(),
+            )
+            args = _prepare_args(root, config, recipes, legacy)
+            args.output = root / "refined_campaign"
+            args.refinements = refinement_path
+            manifest_path = radiative_mode4.prepare(args)
+            manifest = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                manifest["guard_refinements_sha256"],
+                hashlib.sha256(refinement_path.read_bytes()).hexdigest(),
+            )
+            self.assertEqual(manifest["guard_refined_strata"], ["s00000"])
+            self.assertEqual(
+                hashlib.sha256(
+                    (
+                        manifest_path.parent / "guard_refinements.json"
+                    ).read_bytes()
+                ).hexdigest(),
+                manifest["guard_refinements_sha256"],
+            )
+            record = manifest["runs"][0]
+            self.assertAlmostEqual(
+                record["guard_original"]["axes"]["r_u"][0], 0.165
+            )
+            self.assertAlmostEqual(
+                record["guard_original"]["axes"]["r_u"][1], 0.835
+            )
+            self.assertAlmostEqual(
+                record["guard"]["axes"]["r_u"][0], 0.165
+            )
+            self.assertAlmostEqual(
+                record["guard"]["axes"]["r_u"][1], 0.87
+            )
+            self.assertEqual(
+                record["guard_refinement"]["applied_face_changes"][0][
+                    "axis"
+                ],
+                "r_u",
+            )
+            self.assertAlmostEqual(
+                record["guard_refinement"]["volume_ratio"],
+                0.705 / 0.67,
             )
 
     @unittest.skipUnless(

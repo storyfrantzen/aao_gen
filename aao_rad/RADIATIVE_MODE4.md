@@ -72,6 +72,78 @@ Thus `mcall_max > 1` does not bias the distribution, but it creates duplicate
 complete candidates and signals that a larger envelope may be operationally
 preferable.
 
+## Evidence-based face refinements
+
+A finite training survey can stop just short of an important continuous-guard
+face. Do not edit the learned recipe or generated AAO input by hand. Mode 4
+can instead create and apply an optional evidence-hashed refinement artifact.
+Refinement values are the exact **final post-padding guard bounds**. They are
+not padded again, and they may expand support but may never contract it.
+
+For the first `s04468` refinement:
+
+```bash
+python3 radiative_mode4.py create-refinement \
+  --config ../../../configs/analysis/rgk/6.535.json \
+  --recipes \
+    rgk_mode4_v3_fresh_20260730/inputs/continuous_guard_recipes.json \
+  --candidate padding_0p035 \
+  --output \
+    rgk_mode4_v3_fresh_20260730/inputs/s04468_refinement_iteration001.json \
+  --stratum s04468 \
+  --face r_u:upper:0.670 \
+  --face r_ep:lower:0.275 \
+  --rationale \
+    "Independent complement calibration found two r_u-upper escapes and one r_ep-lower escape." \
+  --evidence \
+    rgk_mode4_v3_fresh_20260730/calibration/s04468_pooled.json \
+  --evidence \
+    rgk_mode4_v3_fresh_20260730/calibration/s04468_complement_5M/runs/s04468/s04468__g0000.calibration.csv
+```
+
+The creator validates the analysis and recipe hashes, the guard candidate,
+axis names, native coordinate limits, endpoint anchor, and expansion
+direction. It records hashes and byte counts for every evidence artifact and
+previews the original and refined boxes plus their volume ratio.
+
+Pass the resulting artifact to either preparation operation:
+
+```bash
+python3 radiative_mode4.py prepare-calibration \
+  --config ../../../configs/analysis/rgk/6.535.json \
+  --recipes \
+    rgk_mode4_v3_fresh_20260730/inputs/continuous_guard_recipes.json \
+  --refinements \
+    rgk_mode4_v3_fresh_20260730/inputs/s04468_refinement_iteration001.json \
+  --input aao_input.inp \
+  --output \
+    rgk_mode4_v3_fresh_20260730/calibration/s04468_refined_iteration001 \
+  --candidate padding_0p035 \
+  --core-fraction 0.90 \
+  --inside-guard-trial-fraction 0.50 \
+  --trials 1000000 \
+  --heartbeat-interval 10000 \
+  --replicas 1 \
+  --bin-start 4468 \
+  --bin-stop 4469 \
+  --generator-revision `git rev-parse HEAD`
+```
+
+Preparation snapshots the complete refinement JSON. The manifest records its
+SHA-256, lists the named refined strata, and freezes, for every run:
+
+- the original learned-and-padded guard;
+- the exact refined guard;
+- every changed face and signed movement;
+- the rationale and evidence hashes;
+- the original and refined volumes and their ratio.
+
+Run also verifies the frozen refinement snapshot before invoking AAO, and the
+hash is copied into the normalization output and downstream summary.
+Calibration campaigns can be pooled only when their refinement hashes and
+final guard bounds agree. In particular, do not pool pre-refinement and
+post-refinement `s04468` results.
+
 ## Calibrate the envelope first
 
 Build from `aao_rad`:
@@ -287,6 +359,8 @@ legacy input. Its immutable manifest records:
 - requested bin bounds and indices;
 - generator, config, and recipe revisions or hashes;
 - reconstructed padded guard and normalized volume;
+- optional evidence-hashed guard refinements, with original and refined
+  bounds;
 - core and unrestricted-tail fractions;
 - explicit seed, event count, and `sigr_max`.
 

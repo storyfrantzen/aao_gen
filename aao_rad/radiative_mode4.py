@@ -34,6 +34,8 @@ RUN_SCHEMA = "aao-rad-mode4-run-v3"
 WEIGHTS_SCHEMA = "aao-rad-mode4-weights-v1"
 CALIBRATION_SCHEMA = "aao-rad-mode4-envelope-calibration-v2"
 RECIPE_SCHEMA = "aao-rad-continuous-guard-recipes-v1"
+REFINEMENT_SCHEMA = "aao-rad-mode4-guard-refinements-v1"
+REFINEMENT_COORDINATE_SPACE = "post_padding_guard_bounds"
 SAMPLING_MODE = 4
 MODE4_KINEMATICS_FILENAME = "aao_rad.mode4.csv"
 MODE4_KINEMATICS_SCHEMA = "aao-rad-mode4-events-v1"
@@ -237,6 +239,144 @@ def reconstruct_guard_box(recipe: dict, base_padding: float) -> GuardBox:
     return box
 
 
+def apply_guard_refinement(
+    box: GuardBox,
+    specification: dict,
+    *,
+    stratum_id: str,
+) -> tuple[GuardBox, dict[str, object]]:
+    """Expand selected final guard faces and describe every applied change."""
+    try:
+        rationale = str(specification["rationale"]).strip()
+        evidence = specification["evidence"]
+        faces = specification["faces"]
+    except (KeyError, TypeError) as error:
+        raise ValueError(
+            f"{stratum_id}: malformed guard refinement"
+        ) from error
+    if not rationale:
+        raise ValueError(f"{stratum_id}: refinement rationale is empty")
+    if not isinstance(evidence, list) or not evidence:
+        raise ValueError(
+            f"{stratum_id}: refinement must cite at least one evidence artifact"
+        )
+    for item in evidence:
+        if not isinstance(item, dict):
+            raise ValueError(f"{stratum_id}: malformed refinement evidence")
+        try:
+            evidence_path = str(item["path"]).strip()
+            evidence_hash = str(item["sha256"]).strip().lower()
+        except (KeyError, TypeError) as error:
+            raise ValueError(
+                f"{stratum_id}: malformed refinement evidence"
+            ) from error
+        if not evidence_path or len(evidence_hash) != 64 or any(
+            character not in "0123456789abcdef" for character in evidence_hash
+        ):
+            raise ValueError(
+                f"{stratum_id}: malformed refinement evidence provenance"
+            )
+    if not isinstance(faces, dict) or not faces:
+        raise ValueError(f"{stratum_id}: refinement faces are empty")
+    unknown_axes = set(faces).difference(AXES)
+    if unknown_axes:
+        raise ValueError(
+            f"{stratum_id}: unknown refinement axes "
+            f"{sorted(unknown_axes)}"
+        )
+
+    nonperiodic = dict(box.nonperiodic)
+    phi_relative = list(box.phi_relative)
+    changes: list[dict[str, object]] = []
+    for axis, requested in faces.items():
+        if not isinstance(requested, dict) or not requested:
+            raise ValueError(
+                f"{stratum_id}: {axis} refinement faces are empty"
+            )
+        unknown_faces = set(requested).difference(("lower", "upper"))
+        if unknown_faces:
+            raise ValueError(
+                f"{stratum_id}: {axis} has unknown faces "
+                f"{sorted(unknown_faces)}"
+            )
+        if axis == "hadron_phi_base":
+            old_bounds = box.phi_relative
+            domain = (-0.5, 0.5)
+        else:
+            old_bounds = box.nonperiodic[axis]
+            domain = (0.0, 1.0)
+        new_bounds = list(old_bounds)
+        for face, raw_value in requested.items():
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"{stratum_id}: {axis} {face} is not numeric"
+                ) from error
+            if not math.isfinite(value) or not domain[0] <= value <= domain[1]:
+                raise ValueError(
+                    f"{stratum_id}: {axis} {face} lies outside "
+                    f"[{domain[0]},{domain[1]}]"
+                )
+            index = 0 if face == "lower" else 1
+            original = old_bounds[index]
+            if face == "lower" and value > original:
+                raise ValueError(
+                    f"{stratum_id}: {axis} lower refinement would contract "
+                    "the guard"
+                )
+            if face == "upper" and value < original:
+                raise ValueError(
+                    f"{stratum_id}: {axis} upper refinement would contract "
+                    "the guard"
+                )
+            new_bounds[index] = value
+            if not _close(value, original):
+                changes.append(
+                    {
+                        "axis": axis,
+                        "face": face,
+                        "original": original,
+                        "refined": value,
+                        "signed_change": value - original,
+                    }
+                )
+        if not new_bounds[0] < new_bounds[1]:
+            raise ValueError(
+                f"{stratum_id}: refined {axis} bounds are invalid"
+            )
+        if axis == "hadron_phi_base":
+            phi_relative = new_bounds
+        else:
+            nonperiodic[axis] = (new_bounds[0], new_bounds[1])
+    if not changes:
+        raise ValueError(f"{stratum_id}: refinement does not move any face")
+    if not _close(nonperiodic["u_gamma"][1], 1.0):
+        raise ValueError(
+            f"{stratum_id}: refinement breaks the u_gamma endpoint anchor"
+        )
+    refined = GuardBox(
+        nonperiodic=nonperiodic,
+        phi_origin=box.phi_origin,
+        phi_relative=(phi_relative[0], phi_relative[1]),
+    )
+    if not box.volume < refined.volume <= 1.0:
+        raise ValueError(
+            f"{stratum_id}: refinement must increase guard volume within "
+            "the native domain"
+        )
+    record = {
+        "coordinate_space": REFINEMENT_COORDINATE_SPACE,
+        "rationale": rationale,
+        "evidence": evidence,
+        "applied_face_changes": changes,
+        "original_normalized_volume": box.volume,
+        "refined_normalized_volume": refined.volume,
+        "volume_ratio": refined.volume / box.volume,
+    }
+    return refined, record
+
+
 def proposal_density_ratio(
     coordinates: dict[str, float],
     box: GuardBox,
@@ -368,11 +508,10 @@ def _mode4_trailer(
     ) + "\n"
 
 
-def _load_configuration(
+def _load_config_and_recipes(
     config_path: Path,
     recipes_path: Path,
-    input_path: Path,
-) -> tuple[dict, dict, str, str, str]:
+) -> tuple[dict, dict, str, str]:
     config_raw = config_path.read_bytes()
     recipes_raw = recipes_path.read_bytes()
     try:
@@ -387,6 +526,25 @@ def _load_configuration(
     config_sha256 = hashlib.sha256(config_raw).hexdigest()
     if recipes.get("analysis_config_sha256") != config_sha256:
         raise ValueError("guard recipes and analysis config hashes differ")
+    return (
+        config,
+        recipes,
+        config_sha256,
+        hashlib.sha256(recipes_raw).hexdigest(),
+    )
+
+
+def _load_configuration(
+    config_path: Path,
+    recipes_path: Path,
+    input_path: Path,
+) -> tuple[dict, dict, str, str, str]:
+    (
+        config,
+        recipes,
+        config_sha256,
+        recipes_sha256,
+    ) = _load_config_and_recipes(config_path, recipes_path)
     legacy = input_path.read_text(encoding="utf-8")
     radiative_survey._load_balanced_config(
         config_path,
@@ -407,9 +565,146 @@ def _load_configuration(
         config,
         recipes,
         config_sha256,
-        hashlib.sha256(recipes_raw).hexdigest(),
+        recipes_sha256,
         legacy,
     )
+
+
+def _load_guard_refinements(
+    path: Path,
+    *,
+    config_sha256: str,
+    recipes_sha256: str,
+    candidate: str,
+    recipes: dict,
+    base_padding: float,
+) -> tuple[dict, str]:
+    raw = path.read_bytes()
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{path}: invalid refinement JSON: {error}") from error
+    if payload.get("schema") != REFINEMENT_SCHEMA:
+        raise ValueError(
+            f"{path}: unsupported refinement schema "
+            f"{payload.get('schema')!r}"
+        )
+    if payload.get("coordinate_space") != REFINEMENT_COORDINATE_SPACE:
+        raise ValueError(
+            f"{path}: refinements must use final post-padding guard bounds"
+        )
+    expected = {
+        "analysis_config_sha256": config_sha256,
+        "guard_recipes_sha256": recipes_sha256,
+        "guard_candidate": candidate,
+    }
+    for name, value in expected.items():
+        if payload.get(name) != value:
+            raise ValueError(
+                f"{path}: {name} does not match the selected guard inputs"
+            )
+    specifications = payload.get("strata")
+    if not isinstance(specifications, dict) or not specifications:
+        raise ValueError(f"{path}: refinement strata are empty")
+    for stratum_id, specification in specifications.items():
+        if stratum_id not in recipes.get("strata", {}):
+            raise ValueError(
+                f"{path}: refinement names unknown stratum {stratum_id}"
+            )
+        original = reconstruct_guard_box(
+            recipes["strata"][stratum_id], base_padding
+        )
+        apply_guard_refinement(
+            original, specification, stratum_id=stratum_id
+        )
+    return payload, hashlib.sha256(raw).hexdigest()
+
+
+def create_refinement(args: argparse.Namespace) -> Path:
+    """Create one validated, evidence-hashed stratum refinement artifact."""
+    config_path = args.config.resolve()
+    recipes_path = args.recipes.resolve()
+    output = args.output.resolve()
+    for path in (config_path, recipes_path):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    (
+        _config,
+        recipes,
+        config_sha256,
+        recipes_sha256,
+    ) = _load_config_and_recipes(config_path, recipes_path)
+    base_padding = _candidate_padding(recipes, args.candidate)
+    if args.stratum not in recipes.get("strata", {}):
+        raise ValueError(f"guard recipes lack {args.stratum}")
+    faces: dict[str, dict[str, float]] = {}
+    for specification in args.face:
+        pieces = specification.split(":")
+        if len(pieces) != 3:
+            raise ValueError(
+                f"{specification!r}: expected AXIS:FACE:VALUE"
+            )
+        axis, face, raw_value = pieces
+        if axis not in AXES or face not in ("lower", "upper"):
+            raise ValueError(
+                f"{specification!r}: invalid axis or face"
+            )
+        if face in faces.setdefault(axis, {}):
+            raise ValueError(
+                f"{args.stratum}: duplicate {axis} {face} refinement"
+            )
+        try:
+            faces[axis][face] = float(raw_value)
+        except ValueError as error:
+            raise ValueError(
+                f"{specification!r}: refinement value is not numeric"
+            ) from error
+    evidence: list[dict[str, object]] = []
+    for raw_path in args.evidence:
+        path = raw_path.resolve()
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        evidence.append(
+            {
+                "path": str(path),
+                "sha256": _sha256(path),
+                "bytes": path.stat().st_size,
+            }
+        )
+    stratum_refinement = {
+        "rationale": args.rationale,
+        "evidence": evidence,
+        "faces": faces,
+    }
+    original = reconstruct_guard_box(
+        recipes["strata"][args.stratum], base_padding
+    )
+    refined, applied = apply_guard_refinement(
+        original, stratum_refinement, stratum_id=args.stratum
+    )
+    payload: dict[str, object] = {
+        "schema": REFINEMENT_SCHEMA,
+        "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "coordinate_space": REFINEMENT_COORDINATE_SPACE,
+        "analysis_config_source": str(config_path),
+        "analysis_config_sha256": config_sha256,
+        "guard_recipes_source": str(recipes_path),
+        "guard_recipes_sha256": recipes_sha256,
+        "guard_candidate": args.candidate,
+        "strata": {args.stratum: stratum_refinement},
+        "preview": {
+            args.stratum: {
+                "original_guard": original.manifest_record(),
+                "refined_guard": refined.manifest_record(),
+                **applied,
+            }
+        },
+    }
+    if output.exists() and not args.overwrite:
+        raise FileExistsError(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(output, payload)
+    return output
 
 
 def prepare(args: argparse.Namespace) -> Path:
@@ -466,6 +761,21 @@ def prepare(args: argparse.Namespace) -> Path:
         legacy_source,
     ) = _load_configuration(config_path, recipes_path, input_path)
     base_padding = _candidate_padding(recipes, args.candidate)
+    refinements_path = getattr(args, "refinements", None)
+    refinements: Optional[dict] = None
+    refinements_sha256: Optional[str] = None
+    if refinements_path is not None:
+        refinements_path = refinements_path.resolve()
+        if not refinements_path.is_file():
+            raise FileNotFoundError(refinements_path)
+        refinements, refinements_sha256 = _load_guard_refinements(
+            refinements_path,
+            config_sha256=config_sha256,
+            recipes_sha256=recipes_sha256,
+            candidate=args.candidate,
+            recipes=recipes,
+            base_padding=base_padding,
+        )
     legacy_input, legacy_records = _legacy_mode4_input(
         legacy_source,
         input_path,
@@ -482,6 +792,10 @@ def prepare(args: argparse.Namespace) -> Path:
     input_directory.mkdir(parents=True, exist_ok=True)
     shutil.copy2(config_path, output / "analysis_config.json")
     shutil.copy2(recipes_path, output / "continuous_guard_recipes.json")
+    if refinements_path is not None:
+        shutil.copy2(
+            refinements_path, output / "guard_refinements.json"
+        )
     (output / "legacy_input.inp").write_text(
         legacy_source, encoding="utf-8"
     )
@@ -510,7 +824,21 @@ def prepare(args: argparse.Namespace) -> Path:
             raise ValueError(
                 f"{stratum.identifier}: recipe bounds differ from config"
             )
-        box = reconstruct_guard_box(recipe, base_padding)
+        original_box = reconstruct_guard_box(recipe, base_padding)
+        refinement_record: Optional[dict[str, object]] = None
+        specification = (
+            refinements["strata"].get(stratum.identifier)
+            if refinements is not None
+            else None
+        )
+        if specification is not None:
+            box, refinement_record = apply_guard_refinement(
+                original_box,
+                specification,
+                stratum_id=stratum.identifier,
+            )
+        else:
+            box = original_box
         if operation == "calibration" and box.volume >= 1.0 - 1.0e-7:
             raise ValueError(
                 f"{stratum.identifier}: the anchored guard fills the native "
@@ -568,7 +896,9 @@ def prepare(args: argparse.Namespace) -> Path:
                     ),
                     "input_file": str(input_relative),
                     "output_stem": str(output_stem),
+                    "guard_original": original_box.manifest_record(),
                     "guard": box.manifest_record(),
+                    "guard_refinement": refinement_record,
                 }
             )
     if not records:
@@ -585,6 +915,16 @@ def prepare(args: argparse.Namespace) -> Path:
         "analysis_config_sha256": config_sha256,
         "guard_recipes_source": str(recipes_path),
         "guard_recipes_sha256": recipes_sha256,
+        "guard_refinements_source": (
+            str(refinements_path) if refinements_path is not None else None
+        ),
+        "guard_refinements_sha256": refinements_sha256,
+        "guard_refinement_schema": (
+            REFINEMENT_SCHEMA if refinements is not None else None
+        ),
+        "guard_refined_strata": (
+            sorted(refinements["strata"]) if refinements is not None else []
+        ),
         "guard_learner_revision": recipes.get(
             "continuous_guard_learner_revision"
         ),
@@ -1018,6 +1358,17 @@ def run(args: argparse.Namespace) -> Path:
         )
     record = matches[0]
     root = manifest_path.parent
+    refinements_sha256 = manifest.get("guard_refinements_sha256")
+    if refinements_sha256 is not None:
+        refinement_snapshot = root / "guard_refinements.json"
+        if (
+            not refinement_snapshot.is_file()
+            or _sha256(refinement_snapshot) != refinements_sha256
+        ):
+            raise Mode4Error(
+                "guard-refinement snapshot is missing or differs from "
+                "the manifest"
+            )
     input_path = root / record["input_file"]
     output_stem = root / record["output_stem"]
     output_stem.parent.mkdir(parents=True, exist_ok=True)
@@ -1107,6 +1458,11 @@ def run(args: argparse.Namespace) -> Path:
                 f"mode4_stratum_id={record['stratum_id']}\n"
                 f"mode4_generator_revision={manifest['generator_revision']}\n"
             )
+            if manifest.get("guard_refinements_sha256") is not None:
+                norm_output.write(
+                    "mode4_guard_refinements_sha256="
+                    f"{manifest['guard_refinements_sha256']}\n"
+                )
         products = [
             (".norm", radiative_survey.NORM_FILENAME),
             (".heartbeat.csv", MODE4_HEARTBEAT_FILENAME),
@@ -1522,6 +1878,9 @@ def _finalize_calibration(
         "generator_revision": manifest["generator_revision"],
         "analysis_config_sha256": manifest["analysis_config_sha256"],
         "guard_recipes_sha256": manifest["guard_recipes_sha256"],
+        "guard_refinements_sha256": manifest.get(
+            "guard_refinements_sha256"
+        ),
         "guard_candidate": manifest["guard_candidate"],
         "core_fraction": alpha,
         "calibration_proposal": "guard_partition",
@@ -1609,6 +1968,7 @@ def finalize(args: argparse.Namespace) -> Path:
         "generator_revision",
         "analysis_config_sha256",
         "guard_recipes_sha256",
+        "guard_refinements_sha256",
         "guard_candidate",
         "base_padding",
         "core_fraction",
@@ -1750,6 +2110,9 @@ def finalize(args: argparse.Namespace) -> Path:
         "generator_revision": manifest["generator_revision"],
         "analysis_config_sha256": manifest["analysis_config_sha256"],
         "guard_recipes_sha256": manifest["guard_recipes_sha256"],
+        "guard_refinements_sha256": manifest.get(
+            "guard_refinements_sha256"
+        ),
         "guard_candidate": manifest["guard_candidate"],
         "core_fraction": manifest["core_fraction"],
         "legacy_tail_fraction": manifest["legacy_tail_fraction"],
@@ -1804,9 +2167,48 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    refinement_parser = subparsers.add_parser(
+        "create-refinement",
+        help=(
+            "write one evidence-hashed, post-padding guard-face refinement"
+        ),
+    )
+    refinement_parser.add_argument("--config", type=Path, required=True)
+    refinement_parser.add_argument("--recipes", type=Path, required=True)
+    refinement_parser.add_argument(
+        "--candidate", default="padding_0p035"
+    )
+    refinement_parser.add_argument("--output", type=Path, required=True)
+    refinement_parser.add_argument("--stratum", required=True)
+    refinement_parser.add_argument(
+        "--face",
+        action="append",
+        required=True,
+        metavar="AXIS:FACE:VALUE",
+        help=(
+            "expand one final guard face; repeat for additional faces"
+        ),
+    )
+    refinement_parser.add_argument("--rationale", required=True)
+    refinement_parser.add_argument(
+        "--evidence",
+        type=Path,
+        action="append",
+        required=True,
+        help="evidence artifact to hash; repeat for additional artifacts",
+    )
+    refinement_parser.add_argument("--overwrite", action="store_true")
+
     def add_prepare_common(target: argparse.ArgumentParser) -> None:
         target.add_argument("--config", type=Path, required=True)
         target.add_argument("--recipes", type=Path, required=True)
+        target.add_argument(
+            "--refinements",
+            type=Path,
+            help=(
+                "optional evidence-hashed post-padding guard refinements"
+            ),
+        )
         target.add_argument("--input", type=Path, required=True)
         target.add_argument("--output", type=Path, required=True)
         target.add_argument("--candidate", default="padding_0p035")
@@ -1876,7 +2278,9 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = _parser().parse_args()
-    if args.command in ("prepare", "prepare-calibration"):
+    if args.command == "create-refinement":
+        result = create_refinement(args)
+    elif args.command in ("prepare", "prepare-calibration"):
         result = prepare(args)
     elif args.command == "run":
         result = run(args)
