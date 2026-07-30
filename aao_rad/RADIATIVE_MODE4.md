@@ -439,6 +439,63 @@ Those are the weights for combining strata downstream. Within one stratum,
 the LUND events are unweighted and distributed according to the physical
 radiative cross section conditioned on that final-LUND stratum.
 
+## Validate independent pilots
+
+Before expanding a calibrated stratum to a broader campaign, pool at least
+two independent generation pilots with `validate-pilots`:
+
+```bash
+python3 radiative_mode4.py validate-pilots \
+  --calibration s04468_envelope_calibration.json \
+  --run pilot_1/runs/s04468/s04468__g0000.json \
+  --run pilot_2/runs/s04468/s04468__g0000.json \
+  --minimum-runs 2 \
+  --minimum-events 400 \
+  --maximum-duplicate-fraction 0.05 \
+  --maximum-guard-complement-fraction 0.02 \
+  --maximum-relative-cross-section-difference 0.10 \
+  --maximum-cross-section-z-score 3 \
+  --confidence 0.95 \
+  --output s04468_pilot_validation.json
+```
+
+The command verifies every run and its hashed source manifest and event CSV,
+rejects repeated seeds, and requires matching analysis, recipe, refinement,
+guard, selection, audited generator revision, and stratum metadata. A
+revision mismatch is rejected unless
+`--allow-pilot-revision-mismatch` is accompanied by a nonempty
+`--revision-compatibility-rationale`; the override is preserved in the
+report. It writes JSON plus a compact TSV. For each stratum it reports:
+
+- proposal-count-weighted pilot cross section and run-to-run uncertainty;
+- closure against the fixed-trial calibration cross section;
+- exact emitting-candidate and multiplicity-generated duplicate counts;
+- duplicate overhead and a one-sided Wilson diagnostic;
+- event and emitting-candidate counts in the four combinations of
+  guard-focused/legacy proposal component and inside/outside geometric guard;
+- maximum corrected integrands by proposal component and geometric region;
+- every crossed guard face and its largest observed excursion;
+- `hold` versus `increase_and_revalidate` envelope guidance;
+- `hold` versus `review_complement_geometry` guard guidance;
+- a final `ready_for_multi_stratum_pilot` recommendation.
+
+Proposal component and geometric membership are deliberately kept separate.
+The unrestricted legacy component can land either inside or outside the
+guard. A guard-complement event with stochastic multiplicity does not by
+itself fail validation: measured duplicate overhead, complement frequency,
+and cross-section closure determine the decision.
+
+Pilots generated with an envelope no larger than the currently recommended
+envelope are conservative stress tests for that target and count toward its
+support. A rare integrand above `sigr_max` is recorded, but does not force an
+envelope increase when stochastic multiplicity keeps the pooled duplicate
+overhead below threshold. Wilson bounds are useful finite-sample diagnostics,
+not formal guarantees for nonidentically distributed candidates.
+
+The default readiness thresholds require two independent runs and 400 total
+qualifying events. These defaults are intended for a development pilot, not
+final production certification.
+
 ## Artifacts and type-2 compatibility
 
 `prepare` snapshots the exact analysis configuration, continuous recipes, and

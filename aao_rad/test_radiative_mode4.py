@@ -175,6 +175,249 @@ def _calibration_args(
     )
 
 
+def _write_pilot_artifacts(
+    root: Path,
+    *,
+    name: str,
+    seed: int,
+    sigr_max: float,
+    sigma: float,
+    legacy_outside_duplicate: bool,
+) -> Path:
+    campaign = root / name
+    run_directory = campaign / "runs" / "s00000"
+    run_directory.mkdir(parents=True)
+    guard = {
+        "axes": {
+            "r_u": [0.2, 0.6],
+            "r_ep": [0.2, 0.8],
+            "u_gamma": [0.0, 1.0],
+            "hadron_cosine_base": [0.2, 0.8],
+        },
+        "hadron_phi_base": {
+            "origin": 0.5,
+            "lower_relative_to_origin": -0.2,
+            "upper_relative_to_origin": 0.2,
+            "width": 0.4,
+        },
+        "normalized_volume": 0.0576,
+        "u_gamma_soft_endpoint_anchored": True,
+    }
+    record = {
+        "stratum_id": "s00000",
+        "flat_index": 0,
+        "replica_index": 0,
+        "indices": {"iq2": 0, "ixb": 0, "it": 0, "iphi": 0},
+        "bounds": {
+            "Q2": [1.0, 2.0],
+            "xB": [0.2, 0.3],
+            "minus_t": [0.1, 0.5],
+            "phi_deg": [0.0, 360.0],
+        },
+        "guard": guard,
+        "seed": seed,
+    }
+    manifest = {
+        "schema": radiative_mode4.MANIFEST_SCHEMA,
+        "operation": "generation",
+        "generator_revision": "pilot-validator-test",
+        "analysis_config_sha256": "a" * 64,
+        "guard_recipes_sha256": "b" * 64,
+        "guard_refinements_sha256": "c" * 64,
+        "guard_candidate": "padding_0p035",
+        "core_fraction": 0.9,
+        "analysis_selection": {
+            "w_minimum": 1.08,
+            "y_maximum": 0.95,
+            "apply_y_max": False,
+        },
+        "sigr_max": sigr_max,
+        "runs": [record],
+    }
+    manifest_path = campaign / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+    )
+    rows: list[dict[str, object]] = []
+    core_events = 198 if legacy_outside_duplicate else 200
+    for index in range(core_events):
+        rows.append(
+            {
+                "event": index + 1,
+                "proposal_component": 1,
+                "proposal_density_ratio": 1.0 / (0.1 + 0.9 / 0.0576),
+                "r_u": 0.3 + index * 1.0e-5,
+                "r_ep": 0.4,
+                "u_gamma": 0.99,
+                "hadron_cosine_base": 0.5,
+                "hadron_phi_base": 0.5,
+                "q2_observed": 1.5,
+                "xb_observed": 0.25,
+                "minus_t_observed": 0.3,
+                "phi_observed_deg": 180.0,
+                "w_observed": 2.0,
+                "y_observed": 0.4,
+                "integrand_corrected": 1.0 + index * 1.0e-4,
+            }
+        )
+    if legacy_outside_duplicate:
+        outside = {
+            "proposal_component": 0,
+            "proposal_density_ratio": 10.0,
+            "r_u": 0.6077,
+            "r_ep": 0.4,
+            "u_gamma": 0.99,
+            "hadron_cosine_base": 0.5,
+            "hadron_phi_base": 0.5,
+            "q2_observed": 1.5,
+            "xb_observed": 0.25,
+            "minus_t_observed": 0.3,
+            "phi_observed_deg": 180.0,
+            "w_observed": 2.0,
+            "y_observed": 0.4,
+            "integrand_corrected": 7.2,
+        }
+        rows.extend(
+            [
+                {"event": 199, **outside},
+                {"event": 200, **outside},
+            ]
+        )
+    event_path = run_directory / "s00000__g0000.mode4.csv"
+    with event_path.open("w", encoding="utf-8", newline="") as destination:
+        destination.write(
+            f"# schema={radiative_mode4.MODE4_KINEMATICS_SCHEMA}\n"
+        )
+        writer = csv.DictWriter(
+            destination,
+            fieldnames=radiative_mode4.MODE4_KINEMATICS_COLUMNS,
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    run_path = run_directory / "s00000__g0000.json"
+    run = {
+        **record,
+        "schema": radiative_mode4.RUN_SCHEMA,
+        "operation": "generation",
+        "source_manifest": str(manifest_path),
+        "source_manifest_sha256": hashlib.sha256(
+            manifest_path.read_bytes()
+        ).hexdigest(),
+        "events": 200,
+        "ntries": 1000000 + seed,
+        "sig_sum_microbarn": sigma,
+        "event_overshoot": 0,
+        "emitting_candidates": (
+            199 if legacy_outside_duplicate else 200
+        ),
+        "duplicate_events": 1 if legacy_outside_duplicate else 0,
+        "mcall_max": 2 if legacy_outside_duplicate else 1,
+        "core_events": core_events,
+        "legacy_events": 2 if legacy_outside_duplicate else 0,
+        "noncore_events": 2 if legacy_outside_duplicate else 0,
+    }
+    run_path.write_text(
+        json.dumps(run, indent=2) + "\n", encoding="utf-8"
+    )
+    return run_path
+
+
+def _write_calibration_report(
+    root: Path, *, legacy_metadata: bool = False
+) -> Path:
+    path = root / (
+        "calibration_legacy.json" if legacy_metadata else "calibration.json"
+    )
+    payload = {
+        "schema": radiative_mode4.CALIBRATION_SCHEMA,
+        "analysis_config_sha256": "a" * 64,
+        "guard_recipes_sha256": "b" * 64,
+        "guard_refinements_sha256": "c" * 64,
+        "guard_candidate": "padding_0p035",
+        "core_fraction": 0.9,
+        "generator_revision": "pilot-validator-test",
+        "generator_revisions": ["pilot-validator-test"],
+        "analysis_selection": {
+            "w_minimum": 1.08,
+            "y_maximum": 0.95,
+            "apply_y_max": False,
+        },
+        "strata": [
+            {
+                "stratum_id": "s00000",
+                "flat_index": 0,
+                "indices": {
+                    "iq2": 0,
+                    "ixb": 0,
+                    "it": 0,
+                    "iphi": 0,
+                },
+                "bounds": {
+                    "Q2": [1.0, 2.0],
+                    "xB": [0.2, 0.3],
+                    "minus_t": [0.1, 0.5],
+                    "phi_deg": [0.0, 360.0],
+                },
+                "guard": {
+                    "axes": {
+                        "r_u": [0.2, 0.6],
+                        "r_ep": [0.2, 0.8],
+                        "u_gamma": [0.0, 1.0],
+                        "hadron_cosine_base": [0.2, 0.8],
+                    },
+                    "hadron_phi_base": {
+                        "origin": 0.5,
+                        "lower_relative_to_origin": -0.2,
+                        "upper_relative_to_origin": 0.2,
+                        "width": 0.4,
+                    },
+                    "normalized_volume": 0.0576,
+                    "u_gamma_soft_endpoint_anchored": True,
+                },
+                "recommendation_status": "provisional_zero_complement",
+                "pilot_readiness": "ready_provisional_zero_complement",
+                "recommended_envelope": {"sigr_max": 4.0},
+                "integrated_cross_section_microbarn": 0.3,
+                "integrated_cross_section_sem_microbarn": 0.02,
+            }
+        ],
+    }
+    if legacy_metadata:
+        source_directory = root / "calibration_source"
+        source_directory.mkdir()
+        source_path = source_directory / "manifest.json"
+        source_manifest = {
+            "schema": radiative_mode4.MANIFEST_SCHEMA,
+            "operation": "calibration",
+            "generator_revision": "pilot-validator-test",
+            "analysis_selection": payload["analysis_selection"],
+            "runs": [
+                {
+                    "stratum_id": "s00000",
+                    "guard": payload["strata"][0]["guard"],
+                }
+            ],
+        }
+        source_path.write_text(
+            json.dumps(source_manifest, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        payload["source_manifests"] = [
+            {
+                "path": str(source_path),
+                "sha256": hashlib.sha256(
+                    source_path.read_bytes()
+                ).hexdigest(),
+            }
+        ]
+        payload.pop("analysis_selection")
+        payload["strata"][0].pop("guard")
+    path.write_text(
+        json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+    )
+    return path
+
+
 class ProposalTests(unittest.TestCase):
     def test_periodic_guard_wrap_and_exact_mixture_identity(self) -> None:
         box = radiative_mode4.GuardBox(
@@ -323,6 +566,148 @@ class ProposalTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_pilot_validation_pools_stress_runs_and_separates_geometry(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            calibration = _write_calibration_report(root)
+            first = _write_pilot_artifacts(
+                root,
+                name="pilot_1",
+                seed=1001,
+                sigr_max=3.5,
+                sigma=0.31,
+                legacy_outside_duplicate=False,
+            )
+            second = _write_pilot_artifacts(
+                root,
+                name="pilot_2",
+                seed=1003,
+                sigr_max=4.0,
+                sigma=0.29,
+                legacy_outside_duplicate=True,
+            )
+            output = radiative_mode4.validate_pilots(
+                argparse.Namespace(
+                    calibration=calibration,
+                    runs=[first, second],
+                    output=root / "pilot_validation.json",
+                    minimum_runs=2,
+                    minimum_events=400,
+                    maximum_duplicate_fraction=0.05,
+                    maximum_guard_complement_fraction=0.02,
+                    maximum_relative_cross_section_difference=0.10,
+                    maximum_cross_section_z_score=3.0,
+                    confidence=0.95,
+                )
+            )
+            report = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(
+                report["schema"],
+                radiative_mode4.PILOT_VALIDATION_SCHEMA,
+            )
+            self.assertTrue(report["passed"])
+            result = report["strata"][0]
+            self.assertEqual(
+                result["recommendation"],
+                "ready_for_multi_stratum_pilot",
+            )
+            self.assertEqual(result["envelope_decision"], "hold")
+            self.assertEqual(result["guard_decision"], "hold")
+            self.assertEqual(result["pilot_runs"], 2)
+            self.assertEqual(result["qualifying_conservative_runs"], 2)
+            self.assertEqual(result["total_events"], 400)
+            self.assertEqual(result["emitting_candidates"], 399)
+            self.assertEqual(result["duplicate_events"], 1)
+            self.assertAlmostEqual(
+                result["qualifying_duplicate_event_fraction"], 0.0025
+            )
+            self.assertLess(
+                result["duplicate_candidate_wilson_upper_fraction"],
+                0.02,
+            )
+            self.assertEqual(result["guard_complement_events"], 2)
+            self.assertAlmostEqual(
+                result["guard_complement_event_fraction"], 0.005
+            )
+            self.assertEqual(
+                result["event_classification"]["legacy_outside"]["events"],
+                2,
+            )
+            self.assertEqual(
+                result["event_classification"][
+                    "guard_focused_outside"
+                ]["events"],
+                0,
+            )
+            self.assertEqual(
+                result["guard_complement_faces"][0]["axis"], "r_u"
+            )
+            self.assertEqual(
+                result["guard_complement_faces"][0]["face"], "upper"
+            )
+            self.assertAlmostEqual(
+                result["guard_complement_faces"][0][
+                    "maximum_excursion"
+                ],
+                0.0077,
+            )
+            maximum = result["maximum_integrands"]["guard_complement"]
+            self.assertEqual(maximum["proposal_component_name"], "legacy")
+            self.assertFalse(maximum["inside_geometric_guard"])
+            self.assertAlmostEqual(maximum["ratio_to_run_sigr_max"], 1.8)
+            self.assertIn(
+                "qualifying_duplicate_event_fraction",
+                output.with_suffix(".tsv").read_text(
+                    encoding="utf-8"
+                ).splitlines()[0],
+            )
+            legacy_calibration = _write_calibration_report(
+                root, legacy_metadata=True
+            )
+            legacy_output = radiative_mode4.validate_pilots(
+                argparse.Namespace(
+                    calibration=legacy_calibration,
+                    runs=[first, second],
+                    output=root / "pilot_validation_legacy.json",
+                    minimum_runs=2,
+                    minimum_events=400,
+                    maximum_duplicate_fraction=0.05,
+                    maximum_guard_complement_fraction=0.02,
+                    maximum_relative_cross_section_difference=0.10,
+                    maximum_cross_section_z_score=3.0,
+                    confidence=0.95,
+                )
+            )
+            self.assertTrue(
+                json.loads(legacy_output.read_text(encoding="utf-8"))[
+                    "passed"
+                ]
+            )
+            failed_output = radiative_mode4.validate_pilots(
+                argparse.Namespace(
+                    calibration=calibration,
+                    runs=[first, second],
+                    output=root / "pilot_validation_strict.json",
+                    minimum_runs=2,
+                    minimum_events=400,
+                    maximum_duplicate_fraction=0.001,
+                    maximum_guard_complement_fraction=0.02,
+                    maximum_relative_cross_section_difference=0.10,
+                    maximum_cross_section_z_score=3.0,
+                    confidence=0.95,
+                )
+            )
+            failed = json.loads(
+                failed_output.read_text(encoding="utf-8")
+            )
+            self.assertFalse(failed["passed"])
+            self.assertEqual(
+                failed["strata"][0]["recommendation"],
+                "increase_envelope_and_revalidate",
+            )
+
     def test_prepare_snapshots_provenance_and_writes_mode4_trailer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

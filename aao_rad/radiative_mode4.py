@@ -19,6 +19,7 @@ import json
 import math
 import os
 import shutil
+import statistics
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ MANIFEST_SCHEMA = "aao-rad-mode4-manifest-v3"
 RUN_SCHEMA = "aao-rad-mode4-run-v3"
 WEIGHTS_SCHEMA = "aao-rad-mode4-weights-v2"
 CALIBRATION_SCHEMA = "aao-rad-mode4-envelope-calibration-v4"
+PILOT_VALIDATION_SCHEMA = "aao-rad-mode4-pilot-validation-v1"
 RECIPE_SCHEMA = "aao-rad-continuous-guard-recipes-v1"
 REFINEMENT_SCHEMA = "aao-rad-mode4-guard-refinements-v1"
 REFINEMENT_COORDINATE_SPACE = "post_padding_guard_bounds"
@@ -2149,6 +2151,7 @@ def _finalize_calibration(
                 "flat_index": first["flat_index"],
                 "indices": first["indices"],
                 "bounds": first["bounds"],
+                "guard": first["guard"],
                 "calibration_runs": len(items),
                 "source_campaigns": len(
                     {str(source_path) for *_, source_path in items}
@@ -2263,6 +2266,7 @@ def _finalize_calibration(
         ),
         "guard_candidate": manifest["guard_candidate"],
         "core_fraction": alpha,
+        "analysis_selection": manifest["analysis_selection"],
         "calibration_proposal": "guard_partition",
         "envelope_safety_factor": safety_factor,
         "maximum_duplicate_fraction": maximum_duplicate_fraction,
@@ -2613,6 +2617,1040 @@ def finalize(args: argparse.Namespace) -> Path:
     return output
 
 
+def _wilson_upper_fraction(
+    successes: int, trials: int, confidence: float
+) -> Optional[float]:
+    """One-sided Wilson upper diagnostic for an observed event fraction."""
+    if trials <= 0:
+        return None
+    if successes < 0 or successes > trials:
+        raise ValueError("Wilson successes must lie in [0,trials]")
+    if not 0.5 < confidence < 1.0:
+        raise ValueError("Wilson confidence must lie in (0.5,1)")
+    z = statistics.NormalDist().inv_cdf(confidence)
+    observed = successes / trials
+    z_squared = z * z
+    denominator = 1.0 + z_squared / trials
+    numerator = (
+        observed
+        + z_squared / (2.0 * trials)
+        + z
+        * math.sqrt(
+            observed * (1.0 - observed) / trials
+            + z_squared / (4.0 * trials * trials)
+        )
+    )
+    return min(1.0, numerator / denominator)
+
+
+def _guard_face_violations(
+    box: GuardBox, coordinates: dict[str, float]
+) -> list[dict[str, object]]:
+    violations: list[dict[str, object]] = []
+    for axis in AXES[:-1]:
+        value = coordinates[axis]
+        lower, upper = box.nonperiodic[axis]
+        if value < lower:
+            violations.append(
+                {
+                    "axis": axis,
+                    "face": "lower",
+                    "value": value,
+                    "boundary": lower,
+                    "excursion": lower - value,
+                }
+            )
+        elif value > upper:
+            violations.append(
+                {
+                    "axis": axis,
+                    "face": "upper",
+                    "value": value,
+                    "boundary": upper,
+                    "excursion": value - upper,
+                }
+            )
+    phi = coordinates["hadron_phi_base"]
+    relative = (phi - box.phi_origin + 0.5) % 1.0 - 0.5
+    lower, upper = box.phi_relative
+    if relative < lower:
+        violations.append(
+            {
+                "axis": "hadron_phi_base",
+                "face": "lower",
+                "value": phi,
+                "relative_value": relative,
+                "boundary": lower,
+                "excursion": lower - relative,
+            }
+        )
+    elif relative > upper:
+        violations.append(
+            {
+                "axis": "hadron_phi_base",
+                "face": "upper",
+                "value": phi,
+                "relative_value": relative,
+                "boundary": upper,
+                "excursion": relative - upper,
+            }
+        )
+    return violations
+
+
+def _pilot_source_manifest(
+    run_path: Path, run: dict
+) -> tuple[Path, dict]:
+    candidates = [Path(str(run.get("source_manifest", "")))]
+    if len(run_path.parents) >= 3:
+        candidates.append(run_path.parents[2] / "manifest.json")
+    expected_hash = str(run.get("source_manifest_sha256", ""))
+    visited: set[Path] = set()
+    for candidate in candidates:
+        if not str(candidate):
+            continue
+        resolved = candidate.expanduser().resolve()
+        if resolved in visited or not resolved.is_file():
+            continue
+        visited.add(resolved)
+        if _sha256(resolved) != expected_hash:
+            continue
+        manifest = json.loads(resolved.read_text(encoding="utf-8"))
+        if manifest.get("schema") != MANIFEST_SCHEMA:
+            raise Mode4Error(f"{resolved}: unsupported manifest schema")
+        if manifest.get("operation") != "generation":
+            raise Mode4Error(f"{resolved}: expected generation manifest")
+        return resolved, manifest
+    raise Mode4Error(
+        f"{run_path}: cannot locate the hashed source generation manifest"
+    )
+
+
+def _pilot_maximum_record(
+    candidate: dict[str, object], run_path: Path
+) -> dict[str, object]:
+    return {
+        "run_path": str(run_path),
+        "proposal_component": candidate["proposal_component"],
+        "proposal_component_name": candidate["proposal_component_name"],
+        "inside_geometric_guard": candidate["inside_geometric_guard"],
+        "integrand_corrected": candidate["integrand_corrected"],
+        "ratio_to_run_sigr_max": candidate["ratio_to_run_sigr_max"],
+        "multiplicity": candidate["multiplicity"],
+        "coordinates": candidate["coordinates"],
+        "guard_face_violations": candidate["guard_face_violations"],
+    }
+
+
+def _load_pilot_run(path: Path) -> dict[str, object]:
+    run_path = path.expanduser().resolve()
+    run = json.loads(run_path.read_text(encoding="utf-8"))
+    if run.get("schema") != RUN_SCHEMA:
+        raise Mode4Error(f"{run_path}: unsupported mode-4 run schema")
+    if run.get("operation") != "generation":
+        raise Mode4Error(f"{run_path}: expected a generation pilot")
+    manifest_path, manifest = _pilot_source_manifest(run_path, run)
+    matching = [
+        record
+        for record in manifest["runs"]
+        if (
+            record["stratum_id"] == run["stratum_id"]
+            and int(record["flat_index"]) == int(run["flat_index"])
+            and int(record["replica_index"]) == int(run["replica_index"])
+        )
+    ]
+    if len(matching) != 1:
+        raise Mode4Error(
+            f"{run_path}: source manifest does not identify one run"
+        )
+    record = matching[0]
+    for name in (
+        "stratum_id",
+        "flat_index",
+        "replica_index",
+        "indices",
+        "bounds",
+        "guard",
+        "seed",
+    ):
+        if run[name] != record[name]:
+            raise Mode4Error(f"{run_path}: {name} differs from manifest")
+    event_path = run_path.with_suffix(".mode4.csv")
+    event_summary = _validate_event_diagnostics(
+        event_path, manifest, record, int(run["events"])
+    )
+    if (
+        int(event_summary["core_events"]) != int(run["core_events"])
+        or int(event_summary["legacy_events"]) != int(run["legacy_events"])
+    ):
+        raise Mode4Error(
+            f"{event_path}: proposal-component counts differ from {run_path}"
+        )
+    with event_path.open(encoding="utf-8", newline="") as source:
+        schema = source.readline().strip()
+        if schema != f"# schema={MODE4_KINEMATICS_SCHEMA}":
+            raise Mode4Error(f"{event_path}: unexpected event schema")
+        reader = csv.DictReader(source)
+        if tuple(reader.fieldnames or ()) != MODE4_KINEMATICS_COLUMNS:
+            raise Mode4Error(f"{event_path}: unexpected event columns")
+        rows = list(reader)
+    if len(rows) != int(run["events"]):
+        raise Mode4Error(
+            f"{event_path}: event count differs from {run_path}"
+        )
+    if not rows:
+        raise Mode4Error(f"{event_path}: pilot has no events")
+    envelope = float(manifest["sigr_max"])
+    if not math.isfinite(envelope) or envelope <= 0.0:
+        raise Mode4Error(f"{manifest_path}: invalid sigr_max")
+    groups: dict[tuple[str, ...], list[dict[str, str]]] = {}
+    for expected_event, row in enumerate(rows, start=1):
+        if int(row["event"]) != expected_event:
+            raise Mode4Error(f"{event_path}: nonsequential events")
+        key = tuple(row[name].strip() for name in MODE4_KINEMATICS_COLUMNS[1:])
+        groups.setdefault(key, []).append(row)
+    if len(groups) != int(run["emitting_candidates"]):
+        raise Mode4Error(
+            f"{event_path}: distinct candidates differ from {run_path}"
+        )
+    duplicate_events = sum(len(items) - 1 for items in groups.values())
+    if duplicate_events != int(run["duplicate_events"]):
+        raise Mode4Error(
+            f"{event_path}: duplicate count differs from {run_path}"
+        )
+    box = _guard_box_from_manifest(record)
+    classifications = {
+        name: {
+            "emitting_candidates": 0,
+            "events": 0,
+            "duplicate_events": 0,
+        }
+        for name in (
+            "guard_focused_inside",
+            "guard_focused_outside",
+            "legacy_inside",
+            "legacy_outside",
+        )
+    }
+    maxima: dict[str, dict[str, object]] = {}
+    outside_faces: dict[str, dict[str, object]] = {}
+    duplicate_candidates = 0
+    envelope_exceeding_candidates = 0
+    maximum_multiplicity = 0
+    for items in groups.values():
+        raw = items[0]
+        multiplicity = len(items)
+        component = int(raw["proposal_component"])
+        if component not in (0, 1):
+            raise Mode4Error(f"{event_path}: invalid proposal component")
+        coordinates = {name: float(raw[name]) for name in AXES}
+        if any(not math.isfinite(value) for value in coordinates.values()):
+            raise Mode4Error(f"{event_path}: nonfinite proposal coordinate")
+        integrand = float(raw["integrand_corrected"])
+        if not math.isfinite(integrand) or integrand <= 0.0:
+            raise Mode4Error(f"{event_path}: invalid corrected integrand")
+        inside_guard = box.contains(coordinates)
+        if component == 1 and not inside_guard:
+            raise Mode4Error(
+                f"{event_path}: guard-focused component escaped guard"
+            )
+        component_name = "guard_focused" if component == 1 else "legacy"
+        region_name = "inside" if inside_guard else "outside"
+        classification_name = f"{component_name}_{region_name}"
+        classification = classifications[classification_name]
+        classification["emitting_candidates"] += 1
+        classification["events"] += multiplicity
+        classification["duplicate_events"] += multiplicity - 1
+        if multiplicity > 1:
+            duplicate_candidates += 1
+        ratio = integrand / envelope
+        if ratio > 1.0:
+            envelope_exceeding_candidates += 1
+        maximum_multiplicity = max(maximum_multiplicity, multiplicity)
+        violations = (
+            [] if inside_guard else _guard_face_violations(box, coordinates)
+        )
+        candidate: dict[str, object] = {
+            "proposal_component": component,
+            "proposal_component_name": component_name,
+            "inside_geometric_guard": inside_guard,
+            "integrand_corrected": integrand,
+            "ratio_to_run_sigr_max": ratio,
+            "multiplicity": multiplicity,
+            "coordinates": coordinates,
+            "guard_face_violations": violations,
+        }
+        for category in (
+            "all",
+            component_name,
+            "inside_guard" if inside_guard else "guard_complement",
+            classification_name,
+        ):
+            old = maxima.get(category)
+            if (
+                old is None
+                or integrand > float(old["integrand_corrected"])
+            ):
+                maxima[category] = _pilot_maximum_record(
+                    candidate, run_path
+                )
+        for violation in violations:
+            key = f"{violation['axis']}:{violation['face']}"
+            summary = outside_faces.setdefault(
+                key,
+                {
+                    "axis": violation["axis"],
+                    "face": violation["face"],
+                    "boundary": violation["boundary"],
+                    "emitting_candidates": 0,
+                    "events": 0,
+                    "duplicate_events": 0,
+                    "maximum_excursion": 0.0,
+                    "most_extreme_value": None,
+                },
+            )
+            summary["emitting_candidates"] += 1
+            summary["events"] += multiplicity
+            summary["duplicate_events"] += multiplicity - 1
+            if float(violation["excursion"]) > float(
+                summary["maximum_excursion"]
+            ):
+                summary["maximum_excursion"] = violation["excursion"]
+                summary["most_extreme_value"] = violation["value"]
+    if maximum_multiplicity > int(run["mcall_max"]):
+        raise Mode4Error(
+            f"{event_path}: observed multiplicity exceeds recorded maximum"
+        )
+    if sum(
+        int(item["events"]) for item in classifications.values()
+    ) != int(run["events"]):
+        raise Mode4Error(f"{event_path}: classification count is incomplete")
+    return {
+        "stratum_id": str(run["stratum_id"]),
+        "flat_index": int(run["flat_index"]),
+        "indices": run["indices"],
+        "bounds": run["bounds"],
+        "guard": run["guard"],
+        "seed": int(run["seed"]),
+        "replica_index": int(run["replica_index"]),
+        "generator_revision": manifest["generator_revision"],
+        "analysis_config_sha256": manifest["analysis_config_sha256"],
+        "guard_recipes_sha256": manifest["guard_recipes_sha256"],
+        "guard_refinements_sha256": manifest.get(
+            "guard_refinements_sha256"
+        ),
+        "guard_candidate": manifest["guard_candidate"],
+        "core_fraction": float(manifest["core_fraction"]),
+        "analysis_selection": manifest["analysis_selection"],
+        "sigr_max": envelope,
+        "events": int(run["events"]),
+        "ntries": int(run["ntries"]),
+        "sig_sum_microbarn": float(run["sig_sum_microbarn"]),
+        "event_overshoot": int(run["event_overshoot"]),
+        "emitting_candidates": int(run["emitting_candidates"]),
+        "duplicate_events": int(run["duplicate_events"]),
+        "duplicate_candidates": duplicate_candidates,
+        "mcall_max": int(run["mcall_max"]),
+        "envelope_exceeding_candidates": envelope_exceeding_candidates,
+        "classifications": classifications,
+        "maxima": maxima,
+        "guard_complement_faces": sorted(
+            outside_faces.values(),
+            key=lambda item: (
+                str(item["axis"]),
+                str(item["face"]),
+            ),
+        ),
+        "run_path": str(run_path),
+        "run_sha256": _sha256(run_path),
+        "event_path": str(event_path),
+        "event_sha256": _sha256(event_path),
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": _sha256(manifest_path),
+    }
+
+
+def _merge_pilot_maxima(
+    runs: list[dict[str, object]]
+) -> dict[str, dict[str, object]]:
+    merged: dict[str, dict[str, object]] = {}
+    for run in runs:
+        for category, candidate in run["maxima"].items():
+            old = merged.get(category)
+            if (
+                old is None
+                or float(candidate["integrand_corrected"])
+                > float(old["integrand_corrected"])
+            ):
+                merged[category] = candidate
+    return merged
+
+
+def _merge_guard_complement_faces(
+    runs: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    merged: dict[str, dict[str, object]] = {}
+    for run in runs:
+        for face in run["guard_complement_faces"]:
+            key = f"{face['axis']}:{face['face']}"
+            summary = merged.setdefault(
+                key,
+                {
+                    "axis": face["axis"],
+                    "face": face["face"],
+                    "boundary": face["boundary"],
+                    "emitting_candidates": 0,
+                    "events": 0,
+                    "duplicate_events": 0,
+                    "maximum_excursion": 0.0,
+                    "most_extreme_value": None,
+                },
+            )
+            summary["emitting_candidates"] += int(
+                face["emitting_candidates"]
+            )
+            summary["events"] += int(face["events"])
+            summary["duplicate_events"] += int(face["duplicate_events"])
+            if float(face["maximum_excursion"]) > float(
+                summary["maximum_excursion"]
+            ):
+                summary["maximum_excursion"] = face["maximum_excursion"]
+                summary["most_extreme_value"] = face[
+                    "most_extreme_value"
+                ]
+    return sorted(
+        merged.values(),
+        key=lambda item: (str(item["axis"]), str(item["face"])),
+    )
+
+
+def _calibration_validation_metadata(
+    calibration_path: Path, calibration: dict
+) -> tuple[dict, set[str], dict[str, dict]]:
+    selection = calibration.get("analysis_selection")
+    revisions = {
+        str(value)
+        for value in (
+            calibration.get("generator_revisions")
+            or (
+                [calibration["generator_revision"]]
+                if calibration.get("generator_revision") is not None
+                else []
+            )
+        )
+    }
+    guards = {
+        str(item["stratum_id"]): item["guard"]
+        for item in calibration["strata"]
+        if item.get("guard") is not None
+    }
+    required_strata = {
+        str(item["stratum_id"]) for item in calibration["strata"]
+    }
+    if (
+        selection is not None
+        and revisions
+        and required_strata.issubset(guards)
+    ):
+        return selection, revisions, guards
+    loaded = 0
+    for source_record in calibration.get("source_manifests", []):
+        if isinstance(source_record, str):
+            raw_path = source_record
+            expected_hash = None
+        else:
+            raw_path = str(source_record["path"])
+            expected_hash = source_record.get("sha256")
+        candidate = Path(raw_path).expanduser()
+        candidates = [candidate]
+        if not candidate.is_absolute():
+            candidates.append(calibration_path.parent / candidate)
+        source_path = next(
+            (
+                path.resolve()
+                for path in candidates
+                if path.resolve().is_file()
+            ),
+            None,
+        )
+        if source_path is None:
+            continue
+        if expected_hash is not None and _sha256(source_path) != expected_hash:
+            raise Mode4Error(
+                f"{source_path}: calibration source-manifest hash changed"
+            )
+        manifest = json.loads(source_path.read_text(encoding="utf-8"))
+        if manifest.get("schema") != MANIFEST_SCHEMA:
+            raise Mode4Error(
+                f"{source_path}: unsupported calibration source manifest"
+            )
+        if manifest.get("operation") != "calibration":
+            raise Mode4Error(
+                f"{source_path}: expected calibration source manifest"
+            )
+        loaded += 1
+        candidate_selection = manifest["analysis_selection"]
+        if selection is None:
+            selection = candidate_selection
+        elif selection != candidate_selection:
+            raise Mode4Error(
+                f"{source_path}: calibration selections disagree"
+            )
+        revisions.add(str(manifest["generator_revision"]))
+        for record in manifest["runs"]:
+            stratum_id = str(record["stratum_id"])
+            old = guards.setdefault(stratum_id, record["guard"])
+            if old != record["guard"]:
+                raise Mode4Error(
+                    f"{source_path}: calibration guards disagree for "
+                    f"{stratum_id}"
+                )
+    if loaded == 0 and (
+        selection is None
+        or not revisions
+        or not required_strata.issubset(guards)
+    ):
+        raise Mode4Error(
+            f"{calibration_path}: validation metadata are incomplete and "
+            "hashed source manifests are unavailable"
+        )
+    if selection is None or not revisions:
+        raise Mode4Error(
+            f"{calibration_path}: incomplete calibration provenance"
+        )
+    missing_guards = sorted(required_strata - set(guards))
+    if missing_guards:
+        raise Mode4Error(
+            f"{calibration_path}: missing guards for "
+            + ", ".join(missing_guards)
+        )
+    return selection, revisions, guards
+
+
+def validate_pilots(args: argparse.Namespace) -> Path:
+    calibration_path = args.calibration.expanduser().resolve()
+    calibration = json.loads(
+        calibration_path.read_text(encoding="utf-8")
+    )
+    if calibration.get("schema") != CALIBRATION_SCHEMA:
+        raise Mode4Error(
+            f"{calibration_path}: expected {CALIBRATION_SCHEMA}"
+        )
+    (
+        calibration_selection,
+        calibration_revisions,
+        calibration_guards,
+    ) = _calibration_validation_metadata(calibration_path, calibration)
+    run_paths = [path.expanduser().resolve() for path in args.runs]
+    if len(set(run_paths)) != len(run_paths):
+        raise ValueError("the same pilot run was supplied more than once")
+    minimum_runs = int(args.minimum_runs)
+    minimum_events = int(args.minimum_events)
+    maximum_duplicate_fraction = float(args.maximum_duplicate_fraction)
+    maximum_guard_complement_fraction = float(
+        args.maximum_guard_complement_fraction
+    )
+    maximum_relative_cross_section_difference = float(
+        args.maximum_relative_cross_section_difference
+    )
+    maximum_cross_section_z_score = float(
+        args.maximum_cross_section_z_score
+    )
+    confidence = float(args.confidence)
+    allow_revision_mismatch = bool(
+        getattr(args, "allow_pilot_revision_mismatch", False)
+    )
+    revision_compatibility_rationale = str(
+        getattr(args, "revision_compatibility_rationale", "") or ""
+    ).strip()
+    if minimum_runs < 1 or minimum_events < 1:
+        raise ValueError("minimum pilot support must be positive")
+    for name, value in (
+        ("maximum duplicate fraction", maximum_duplicate_fraction),
+        (
+            "maximum guard-complement fraction",
+            maximum_guard_complement_fraction,
+        ),
+        (
+            "maximum relative cross-section difference",
+            maximum_relative_cross_section_difference,
+        ),
+    ):
+        if not 0.0 < value < 1.0:
+            raise ValueError(f"{name} must lie in (0,1)")
+    if maximum_cross_section_z_score <= 0.0:
+        raise ValueError("maximum cross-section z score must be positive")
+    if not 0.5 < confidence < 1.0:
+        raise ValueError("confidence must lie in (0.5,1)")
+    if allow_revision_mismatch and not revision_compatibility_rationale:
+        raise ValueError(
+            "--revision-compatibility-rationale is required with "
+            "--allow-pilot-revision-mismatch"
+        )
+    loaded = [_load_pilot_run(path) for path in run_paths]
+    pilot_revisions = {
+        str(run["generator_revision"]) for run in loaded
+    }
+    revisions_match = (
+        len(pilot_revisions) == 1
+        and pilot_revisions.issubset(calibration_revisions)
+    )
+    if not revisions_match and not allow_revision_mismatch:
+        raise Mode4Error(
+            "pilot generator revisions differ from one another or from "
+            "the audited calibration revisions"
+        )
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for run in loaded:
+        grouped.setdefault(str(run["stratum_id"]), []).append(run)
+    calibration_strata = {
+        str(item["stratum_id"]): item for item in calibration["strata"]
+    }
+    unknown = sorted(set(grouped) - set(calibration_strata))
+    if unknown:
+        raise Mode4Error(
+            "pilot strata are absent from the calibration report: "
+            + ", ".join(unknown)
+        )
+    strata: list[dict[str, object]] = []
+    for stratum_id, runs in sorted(
+        grouped.items(), key=lambda item: int(item[1][0]["flat_index"])
+    ):
+        calibration_stratum = calibration_strata[stratum_id]
+        first = runs[0]
+        if first["bounds"] != calibration_stratum["bounds"]:
+            raise Mode4Error(
+                f"{stratum_id}: pilot and calibration bounds differ"
+            )
+        if first["guard"] != calibration_guards[stratum_id]:
+            raise Mode4Error(
+                f"{stratum_id}: pilot and calibration guards differ"
+            )
+        compatibility = {
+            "analysis_config_sha256": calibration[
+                "analysis_config_sha256"
+            ],
+            "guard_recipes_sha256": calibration["guard_recipes_sha256"],
+            "guard_refinements_sha256": calibration.get(
+                "guard_refinements_sha256"
+            ),
+            "guard_candidate": calibration["guard_candidate"],
+            "core_fraction": float(calibration["core_fraction"]),
+            "analysis_selection": calibration_selection,
+        }
+        for run in runs:
+            for name, expected in compatibility.items():
+                if run[name] != expected:
+                    raise Mode4Error(
+                        f"{run['run_path']}: {name} differs from calibration"
+                    )
+            for name in ("flat_index", "indices", "bounds", "guard"):
+                if run[name] != first[name]:
+                    raise Mode4Error(
+                        f"{run['run_path']}: pilot {name} differs across runs"
+                    )
+        seeds = [int(run["seed"]) for run in runs]
+        if len(set(seeds)) != len(seeds):
+            raise Mode4Error(f"{stratum_id}: pilot seeds are not independent")
+        recommended = calibration_stratum.get("recommended_envelope")
+        target_envelope = (
+            float(recommended["sigr_max"])
+            if recommended is not None
+            else None
+        )
+        qualifying = [
+            run
+            for run in runs
+            if (
+                target_envelope is not None
+                and float(run["sigr_max"])
+                <= target_envelope * (1.0 + 1.0e-12)
+            )
+        ]
+        total_proposals = sum(int(run["ntries"]) for run in runs)
+        total_events = sum(int(run["events"]) for run in runs)
+        pooled_sigma = sum(
+            int(run["ntries"]) * float(run["sig_sum_microbarn"])
+            for run in runs
+        ) / total_proposals
+        run_sigmas = [float(run["sig_sum_microbarn"]) for run in runs]
+        run_to_run_sem = (
+            statistics.stdev(run_sigmas) / math.sqrt(len(run_sigmas))
+            if len(run_sigmas) >= 2
+            else None
+        )
+        calibration_sigma = float(
+            calibration_stratum["integrated_cross_section_microbarn"]
+        )
+        calibration_sem = float(
+            calibration_stratum[
+                "integrated_cross_section_sem_microbarn"
+            ]
+        )
+        difference = pooled_sigma - calibration_sigma
+        relative_difference = (
+            difference / calibration_sigma
+            if calibration_sigma != 0.0
+            else None
+        )
+        combined_sem = (
+            math.hypot(calibration_sem, run_to_run_sem)
+            if run_to_run_sem is not None
+            else calibration_sem
+        )
+        difference_z_score = (
+            difference / combined_sem if combined_sem > 0.0 else None
+        )
+        qualifying_runs = len(qualifying)
+        qualifying_events = sum(int(run["events"]) for run in qualifying)
+        qualifying_emitting = sum(
+            int(run["emitting_candidates"]) for run in qualifying
+        )
+        qualifying_duplicate_events = sum(
+            int(run["duplicate_events"]) for run in qualifying
+        )
+        qualifying_duplicate_candidates = sum(
+            int(run["duplicate_candidates"]) for run in qualifying
+        )
+        duplicate_event_fraction = (
+            qualifying_duplicate_events / qualifying_events
+            if qualifying_events
+            else None
+        )
+        duplicate_candidate_fraction = (
+            qualifying_duplicate_candidates / qualifying_emitting
+            if qualifying_emitting
+            else None
+        )
+        duplicate_candidate_upper = _wilson_upper_fraction(
+            qualifying_duplicate_candidates,
+            qualifying_emitting,
+            confidence,
+        )
+        classifications = {
+            name: {
+                "emitting_candidates": sum(
+                    int(run["classifications"][name]["emitting_candidates"])
+                    for run in runs
+                ),
+                "events": sum(
+                    int(run["classifications"][name]["events"])
+                    for run in runs
+                ),
+                "duplicate_events": sum(
+                    int(run["classifications"][name]["duplicate_events"])
+                    for run in runs
+                ),
+            }
+            for name in first["classifications"]
+        }
+        outside_candidates = sum(
+            int(item["emitting_candidates"])
+            for name, item in classifications.items()
+            if name.endswith("_outside")
+        )
+        outside_events = sum(
+            int(item["events"])
+            for name, item in classifications.items()
+            if name.endswith("_outside")
+        )
+        total_emitting = sum(
+            int(run["emitting_candidates"]) for run in runs
+        )
+        guard_complement_event_fraction = outside_events / total_events
+        guard_complement_candidate_fraction = (
+            outside_candidates / total_emitting
+        )
+        guard_complement_candidate_upper = _wilson_upper_fraction(
+            outside_candidates, total_emitting, confidence
+        )
+        support_passes = (
+            qualifying_runs >= minimum_runs
+            and qualifying_events >= minimum_events
+        )
+        duplicate_passes = (
+            duplicate_event_fraction is not None
+            and duplicate_event_fraction <= maximum_duplicate_fraction
+            and duplicate_candidate_upper is not None
+            and duplicate_candidate_upper <= maximum_duplicate_fraction
+        )
+        guard_passes = (
+            guard_complement_event_fraction
+            <= maximum_guard_complement_fraction
+            and guard_complement_candidate_upper is not None
+            and guard_complement_candidate_upper
+            <= maximum_guard_complement_fraction
+        )
+        closure_passes = (
+            relative_difference is not None
+            and abs(relative_difference)
+            <= maximum_relative_cross_section_difference
+            and (
+                difference_z_score is None
+                or abs(difference_z_score)
+                <= maximum_cross_section_z_score
+            )
+        )
+        overshoot_passes = all(
+            int(run["event_overshoot"]) == 0 for run in runs
+        )
+        calibration_ready = (
+            calibration_stratum.get("pilot_readiness")
+            in ("ready", "ready_provisional_zero_complement")
+            and recommended is not None
+        )
+        if not calibration_ready:
+            recommendation = "calibration_not_ready"
+        elif not support_passes:
+            recommendation = "collect_more_pilot_support"
+        elif not duplicate_passes:
+            recommendation = "increase_envelope_and_revalidate"
+        elif not guard_passes:
+            recommendation = "review_guard_complement_geometry"
+        elif not closure_passes:
+            recommendation = "review_cross_section_closure"
+        elif not overshoot_passes:
+            recommendation = "review_event_overshoot"
+        else:
+            recommendation = "ready_for_multi_stratum_pilot"
+        passed = recommendation == "ready_for_multi_stratum_pilot"
+        strata.append(
+            {
+                "stratum_id": stratum_id,
+                "flat_index": first["flat_index"],
+                "indices": first["indices"],
+                "bounds": first["bounds"],
+                "calibration_recommendation_status": calibration_stratum[
+                    "recommendation_status"
+                ],
+                "target_sigr_max": target_envelope,
+                "pilot_runs": len(runs),
+                "qualifying_conservative_runs": qualifying_runs,
+                "pilot_sigr_max_range": [
+                    min(float(run["sigr_max"]) for run in runs),
+                    max(float(run["sigr_max"]) for run in runs),
+                ],
+                "total_proposals": total_proposals,
+                "total_events": total_events,
+                "qualifying_events": qualifying_events,
+                "event_yield_per_proposal": (
+                    total_events / total_proposals
+                ),
+                "pooled_sig_sum_microbarn": pooled_sigma,
+                "pilot_run_to_run_sem_microbarn": run_to_run_sem,
+                "calibration_cross_section_microbarn": calibration_sigma,
+                "calibration_sem_microbarn": calibration_sem,
+                "cross_section_difference_microbarn": difference,
+                "relative_cross_section_difference": relative_difference,
+                "combined_calibration_and_run_sem_microbarn": combined_sem,
+                "cross_section_difference_z_score": difference_z_score,
+                "emitting_candidates": total_emitting,
+                "qualifying_emitting_candidates": qualifying_emitting,
+                "duplicate_events": sum(
+                    int(run["duplicate_events"]) for run in runs
+                ),
+                "qualifying_duplicate_events": (
+                    qualifying_duplicate_events
+                ),
+                "qualifying_duplicate_event_fraction": (
+                    duplicate_event_fraction
+                ),
+                "qualifying_duplicate_candidates": (
+                    qualifying_duplicate_candidates
+                ),
+                "qualifying_duplicate_candidate_fraction": (
+                    duplicate_candidate_fraction
+                ),
+                "duplicate_candidate_wilson_upper_fraction": (
+                    duplicate_candidate_upper
+                ),
+                "maximum_mcall": max(
+                    int(run["mcall_max"]) for run in runs
+                ),
+                "envelope_exceeding_candidates": sum(
+                    int(run["envelope_exceeding_candidates"])
+                    for run in runs
+                ),
+                "event_classification": classifications,
+                "guard_complement_events": outside_events,
+                "guard_complement_event_fraction": (
+                    guard_complement_event_fraction
+                ),
+                "guard_complement_emitting_candidates": (
+                    outside_candidates
+                ),
+                "guard_complement_candidate_fraction": (
+                    guard_complement_candidate_fraction
+                ),
+                "guard_complement_candidate_wilson_upper_fraction": (
+                    guard_complement_candidate_upper
+                ),
+                "guard_complement_faces": (
+                    _merge_guard_complement_faces(runs)
+                ),
+                "maximum_integrands": _merge_pilot_maxima(runs),
+                "support_passes": support_passes,
+                "duplicate_overhead_passes": duplicate_passes,
+                "guard_complement_passes": guard_passes,
+                "cross_section_closure_passes": closure_passes,
+                "event_overshoot_passes": overshoot_passes,
+                "envelope_decision": (
+                    "hold"
+                    if duplicate_passes
+                    else "increase_and_revalidate"
+                ),
+                "guard_decision": (
+                    "hold"
+                    if guard_passes
+                    else "review_complement_geometry"
+                ),
+                "recommendation": recommendation,
+                "passed": passed,
+                "runs": [
+                    {
+                        name: run[name]
+                        for name in (
+                            "run_path",
+                            "run_sha256",
+                            "event_path",
+                            "event_sha256",
+                            "manifest_path",
+                            "manifest_sha256",
+                            "seed",
+                            "replica_index",
+                            "sigr_max",
+                            "events",
+                            "ntries",
+                            "sig_sum_microbarn",
+                            "event_overshoot",
+                            "emitting_candidates",
+                            "duplicate_events",
+                            "duplicate_candidates",
+                            "mcall_max",
+                            "envelope_exceeding_candidates",
+                            "classifications",
+                            "maxima",
+                            "guard_complement_faces",
+                        )
+                    }
+                    for run in runs
+                ],
+            }
+        )
+    passed = bool(strata) and all(bool(item["passed"]) for item in strata)
+    payload: dict[str, object] = {
+        "schema": PILOT_VALIDATION_SCHEMA,
+        "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "validator_revision": _source_revision(),
+        "validator_source_sha256": _sha256(Path(__file__).resolve()),
+        "calibration_report": str(calibration_path),
+        "calibration_report_sha256": _sha256(calibration_path),
+        "calibration_generator_revisions": sorted(
+            calibration_revisions
+        ),
+        "pilot_generator_revisions": sorted(pilot_revisions),
+        "pilot_revision_compatibility_override": {
+            "enabled": allow_revision_mismatch,
+            "rationale": (
+                revision_compatibility_rationale
+                if allow_revision_mismatch
+                else None
+            ),
+        },
+        "confidence_level": confidence,
+        "thresholds": {
+            "minimum_runs": minimum_runs,
+            "minimum_events": minimum_events,
+            "maximum_duplicate_fraction": maximum_duplicate_fraction,
+            "maximum_guard_complement_fraction": (
+                maximum_guard_complement_fraction
+            ),
+            "maximum_relative_cross_section_difference": (
+                maximum_relative_cross_section_difference
+            ),
+            "maximum_cross_section_z_score": (
+                maximum_cross_section_z_score
+            ),
+        },
+        "wilson_bounds_are_diagnostics_not_formal_iid_guarantees": True,
+        "lower_envelope_runs_are_conservative_for_target_envelope": True,
+        "passed": passed,
+        "recommendation": (
+            "ready_for_multi_stratum_pilot"
+            if passed
+            else "review_stratum_recommendations"
+        ),
+        "stratum_count": len(strata),
+        "passed_strata": sum(bool(item["passed"]) for item in strata),
+        "strata": strata,
+    }
+    output = (
+        args.output.expanduser().resolve()
+        if args.output is not None
+        else calibration_path.with_name("pilot_validation.json")
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(output, payload)
+    with output.with_suffix(".tsv").open(
+        "w", encoding="utf-8", newline=""
+    ) as destination:
+        writer = csv.writer(destination, delimiter="\t")
+        writer.writerow(
+            [
+                "flat_index",
+                "stratum_id",
+                "passed",
+                "recommendation",
+                "target_sigr_max",
+                "pilot_runs",
+                "qualifying_runs",
+                "total_events",
+                "qualifying_events",
+                "pooled_sig_sum_microbarn",
+                "calibration_cross_section_microbarn",
+                "relative_cross_section_difference",
+                "cross_section_difference_z_score",
+                "qualifying_duplicate_event_fraction",
+                "duplicate_candidate_wilson_upper_fraction",
+                "guard_complement_event_fraction",
+                "guard_complement_candidate_wilson_upper_fraction",
+                "maximum_mcall",
+                "envelope_decision",
+                "guard_decision",
+            ]
+        )
+        for stratum in strata:
+            writer.writerow(
+                [
+                    stratum["flat_index"],
+                    stratum["stratum_id"],
+                    stratum["passed"],
+                    stratum["recommendation"],
+                    stratum["target_sigr_max"],
+                    stratum["pilot_runs"],
+                    stratum["qualifying_conservative_runs"],
+                    stratum["total_events"],
+                    stratum["qualifying_events"],
+                    stratum["pooled_sig_sum_microbarn"],
+                    stratum["calibration_cross_section_microbarn"],
+                    stratum["relative_cross_section_difference"],
+                    stratum["cross_section_difference_z_score"],
+                    stratum["qualifying_duplicate_event_fraction"],
+                    stratum[
+                        "duplicate_candidate_wilson_upper_fraction"
+                    ],
+                    stratum["guard_complement_event_fraction"],
+                    stratum[
+                        "guard_complement_candidate_wilson_upper_fraction"
+                    ],
+                    stratum["maximum_mcall"],
+                    stratum["envelope_decision"],
+                    stratum["guard_decision"],
+                ]
+            )
+    return output
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2782,6 +3820,61 @@ def _parser() -> argparse.ArgumentParser:
             "revisions have identical calibration physics and proposals"
         ),
     )
+    validation_parser = subparsers.add_parser(
+        "validate-pilots",
+        help=(
+            "pool independent generation pilots and decide whether each "
+            "calibrated stratum is ready for a broader pilot"
+        ),
+    )
+    validation_parser.add_argument(
+        "--calibration", type=Path, required=True
+    )
+    validation_parser.add_argument(
+        "--run",
+        dest="runs",
+        type=Path,
+        action="append",
+        required=True,
+        help="completed mode-4 generation run JSON; repeat for more runs",
+    )
+    validation_parser.add_argument("--output", type=Path)
+    validation_parser.add_argument("--minimum-runs", type=int, default=2)
+    validation_parser.add_argument("--minimum-events", type=int, default=400)
+    validation_parser.add_argument(
+        "--maximum-duplicate-fraction", type=float, default=0.05
+    )
+    validation_parser.add_argument(
+        "--maximum-guard-complement-fraction",
+        type=float,
+        default=0.02,
+    )
+    validation_parser.add_argument(
+        "--maximum-relative-cross-section-difference",
+        type=float,
+        default=0.10,
+    )
+    validation_parser.add_argument(
+        "--maximum-cross-section-z-score", type=float, default=3.0
+    )
+    validation_parser.add_argument(
+        "--confidence", type=float, default=0.95
+    )
+    validation_parser.add_argument(
+        "--allow-pilot-revision-mismatch",
+        action="store_true",
+        help=(
+            "accept differing pilot or calibration generator revisions "
+            "after an explicit compatibility audit"
+        ),
+    )
+    validation_parser.add_argument(
+        "--revision-compatibility-rationale",
+        help=(
+            "required audit note when pilot generator revisions differ "
+            "from one another or the calibration"
+        ),
+    )
     return parser
 
 
@@ -2793,6 +3886,8 @@ def main() -> int:
         result = prepare(args)
     elif args.command == "run":
         result = run(args)
+    elif args.command == "validate-pilots":
+        result = validate_pilots(args)
     else:
         result = finalize(args)
     print(result)
