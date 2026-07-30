@@ -155,6 +155,60 @@ class InputValidationTests(unittest.TestCase):
 
 
 class ProposalDensityTests(unittest.TestCase):
+    def test_density_uses_analysis_mass_proposal_xb_not_legacy_diagnostic(
+        self,
+    ) -> None:
+        q2 = 2.0
+        proposal_xb = 0.300001
+        energy_in = 5.0
+        energy_out = energy_in - q2 / (
+            2.0 * radiative_survey.PROTON_MASS_GEV * proposal_xb
+        )
+        row = {
+            "q2_leptonic": q2,
+            "xb_leptonic": 0.299999,
+            "minus_t_hard": 0.2,
+            "phi_cm_deg": 90.0,
+            "energy_in_vertex": energy_in,
+            "energy_e_pre_external": energy_out,
+            "energy_gamma": 0.05,
+            "cos_theta_gamma": 0.5,
+        }
+        norm = {
+            "q2_min": "1.0",
+            "q2_max": "5.0",
+            "ep_min": "0.2",
+            "ep_max_effective": "6.0",
+        }
+        spec = {
+            "mode": 1,
+            "legacy_fraction": 0.25,
+            "binning": {
+                "Q2": [1.0, 2.5, 5.0],
+                "xB": [0.2, 0.3, 0.38],
+                "minus_t": [0.09, 0.3, 1.0],
+                "phi_deg": [0.0, 180.0, 360.0],
+            },
+        }
+
+        first = radiative_survey._proposal_density_ratio(row, norm, spec)
+        row["xb_leptonic"] = 0.300002
+        second = radiative_survey._proposal_density_ratio(row, norm, spec)
+        boundary_candidates = (
+            radiative_survey._proposal_density_ratio_candidates(
+                row, norm, spec
+            )
+        )
+
+        self.assertAlmostEqual(first, second)
+        self.assertGreater(len(boundary_candidates), 1)
+        self.assertTrue(
+            any(
+                math.isclose(first, candidate)
+                for candidate in boundary_candidates
+            )
+        )
+
     def test_declared_bin_allows_only_small_boundary_roundoff(self) -> None:
         edges = [0.09, 1.0, 1.5, 2.0]
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -970,18 +971,26 @@ def _validate_proposal_mapping(
         absolute=1.0e-7,
     )
     if schema == SURVEY_SCHEMA:
-        expected_ratio = _proposal_density_ratio(
+        expected_ratios = _proposal_density_ratio_candidates(
             row,
             norm,
             proposal_spec,
         )
-        _assert_close(
-            "survey proposal density ratio",
-            float(row["proposal_density_ratio"]),
-            expected_ratio,
-            relative=2.0e-5,
-            absolute=2.0e-7,
-        )
+        actual_ratio = float(row["proposal_density_ratio"])
+        if not any(
+            math.isclose(
+                actual_ratio,
+                expected_ratio,
+                rel_tol=2.0e-5,
+                abs_tol=2.0e-7,
+            )
+            for expected_ratio in expected_ratios
+        ):
+            raise SurveyValidationError(
+                f"trial {row['trial']} survey proposal density ratio "
+                f"{actual_ratio:.17g} does not match boundary-aware "
+                f"candidates {expected_ratios}"
+            )
         if int(row["proposal_component"]) == 1:
             binning = proposal_spec["binning"]
             values = (
@@ -1076,6 +1085,42 @@ def _declared_bin_contains(
         lower - tolerance <= candidate <= upper + tolerance
         for candidate in candidates
     )
+
+
+def _bin_candidates(
+    value: float,
+    edges: list[float],
+    *,
+    tolerance: float,
+    periodic: bool = False,
+) -> list[int | None]:
+    """Return only bin classifications ambiguous at numerical boundaries."""
+
+    candidates: list[int | None] = [
+        index
+        for index in range(len(edges) - 1)
+        if _declared_bin_contains(
+            value,
+            edges,
+            index,
+            tolerance=tolerance,
+            periodic=periodic,
+        )
+    ]
+    strict_value = value
+    if periodic:
+        strict_value = (value - edges[0]) % (edges[-1] - edges[0]) + edges[0]
+    strict = _bin_index(strict_value, edges)
+    if strict is not None and strict not in candidates:
+        candidates.append(strict)
+    if not candidates:
+        return [None]
+    if not periodic and (
+        abs(value - edges[0]) <= tolerance
+        or abs(value - edges[-1]) <= tolerance
+    ):
+        candidates.append(None)
+    return candidates
 
 
 def _allocation_summary(
@@ -1207,17 +1252,93 @@ def _proposal_density_ratio(
     legacy_fraction = float(proposal_spec["legacy_fraction"])
     if int(proposal_spec["mode"]) == 0:
         return 1.0
-    q2 = float(row["q2_leptonic"])
-    xb = float(row["xb_leptonic"])
-    minus_t = float(row["minus_t_hard"])
-    phi = float(row["phi_cm_deg"]) % 360.0
+    coordinates = _proposal_density_coordinates(row)
+    if coordinates is None:
+        return 1.0 / legacy_fraction
+    q2, xb, minus_t, phi = coordinates
     binning = proposal_spec["binning"]
     indices = (
         _bin_index(q2, binning["Q2"]),
         _bin_index(xb, binning["xB"]),
         _bin_index(minus_t, binning["minus_t"]),
-        _bin_index(phi, binning["phi_deg"]),
+        _bin_index(phi % 360.0, binning["phi_deg"]),
     )
+    return _proposal_density_ratio_for_indices(
+        row, norm, proposal_spec, coordinates, indices
+    )
+
+
+def _proposal_density_ratio_candidates(
+    row: dict[str, int | float],
+    norm: dict[str, str],
+    proposal_spec: dict[str, object],
+) -> list[float]:
+    legacy_fraction = float(proposal_spec["legacy_fraction"])
+    if int(proposal_spec["mode"]) == 0:
+        return [1.0]
+    coordinates = _proposal_density_coordinates(row)
+    if coordinates is None:
+        return [1.0 / legacy_fraction]
+    q2, xb, minus_t, phi = coordinates
+    binning = proposal_spec["binning"]
+    choices = (
+        _bin_candidates(
+            q2,
+            binning["Q2"],
+            tolerance=COORDINATE_TOLERANCES["q2_observed"],
+        ),
+        _bin_candidates(
+            xb,
+            binning["xB"],
+            tolerance=COORDINATE_TOLERANCES["xb_observed"],
+        ),
+        _bin_candidates(
+            minus_t,
+            binning["minus_t"],
+            tolerance=COORDINATE_TOLERANCES["minus_t_observed"],
+        ),
+        _bin_candidates(
+            phi,
+            binning["phi_deg"],
+            tolerance=COORDINATE_TOLERANCES["phi_observed_deg"],
+            periodic=True,
+        ),
+    )
+    candidates = {
+        _proposal_density_ratio_for_indices(
+            row, norm, proposal_spec, coordinates, indices
+        )
+        for indices in itertools.product(*choices)
+    }
+    return sorted(candidates)
+
+
+def _proposal_density_coordinates(
+    row: dict[str, int | float],
+) -> tuple[float, float, float, float] | None:
+    q2 = float(row["q2_leptonic"])
+    energy_transfer = (
+        float(row["energy_in_vertex"])
+        - float(row["energy_e_pre_external"])
+    )
+    if energy_transfer <= 0.0:
+        return None
+    xb = q2 / (2.0 * PROTON_MASS_GEV * energy_transfer)
+    minus_t = float(row["minus_t_hard"])
+    phi = float(row["phi_cm_deg"])
+    return q2, xb, minus_t, phi
+
+
+def _proposal_density_ratio_for_indices(
+    row: dict[str, int | float],
+    norm: dict[str, str],
+    proposal_spec: dict[str, object],
+    coordinates: tuple[float, float, float, float],
+    indices: tuple[int | None, int | None, int | None, int | None],
+) -> float:
+    legacy_fraction = float(proposal_spec["legacy_fraction"])
+    q2, xb, _, _ = coordinates
+    binning = proposal_spec["binning"]
     if any(index is None for index in indices):
         return 1.0 / legacy_fraction
     iq2, ixb, it, iphi = (int(index) for index in indices)
