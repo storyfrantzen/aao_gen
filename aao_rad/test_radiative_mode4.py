@@ -120,6 +120,7 @@ def _prepare_args(
     root: Path, config: Path, recipes: Path, legacy: Path
 ) -> argparse.Namespace:
     return argparse.Namespace(
+        command="prepare",
         config=config,
         recipes=recipes,
         input=legacy,
@@ -134,6 +135,31 @@ def _prepare_args(
         bin_stop=None,
         apply_y_max=False,
         generator_revision="generator-test",
+        heartbeat_interval=100,
+        overwrite=False,
+    )
+
+
+def _calibration_args(
+    root: Path, config: Path, recipes: Path, legacy: Path
+) -> argparse.Namespace:
+    return argparse.Namespace(
+        command="prepare-calibration",
+        config=config,
+        recipes=recipes,
+        input=legacy,
+        output=root / "calibration",
+        candidate="padding_0p035",
+        core_fraction=0.9,
+        trials=1000,
+        calibration_core_fraction=0.5,
+        replicas=1,
+        seed_base=581001,
+        bin_start=0,
+        bin_stop=None,
+        apply_y_max=False,
+        generator_revision="generator-test",
+        heartbeat_interval=100,
         overwrite=False,
     )
 
@@ -239,6 +265,8 @@ class WorkflowTests(unittest.TestCase):
                 parsed[legacy_count + 3].split(),
                 ["0", "0", "0", "0", "0"],
             )
+            self.assertEqual(parsed[-4:-1], ["0", "0", "100"])
+            self.assertAlmostEqual(float(parsed[-1]), 0.9)
             self.assertEqual(
                 hashlib.sha256(
                     (manifest_path.parent / "analysis_config.json").read_bytes()
@@ -271,7 +299,7 @@ class WorkflowTests(unittest.TestCase):
             )
             completed = json.loads(run_path.read_text(encoding="utf-8"))
             self.assertEqual(completed["schema"], radiative_mode4.RUN_SCHEMA)
-            self.assertEqual(completed["events"], 2)
+            self.assertGreaterEqual(completed["events"], 2)
             self.assertGreater(completed["ntries"], 0)
             self.assertGreater(completed["sig_sum_microbarn"], 0.0)
             self.assertEqual(
@@ -286,10 +314,10 @@ class WorkflowTests(unittest.TestCase):
                 .splitlines()
                 if line.strip()
             ]
-            self.assertEqual(len(lund_lines), 10)
+            self.assertEqual(len(lund_lines), 5 * completed["events"])
             self.assertTrue(all(
                 lund_lines[offset].split()[0] == "4"
-                for offset in (0, 5)
+                for offset in range(0, len(lund_lines), 5)
             ))
             norm = radiative_survey.parse_norm(
                 Path(str(stem) + ".norm")
@@ -305,11 +333,88 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(weights["schema"], radiative_mode4.WEIGHTS_SCHEMA)
             self.assertEqual(weights["stratum_count"], 1)
             stratum = weights["strata"][0]
-            self.assertEqual(stratum["total_events"], 2)
+            self.assertEqual(stratum["total_events"], completed["events"])
             self.assertAlmostEqual(
                 stratum["pooled_event_weight_microbarn"]
                 * stratum["total_events"],
                 stratum["combined_sig_sum_microbarn"],
+            )
+
+    @unittest.skipUnless(
+        Path(__file__).with_name("build").joinpath("aao_rad").is_file(),
+        "build/aao_rad is required for the end-to-end calibration test",
+    )
+    def test_fixed_trial_calibration_heartbeat_and_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, recipes, legacy = _fixtures(root)
+            manifest_path = radiative_mode4.prepare(
+                _calibration_args(root, config, recipes, legacy)
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["operation"], "calibration")
+            self.assertEqual(manifest["calibration_trials_per_replica"], 1000)
+            self.assertAlmostEqual(
+                manifest["component_core_fraction"], 0.5
+            )
+            run_path = radiative_mode4.run(
+                argparse.Namespace(
+                    manifest=manifest_path,
+                    flat_index=0,
+                    replica_index=0,
+                    executable=Path(__file__).with_name("build")
+                    / "aao_rad",
+                    overwrite=False,
+                )
+            )
+            completed = json.loads(run_path.read_text(encoding="utf-8"))
+            self.assertEqual(completed["events"], 0)
+            self.assertEqual(completed["ntries"], 1000)
+            self.assertEqual(
+                completed["final_heartbeat"]["proposals"], 1000
+            )
+            self.assertGreater(completed["calibration_target_rows"], 0)
+            stem = run_path.with_suffix("")
+            self.assertTrue(
+                Path(str(stem) + ".calibration.csv").is_file()
+            )
+            heartbeat = Path(str(stem) + ".heartbeat.csv").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("1000,0,", heartbeat)
+            report_path = radiative_mode4.finalize(
+                argparse.Namespace(
+                    manifest=manifest_path,
+                    output=None,
+                    envelope_safety_factor=1.2,
+                    maximum_duplicate_fraction=0.05,
+                    minimum_component_targets=5,
+                )
+            )
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                report["schema"], radiative_mode4.CALIBRATION_SCHEMA
+            )
+            self.assertEqual(report["stratum_count"], 1)
+            result = report["strata"][0]
+            self.assertGreater(
+                result["core"]["target_candidates"], 0
+            )
+            self.assertGreater(
+                result["legacy_tail"]["target_candidates"], 0
+            )
+            self.assertTrue(result["envelope_candidates"])
+            self.assertEqual(
+                result["recommendation_status"], "recommended"
+            )
+            self.assertGreater(
+                result["recommended_envelope"]["sigr_max"], 0.0
+            )
+            self.assertLessEqual(
+                result["recommended_envelope"][
+                    "expected_duplicate_event_fraction"
+                ],
+                0.05,
             )
 
 

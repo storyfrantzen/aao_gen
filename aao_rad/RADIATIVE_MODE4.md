@@ -1,9 +1,9 @@
 # Development radiative mode 4
 
-Radiative mode 4 generates unweighted events for one final-LUND analysis
-stratum per invocation. It is a development prototype: its proposal and
-normalization are exact, but the current guard recipes and tuning have not
-yet passed fresh-replica production validation.
+Radiative mode 4 calibrates and then generates unweighted events for one
+final-LUND analysis stratum per invocation. It is a development prototype:
+its proposal and normalization are exact, but the current guard recipes and
+tuning have not yet passed fresh-replica production validation.
 
 The target coordinates are reconstructed from the final LUND electron and
 proton after internal radiation and both incoming and outgoing external
@@ -66,15 +66,103 @@ Thus `mcall_max > 1` does not bias the distribution, but it creates duplicate
 complete candidates and signals that a larger envelope may be operationally
 preferable.
 
-## Prepare a pilot
+## Calibrate the envelope first
 
 Build from `aao_rad`:
 
 ```bash
 make
+make test
 ```
 
-Prepare one representative stratum with the current development recipe:
+Do not guess `sigr_max`. A value large enough for the amplified legacy tail
+can make the densely sampled core extraordinarily inefficient, while a value
+near the core scale can make a rare tail proposal emit a large multiplicity.
+The fixed-trial calibration operation samples both components without
+acceptance-rejection or LUND output and records the corrected integrand.
+
+The intended generation mixture remains 90% core and 10% unrestricted tail.
+Calibration defaults to a 50/50 component allocation so the rare tail is
+measured more efficiently. Exact component importance factors preserve the
+intended 90/10 mixture normalization.
+
+Prepare a 100,000-trial first calibration for one representative stratum:
+
+```bash
+python3 radiative_mode4.py prepare-calibration \
+  --config ../../../configs/analysis/rgk/6.535.json \
+  --recipes \
+    migration_rgk_balanced_continuous_guards_iteration001/continuous_guard_recipes.json \
+  --input aao_input.inp \
+  --output mode4_rgk_calibration_s04468 \
+  --candidate padding_0p035 \
+  --core-fraction 0.90 \
+  --calibration-core-fraction 0.50 \
+  --trials 100000 \
+  --heartbeat-interval 10000 \
+  --replicas 1 \
+  --bin-start 4468 \
+  --bin-stop 4469 \
+  --generator-revision `git rev-parse HEAD`
+```
+
+The input file must be a legacy AAO input without a survey trailer and must
+match the analysis beam energy. The wrapper freezes `fmcall=0`; calibration
+uses an unused positive placeholder envelope, while generation freezes the
+explicit `--sigr-max`. The original file is not modified.
+
+The default does not apply an analysis-level upper-`y` cut. Add
+`--apply-y-max` only after that selection is intentionally frozen.
+
+Run the fixed-trial calibration:
+
+```bash
+python3 radiative_mode4.py run \
+  mode4_rgk_calibration_s04468/manifest.json \
+  --flat-index 4468 \
+  --replica-index 0 \
+  --executable build/aao_rad \
+  |& tee mode4_rgk_calibration_s04468_run.log
+```
+
+At startup the wrapper prints `mode4_live_heartbeat=...`. Inspect it safely
+from another session:
+
+```bash
+tail -f /printed/path/aao_rad.mode4.heartbeat.csv
+```
+
+The heartbeat is flushed at the requested proposal interval and contains
+proposal, internal-valid, final-candidate, target-candidate, event, and
+component counts.
+
+Finalize the calibration:
+
+```bash
+python3 radiative_mode4.py finalize \
+  mode4_rgk_calibration_s04468/manifest.json \
+  --envelope-safety-factor 1.20 \
+  --maximum-duplicate-fraction 0.05 \
+  --minimum-component-targets 20 \
+  --minimum-outside-targets 5
+```
+
+The resulting `envelope_calibration.json` reports:
+
+- core and legacy-tail target rates, cross sections, uncertainties, and ESS;
+- the number of legacy-tail targets inside and outside the learned core;
+- corrected-integrand quantiles and observed maxima;
+- expected event yield, emitting-proposal rate, duplicate fraction, and
+  maximum observed `mcall` ratio for each candidate envelope;
+- a recommendation only when both components and the outside-core tail have
+  enough target support.
+
+If the report says `insufficient_tail_outside_core_support`, increase the
+fixed trial count rather than accepting an unmeasured envelope.
+
+## Generate after calibration
+
+Use the recommended `sigr_max` from the frozen calibration report:
 
 ```bash
 python3 radiative_mode4.py prepare \
@@ -85,24 +173,16 @@ python3 radiative_mode4.py prepare \
   --output mode4_rgk_pilot_s04468 \
   --candidate padding_0p035 \
   --core-fraction 0.90 \
-  --sigr-max 0.05 \
+  --sigr-max RECOMMENDED_VALUE \
   --events-per-stratum 5000 \
+  --heartbeat-interval 100000 \
   --replicas 1 \
   --bin-start 4468 \
   --bin-stop 4469 \
   --generator-revision `git rev-parse HEAD`
 ```
 
-The input file must be a legacy AAO input without a survey trailer and must
-match the analysis beam energy. The wrapper freezes `fmcall=0` and the
-explicit `--sigr-max`; the original file is not modified.
-
-The default does not apply an analysis-level upper-`y` cut. Add
-`--apply-y-max` only after that selection is intentionally frozen.
-
-## Run and finalize
-
-Run one prepared invocation:
+Run and finalize generation:
 
 ```bash
 python3 radiative_mode4.py run \
@@ -110,11 +190,7 @@ python3 radiative_mode4.py run \
   --flat-index 4468 \
   --replica-index 0 \
   --executable build/aao_rad
-```
 
-After every prepared replica completes:
-
-```bash
 python3 radiative_mode4.py finalize \
   mode4_rgk_pilot_s04468/manifest.json
 ```
@@ -156,6 +232,10 @@ proposal efficiency. `aao_rad.mode4.csv` records accepted-event diagnostics
 and is independently checked against the manifest proposal density and
 final-coordinate bounds.
 
+Every run also preserves `*.heartbeat.csv`. Calibration runs preserve
+`*.calibration.csv`, emit no LUND events, and are summarized in
+`envelope_calibration.json` plus a compact TSV.
+
 The LUND structure is unchanged: one historical event header followed by the
 same four particle records. No weights or metadata are inserted into LUND.
 The stratum ID remains in the filename and manifest, making the products
@@ -170,8 +250,8 @@ Start with a small representative set rather than all analysis strata:
 - low- and high-kinematic strata;
 - low-coverage cases such as `s04468` and `s09012`.
 
-Compare `padding_0p03`, `padding_0p035`, and `padding_0p04`, initially at a
-90/10 core/tail mixture. Inspect:
+Calibrate and then compare `padding_0p03`, `padding_0p035`, and
+`padding_0p04`, initially at a 90/10 generation mixture. Inspect:
 
 - emitted events per proposal;
 - `mcall_max` and duplicate-event frequency;

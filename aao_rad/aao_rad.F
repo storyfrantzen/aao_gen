@@ -179,6 +179,8 @@ c     and make a new version.
       real mode4_hphi_origin,mode4_hphi_relative_low
       real mode4_hphi_relative_high,mode4_hphi_relative
       real mode4_density_denominator
+      real mode4_component_core_fraction
+      real mode4_component_weight,mode4_trial_integrand
 
       integer dismc(6,100)
       integer intreg
@@ -199,6 +201,7 @@ c      integer iext
       integer proposal_t_bin,proposal_phi_bin,proposal_mapping_status
       integer candidate_status,coordinate_status,final_valid
       integer mode4_apply_y_max,mode4_stratum_status
+      integer mode4_operation,mode4_inside_core
       integer stratum_flat,stratum_iq2,stratum_ixb,stratum_it
       integer stratum_iphi
       integer nprint,ntell,ntold
@@ -217,6 +220,9 @@ cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
       integer*8 mode4_internal_rows,mode4_final_candidates
       integer*8 mode4_target_candidates
       integer*8 mode4_core_events,mode4_legacy_events
+      integer*8 mode4_core_targets,mode4_legacy_targets
+      integer*8 mode4_trial_limit,mode4_heartbeat_interval
+      integer*8 mode4_last_heartbeat
       
       real cfac,asig
 
@@ -243,6 +249,8 @@ c     character*1 ich1
       character*13 file_bos
       character*18 file_survey
       character*18 file_mode4
+      character*32 file_mode4_heartbeat
+      character*32 file_mode4_calibration
       character*8 recname
       character*28  ctime
 
@@ -271,6 +279,8 @@ c     character*1 ich1
       data file_bos /'aao_rad.bos'/
       data file_survey /'aao_rad.survey.csv'/
       data file_mode4 /'aao_rad.mode4.csv'/
+      data file_mode4_heartbeat /'aao_rad.mode4.heartbeat.csv'/
+      data file_mode4_calibration /'aao_rad.mode4.calibration.csv'/
       data ctime    /'                            '/
 
       do j=1,6
@@ -507,6 +517,10 @@ c     of a learned continuous core and the unrestricted legacy proposal.
       mode4_core_volume=0.
       mode4_apply_y_max=0
       mode4_y_maximum=1.
+      mode4_operation=0
+      mode4_trial_limit=0
+      mode4_heartbeat_interval=100000
+      mode4_component_core_fraction=0.
       stratum_flat=-1
       stratum_iq2=-1
       stratum_ixb=-1
@@ -785,6 +799,45 @@ c     of a learned continuous core and the unrestricted legacy proposal.
             write(6,*)'Mode 4 core volume disagrees with guard bounds'
             stop 2
          endif
+         read(5,*,iostat=input_status)mode4_operation
+         if (input_status .lt. 0) then
+            mode4_operation=0
+            mode4_trial_limit=0
+            mode4_heartbeat_interval=100000
+            mode4_component_core_fraction=mode4_core_fraction
+         elseif (input_status .ne. 0 .or.
+     *           (mode4_operation .ne. 0 .and.
+     *            mode4_operation .ne. 1)) then
+            write(6,*)'Mode 4 operation must be 0 or 1'
+            stop 2
+         else
+            read(5,*,iostat=input_status)mode4_trial_limit
+            if (input_status .ne. 0 .or. mode4_trial_limit .lt. 0) then
+               write(6,*)'Invalid mode-4 fixed trial limit'
+               stop 2
+            endif
+            read(5,*,iostat=input_status)mode4_heartbeat_interval
+            if (input_status .ne. 0 .or.
+     *          mode4_heartbeat_interval .le. 0) then
+               write(6,*)'Mode-4 heartbeat interval must be positive'
+               stop 2
+            endif
+            read(5,*,iostat=input_status)
+     *         mode4_component_core_fraction
+            if (input_status .ne. 0 .or.
+     *          mode4_component_core_fraction .le. 0. .or.
+     *          mode4_component_core_fraction .ge. 1.) then
+               write(6,*)'Mode-4 component fraction must be in (0,1)'
+               stop 2
+            endif
+         endif
+         if (mode4_operation .eq. 0) then
+            mode4_trial_limit=0
+            mode4_component_core_fraction=mode4_core_fraction
+         elseif (mode4_trial_limit .le. 0) then
+            write(6,*)'Mode-4 calibration requires positive trials'
+            stop 2
+         endif
          if (fmcall .ne. 0. .or. sigr_max .le. 0.) then
             write(6,*)'Mode 4 requires fmcall=0 and positive sigr_max'
             stop 2
@@ -800,6 +853,10 @@ c     of a learned continuous core and the unrestricted legacy proposal.
          write(6,*)'Mode 4 core/tail fractions:',
      *      mode4_core_fraction,mode4_legacy_fraction
          write(6,*)'Mode 4 core volume:',mode4_core_volume
+         write(6,*)'Mode 4 operation/trial limit:',
+     *      mode4_operation,mode4_trial_limit
+         write(6,*)'Mode 4 heartbeat/component fraction:',
+     *      mode4_heartbeat_interval,mode4_component_core_fraction
       endif
 c
  1    mcall_max	= 0
@@ -817,6 +874,9 @@ c
       mode4_target_candidates=0
       mode4_core_events=0
       mode4_legacy_events=0
+      mode4_core_targets=0
+      mode4_legacy_targets=0
+      mode4_last_heartbeat=-1
 
 c     Use the internal clock to initialize the random number generator
 
@@ -914,7 +974,7 @@ c     filerz=aaoradgen-pi0-1.6-0811.rz.0, for example.
      *   //'trial_xsec_observed_microbarn,rotation_deg,'
      *   //'incoming_loss_fraction,outgoing_loss_fraction'
       endif
-      if (sampling_mode .eq. 4) then
+      if (sampling_mode .eq. 4 .and. mode4_operation .eq. 0) then
          open(unit=17,file=file_mode4,status='replace')
          write(17,'(A)')'# schema=aao-rad-mode4-events-v1'
          write(17,'(A)')'event,proposal_component,'
@@ -923,6 +983,33 @@ c     filerz=aaoradgen-pi0-1.6-0811.rz.0, for example.
      *      //'q2_observed,xb_observed,'
      *      //'minus_t_observed,phi_observed_deg,w_observed,'
      *      //'y_observed,integrand_corrected'
+         flush(17)
+      endif
+      if (sampling_mode .eq. 4 .and. mode4_operation .eq. 1) then
+         open(unit=19,file=file_mode4_calibration,status='replace')
+         write(19,'(A)')'# schema=aao-rad-mode4-calibration-events-v1'
+         write(19,'(A)')'trial,proposal_component,inside_core,'
+     *      //'proposal_density_ratio,integrand_corrected,'
+     *      //'component_importance_weight,r_u,r_ep,u_gamma,'
+     *      //'hadron_cosine_base,hadron_phi_base,q2_observed,'
+     *      //'xb_observed,minus_t_observed,phi_observed_deg,'
+     *      //'w_observed,y_observed'
+         flush(19)
+      endif
+      if (sampling_mode .eq. 4) then
+         open(unit=18,file=file_mode4_heartbeat,status='replace')
+         write(18,'(A)')'# schema=aao-rad-mode4-heartbeat-v1'
+         write(18,'(A)')'proposals,events,core_trials,legacy_trials,'
+     *      //'internal_rows,final_candidates,target_candidates,'
+     *      //'core_targets,legacy_targets,core_events,legacy_events,'
+     *      //'mcall_max'
+         write(18,9010)ntries,nevent,mode4_core_trials,
+     *      mode4_legacy_trials,mode4_internal_rows,
+     *      mode4_final_candidates,mode4_target_candidates,
+     *      mode4_core_targets,mode4_legacy_targets,
+     *      mode4_core_events,mode4_legacy_events,mcall_max
+         flush(18)
+         mode4_last_heartbeat=ntries
       endif
 
 c     Initialize BOS
@@ -1083,6 +1170,23 @@ c     distributed according to the Mo-Tsai integrand.
  20   continue
       if (sampling_mode .eq. 1 .and.
      *    ntries .ge. survey_ntrials) go to 50
+      if (sampling_mode .eq. 4 .and. ntries .gt. 0 .and.
+     *    ntries .ne. mode4_last_heartbeat .and.
+     *    mod(ntries,mode4_heartbeat_interval) .eq. 0) then
+         write(18,9010)ntries,nevent,mode4_core_trials,
+     *      mode4_legacy_trials,mode4_internal_rows,
+     *      mode4_final_candidates,mode4_target_candidates,
+     *      mode4_core_targets,mode4_legacy_targets,
+     *      mode4_core_events,mode4_legacy_events,mcall_max
+         flush(18)
+         flush(12)
+         flush(13)
+         if (mode4_operation .eq. 0)flush(17)
+         if (mode4_operation .eq. 1)flush(19)
+         mode4_last_heartbeat=ntries
+      endif
+      if (sampling_mode .eq. 4 .and. mode4_operation .eq. 1
+     *    .and. ntries .ge. mode4_trial_limit) go to 50
       ntries	= ntries+1
       proposal_component=0
       proposal_q2_bin=0
@@ -1108,7 +1212,8 @@ c     distributed according to the Mo-Tsai integrand.
          survey_legacy_trials=survey_legacy_trials+1
       elseif (sampling_mode .eq. 4) then
          proposal_selector=myran()
-         if (proposal_selector .lt. mode4_core_fraction) then
+         if (proposal_selector .lt.
+     *       mode4_component_core_fraction) then
             proposal_component=1
             mode4_core_trials=mode4_core_trials+1
          else
@@ -1633,7 +1738,8 @@ c     legacy-component points that happen to lie inside the learned core.
      *      mode4_ugamma_low,mode4_ugamma_high,
      *      mode4_hcos_low,mode4_hcos_high,
      *      mode4_hphi_origin,mode4_hphi_relative_low,
-     *      mode4_hphi_relative_high,proposal_density_ratio)
+     *      mode4_hphi_relative_high,proposal_density_ratio,
+     *      mode4_inside_core)
          sigr=sigr*proposal_density_ratio
          mode4_internal_rows=mode4_internal_rows+1
       endif
@@ -1664,6 +1770,28 @@ c     part of the sampled probability space rather than an afterthought.
      *      mode4_stratum_status)
          if (mode4_stratum_status .ne. 0)go to 30
          mode4_target_candidates=mode4_target_candidates+1
+         if (proposal_component .eq. 1) then
+            mode4_core_targets=mode4_core_targets+1
+         else
+            mode4_legacy_targets=mode4_legacy_targets+1
+         endif
+         if (mode4_operation .eq. 1) then
+            if (proposal_component .eq. 1) then
+               mode4_component_weight=mode4_core_fraction/
+     *            mode4_component_core_fraction
+            else
+               mode4_component_weight=mode4_legacy_fraction/
+     *            (1.-mode4_component_core_fraction)
+            endif
+            mode4_trial_integrand=sigr*mode4_component_weight
+            sig_tot=sig_tot+dble(mode4_trial_integrand)
+            write(19,9003)ntries,proposal_component,
+     *         mode4_inside_core,proposal_density_ratio,sigr,
+     *         mode4_component_weight,r_u,r_ep,uek,
+     *         hadron_cosine_base,hadron_phi_base,
+     *         q2_obs,xb_obs,minus_t_obs,phi_obs,w_obs,y_obs
+            go to 30
+         endif
          sig_tot=sig_tot+dble(sigr)
          sig_ratio=sigr/sigr_max
          rtest=myran()
@@ -2007,6 +2135,21 @@ c     Close out the n-tuple file
 Clcs      call hrout(0,icycle,' ')
 Clcs      call hrend('aaoradgen')
 
+      if (sampling_mode .eq. 4 .and.
+     *    ntries .ne. mode4_last_heartbeat) then
+         write(18,9010)ntries,nevent,mode4_core_trials,
+     *      mode4_legacy_trials,mode4_internal_rows,
+     *      mode4_final_candidates,mode4_target_candidates,
+     *      mode4_core_targets,mode4_legacy_targets,
+     *      mode4_core_events,mode4_legacy_events,mcall_max
+         flush(18)
+         flush(12)
+         flush(13)
+         if (mode4_operation .eq. 0)flush(17)
+         if (mode4_operation .eq. 1)flush(19)
+         mode4_last_heartbeat=ntries
+      endif
+
       if (sampling_mode .eq. 1)then
          tries=ntries
          events=0.
@@ -2038,8 +2181,12 @@ Clcs      call hrend('aaoradgen')
       if (sampling_mode .eq. 4)then
          tries=ntries
          events=nevent
-         sig_int=events/tries*sigr_max*analysis_volume
          sig_sum=sig_tot*analysis_volume/tries
+         if (mode4_operation .eq. 1) then
+            sig_int=0.
+         else
+            sig_int=events/tries*sigr_max*analysis_volume
+         endif
          write(6,*)' Mode-4 proposals/events =',ntries,nevent
          write(6,*)' Mode-4 core/legacy trials =',
      *      mode4_core_trials,mode4_legacy_trials
@@ -2063,7 +2210,9 @@ Clcs      call hrend('aaoradgen')
       close(12)
       close(13)
       if (sampling_mode .eq. 1)close(16)
-      if (sampling_mode .eq. 4)close(17)
+      if (sampling_mode .eq. 4 .and. mode4_operation .eq. 0)close(17)
+      if (sampling_mode .eq. 4 .and. mode4_operation .eq. 1)close(19)
+      if (sampling_mode .eq. 4)close(18)
 
       open(unit=14,file=file_sum)
       
@@ -2101,6 +2250,8 @@ Clcs      call hrend('aaoradgen')
      *      mode4_final_candidates,mode4_target_candidates
          write(14,*)' Mode-4 core/legacy events =',
      *      mode4_core_events,mode4_legacy_events
+         write(14,*)' Mode-4 operation/trial limit =',
+     *      mode4_operation,mode4_trial_limit
       endif
       write(14,*)' Elapsed CPU time = ',t_elapse/60,' minutes'
       if ((sampling_mode .eq. 0 .or. sampling_mode .eq. 4)
@@ -2160,8 +2311,22 @@ Clcs      call hrend('aaoradgen')
          write(15,*)'survey_emits_lund=0'
       endif
       if (sampling_mode .eq. 4)then
-         write(15,*)'mode4_schema=aao-rad-mode4-v1'
-         write(15,*)'mode4_event_file=',file_mode4
+         write(15,*)'mode4_schema=aao-rad-mode4-v2'
+         write(15,*)'mode4_operation=',mode4_operation
+         write(15,*)'mode4_trial_limit=',mode4_trial_limit
+         write(15,*)'mode4_heartbeat_interval=',
+     *      mode4_heartbeat_interval
+         write(15,*)'mode4_component_core_fraction=',
+     *      mode4_component_core_fraction
+         write(15,*)'mode4_heartbeat_file=',file_mode4_heartbeat
+         if (mode4_operation .eq. 0) then
+            write(15,*)'mode4_event_file=',file_mode4
+            write(15,*)'mode4_calibration_file=none'
+         else
+            write(15,*)'mode4_event_file=none'
+            write(15,*)'mode4_calibration_file=',
+     *         file_mode4_calibration
+         endif
          write(15,*)'mode4_seed=',mode4_seed
          write(15,*)'mode4_replica=',mode4_replica
          write(15,*)'stratum_flat_index=',stratum_flat
@@ -2189,10 +2354,20 @@ Clcs      call hrend('aaoradgen')
          write(15,*)'mode4_internal_rows=',mode4_internal_rows
          write(15,*)'mode4_final_candidates=',mode4_final_candidates
          write(15,*)'mode4_target_candidates=',mode4_target_candidates
+         write(15,*)'mode4_core_targets=',mode4_core_targets
+         write(15,*)'mode4_legacy_targets=',mode4_legacy_targets
          write(15,*)'mode4_core_events=',mode4_core_events
          write(15,*)'mode4_legacy_events=',mode4_legacy_events
-         write(15,*)'mode4_event_weight_microbarn=',sig_sum/events
-         write(15,*)'mode4_lund_structure=legacy-four-particle'
+         write(15,*)'mode4_phase_volume=',analysis_volume
+         if (mode4_operation .eq. 0 .and. events .gt. 0.) then
+            write(15,*)'mode4_event_weight_microbarn=',sig_sum/events
+            write(15,*)'mode4_lund_structure=legacy-four-particle'
+            write(15,*)'mode4_emits_lund=1'
+         else
+            write(15,*)'mode4_event_weight_microbarn=0'
+            write(15,*)'mode4_lund_structure=none-calibration'
+            write(15,*)'mode4_emits_lund=0'
+         endif
       endif
       close(unit=15)
 
@@ -2206,6 +2381,8 @@ Clcs      call hrend('aaoradgen')
  1410 format(' Distribution of mcall values, region', i2 /10(1x,10i7/))
  9001 format(I0,10(',',I0),51(',',ES24.16E3))
  9002 format(I0,',',I0,13(',',ES24.16E3))
+ 9003 format(I0,2(',',I0),14(',',ES24.16E3))
+ 9010 format(I0,11(',',I0))
 
       close(14)
 Cvpk      CALL bos_end(recname)
@@ -2221,7 +2398,7 @@ c   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
       subroutine mode4_proposal_ratio(r_u,r_ep,u_gamma,hcos,hphi,
      * core_fraction,core_volume,ru_low,ru_high,rep_low,rep_high,
      * ugamma_low,ugamma_high,hcos_low,hcos_high,hphi_origin,
-     * hphi_relative_low,hphi_relative_high,density_ratio)
+     * hphi_relative_low,hphi_relative_high,density_ratio,inside)
 
 c     Return q_legacy/q_mixture for
 c
