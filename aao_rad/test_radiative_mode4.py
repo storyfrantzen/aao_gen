@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import tempfile
@@ -594,6 +595,59 @@ class WorkflowTests(unittest.TestCase):
             second_completed = json.loads(
                 second_run_path.read_text(encoding="utf-8")
             )
+            mismatch_args = _calibration_args(
+                root, config, recipes, legacy
+            )
+            mismatch_args.output = root / "calibration_new_revision"
+            mismatch_args.generator_revision = "generator-diagnostics-test"
+            mismatch_args.seed_base = 781001
+            mismatch_manifest_path = radiative_mode4.prepare(mismatch_args)
+            radiative_mode4.run(
+                argparse.Namespace(
+                    manifest=mismatch_manifest_path,
+                    flat_index=0,
+                    replica_index=0,
+                    executable=Path(__file__).with_name("build")
+                    / "aao_rad",
+                    overwrite=False,
+                )
+            )
+            with self.assertRaisesRegex(
+                radiative_mode4.Mode4Error,
+                "generator_revision is incompatible",
+            ):
+                radiative_mode4.finalize(
+                    argparse.Namespace(
+                        manifests=[
+                            manifest_path,
+                            mismatch_manifest_path,
+                        ],
+                        output=root / "revision_mismatch_rejected.json",
+                    )
+                )
+            override_path = radiative_mode4.finalize(
+                argparse.Namespace(
+                    manifests=[manifest_path, mismatch_manifest_path],
+                    output=root / "revision_mismatch_audited.json",
+                    envelope_safety_factor=1.2,
+                    maximum_duplicate_fraction=0.05,
+                    minimum_component_targets=5,
+                    minimum_provisional_inside_targets=5,
+                    allow_calibration_revision_mismatch=True,
+                    revision_compatibility_rationale=(
+                        "test-only diagnostic revision; calibration "
+                        "physics and proposal are unchanged"
+                    ),
+                )
+            )
+            override = json.loads(
+                override_path.read_text(encoding="utf-8")
+            )
+            self.assertIsNone(override["generator_revision"])
+            self.assertEqual(len(override["generator_revisions"]), 2)
+            self.assertTrue(
+                override["revision_compatibility_override"]["enabled"]
+            )
             report_path = radiative_mode4.finalize(
                 argparse.Namespace(
                     manifests=[manifest_path, second_manifest_path],
@@ -698,6 +752,31 @@ class WorkflowTests(unittest.TestCase):
                 insufficient["recommendation_status"],
                 "insufficient_zero_complement_exposure",
             )
+            insufficient_inside_path = radiative_mode4.finalize(
+                argparse.Namespace(
+                    manifests=[manifest_path, second_manifest_path],
+                    output=root / "insufficient_inside_envelope.json",
+                    envelope_safety_factor=1.2,
+                    maximum_duplicate_fraction=0.05,
+                    minimum_component_targets=5,
+                    minimum_provisional_inside_targets=1000000,
+                    allow_zero_complement=True,
+                    zero_complement_confidence=0.95,
+                    maximum_zero_complement_target_rate=0.01,
+                )
+            )
+            insufficient_inside = json.loads(
+                insufficient_inside_path.read_text(encoding="utf-8")
+            )["strata"][0]
+            self.assertEqual(
+                insufficient_inside["recommendation_status"],
+                "insufficient_provisional_inside_envelope_support",
+            )
+            self.assertFalse(
+                insufficient_inside[
+                    "provisional_inside_envelope_support"
+                ]["passes_target_threshold"]
+            )
             provisional_path = radiative_mode4.finalize(
                 argparse.Namespace(
                     manifests=[manifest_path, second_manifest_path],
@@ -705,6 +784,7 @@ class WorkflowTests(unittest.TestCase):
                     envelope_safety_factor=1.2,
                     maximum_duplicate_fraction=0.05,
                     minimum_component_targets=5,
+                    minimum_provisional_inside_targets=5,
                     allow_zero_complement=True,
                     zero_complement_confidence=0.95,
                     maximum_zero_complement_target_rate=0.01,
@@ -724,6 +804,109 @@ class WorkflowTests(unittest.TestCase):
             )
             self.assertTrue(
                 provisional["recommended_envelope"]["provisional"]
+            )
+            self.assertEqual(
+                provisional["recommended_envelope"]["source"],
+                "inside_guard_maximum",
+            )
+            self.assertEqual(
+                provisional["recommended_envelope"][
+                    "expected_duplicate_event_fraction"
+                ],
+                0.0,
+            )
+            self.assertEqual(
+                provisional["recommended_envelope"]["sigr_max"],
+                provisional["provisional_inside_envelope_support"][
+                    "safety_scaled_observed_maximum_sigr_max"
+                ],
+            )
+            source_record = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )["runs"][0]
+            pilot_run_path = root / "inside_only_pilot.json"
+            pilot_run_path.write_text(
+                json.dumps(
+                    {
+                        **{
+                            name: source_record[name]
+                            for name in (
+                                "stratum_id",
+                                "flat_index",
+                                "indices",
+                                "bounds",
+                                "guard",
+                            )
+                        },
+                        "schema": radiative_mode4.RUN_SCHEMA,
+                        "operation": "generation",
+                        "events": 1,
+                        "noncore_events": 0,
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            pilot_event_path = pilot_run_path.with_suffix(".mode4.csv")
+            with pilot_event_path.open(
+                "w", encoding="utf-8", newline=""
+            ) as destination:
+                destination.write(
+                    "# schema="
+                    f"{radiative_mode4.MODE4_KINEMATICS_SCHEMA}\n"
+                )
+                writer = csv.DictWriter(
+                    destination,
+                    fieldnames=radiative_mode4.MODE4_KINEMATICS_COLUMNS,
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        name: (
+                            1
+                            if name in ("event", "proposal_component")
+                            else 9.0
+                            if name == "integrand_corrected"
+                            else 0.5
+                        )
+                        for name in (
+                            radiative_mode4.MODE4_KINEMATICS_COLUMNS
+                        )
+                    }
+                )
+            pilot_floor_path = radiative_mode4.finalize(
+                argparse.Namespace(
+                    manifests=[manifest_path, second_manifest_path],
+                    output=root / "provisional_with_pilot_floor.json",
+                    envelope_safety_factor=1.2,
+                    maximum_duplicate_fraction=0.05,
+                    minimum_component_targets=5,
+                    minimum_provisional_inside_targets=5,
+                    allow_zero_complement=True,
+                    zero_complement_confidence=0.95,
+                    maximum_zero_complement_target_rate=0.01,
+                    additional_inside_pilot_run=[pilot_run_path],
+                )
+            )
+            pilot_floor = json.loads(
+                pilot_floor_path.read_text(encoding="utf-8")
+            )["strata"][0]
+            self.assertEqual(
+                pilot_floor["recommended_envelope"]["source"],
+                "additional_inside_pilot_observed_maximum",
+            )
+            self.assertAlmostEqual(
+                pilot_floor["recommended_envelope"]["sigr_max"], 10.8
+            )
+            self.assertEqual(
+                len(pilot_floor["additional_inside_pilot_observations"]),
+                1,
+            )
+            self.assertTrue(
+                pilot_floor["additional_inside_pilot_observations"][0][
+                    "excluded_from_fixed_trial_calibration_statistics"
+                ]
             )
             self.assertTrue(
                 provisional["zero_complement_stopping_test"][

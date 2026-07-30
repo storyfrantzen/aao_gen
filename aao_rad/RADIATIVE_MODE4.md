@@ -305,6 +305,20 @@ hashes, guard candidate, production core fraction, selections, and per-stratum
 guard bounds. Trial allocation, trial count, replica count, and seed may
 differ. Duplicate manifests and repeated stratum seeds are rejected.
 
+If generator revisions differ only because of audited diagnostic or
+finalizer changes, calibration pooling can be explicitly authorized with:
+
+```bash
+  --allow-calibration-revision-mismatch \
+  --revision-compatibility-rationale \
+    "Exact reason the calibration physics and proposal are unchanged"
+```
+
+This override is calibration-only, is rejected without a nonempty rationale,
+and records every source revision plus the rationale in the report. It must
+not be used across changes to the integrand, phase-space mapping, proposal,
+selection, or guard construction.
+
 ### Provisional zero-complement stopping rule
 
 A well-tuned guard may produce no complement targets even after a large,
@@ -319,6 +333,9 @@ python3 radiative_mode4.py finalize \
   --envelope-safety-factor 1.20 \
   --maximum-duplicate-fraction 0.05 \
   --minimum-component-targets 20 \
+  --minimum-provisional-inside-targets 1000 \
+  --additional-inside-pilot-run \
+    previous_pilot/runs/s04468/s04468__g0000.json \
   --allow-zero-complement \
   --zero-complement-confidence 0.95 \
   --maximum-zero-complement-target-rate 1e-6 \
@@ -335,9 +352,19 @@ p_upper = 1 - (1 - confidence)^(1/N)
 The provisional policy is allowed only when:
 
 - the inside guard meets `--minimum-component-targets`;
+- at least `--minimum-provisional-inside-targets` inside-guard target
+  candidates have been observed (default 1000);
 - exactly zero complement targets were observed;
 - `p_upper` does not exceed the configured maximum target rate;
-- an inside-derived envelope meets the duplicate-fraction requirement.
+- the safety-scaled maximum corrected integrand observed inside the guard
+  meets the duplicate-fraction requirement.
+
+Each optional `--additional-inside-pilot-run` must be a validated mode-4
+generation run containing no noncore events and matching the finalized
+stratum's frozen bounds and guard. Its event-file maximum can only raise the
+envelope floor. The report records hashes of both artifacts, and the pilot
+events are deliberately excluded from fixed-trial cross-section, uncertainty,
+ESS, occurrence-rate, and target-count calculations.
 
 If even one complement target is observed, the zero-target exception is
 disabled and the ordinary component-support requirement remains in force.
@@ -348,16 +375,21 @@ The JSON and TSV record:
   and configured threshold;
 - the finalizer's repository revision and exact source-file hash;
 - the recommendation basis and provisional flag;
+- the inside-target threshold, observed count, empirical next-target rank
+  resolution, observed maximum, and safety-scaled maximum;
+- any inside-only pilot evidence, its artifact hashes, and the additional
+  observed maximum used as an envelope floor;
 - `pilot_readiness=ready_provisional_zero_complement`;
 - a warning that the occurrence-rate bound does **not** bound an unseen
   event's cross section or corrected-integrand magnitude.
 
-The envelope's predicted yield and duplicate metrics are conditional on the
-observed calibration sample. Full proposal support and stochastic
-multiplicity preserve correctness if a complement event later exceeds the
-inside-derived envelope, but such an event can create duplicates and reduce
-effective precision. Therefore this policy authorizes only a small monitored
-pilot before broader production.
+The empirical next-target rank resolution, `1/(n_inside+1)`, is an audit
+indicator rather than a confidence bound on the integrand tail. The envelope's
+predicted yield and duplicate metrics remain conditional on the observed
+calibration sample. Full proposal support and stochastic multiplicity preserve
+correctness if a later event exceeds the envelope, but such an event can
+create duplicates and reduce effective precision. Therefore this policy
+authorizes only a small monitored pilot before broader production.
 
 ## Generate after calibration
 

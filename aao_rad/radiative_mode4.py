@@ -32,7 +32,7 @@ import radiative_survey
 MANIFEST_SCHEMA = "aao-rad-mode4-manifest-v3"
 RUN_SCHEMA = "aao-rad-mode4-run-v3"
 WEIGHTS_SCHEMA = "aao-rad-mode4-weights-v2"
-CALIBRATION_SCHEMA = "aao-rad-mode4-envelope-calibration-v3"
+CALIBRATION_SCHEMA = "aao-rad-mode4-envelope-calibration-v4"
 RECIPE_SCHEMA = "aao-rad-continuous-guard-recipes-v1"
 REFINEMENT_SCHEMA = "aao-rad-mode4-guard-refinements-v1"
 REFINEMENT_COORDINATE_SPACE = "post_padding_guard_bounds"
@@ -1723,6 +1723,58 @@ def _calibration_rows(path: Path) -> list[tuple[int, int, float]]:
         ]
 
 
+def _additional_inside_pilot_observation(path: Path) -> dict[str, object]:
+    run_path = path.resolve()
+    run = json.loads(run_path.read_text(encoding="utf-8"))
+    if run.get("schema") != RUN_SCHEMA:
+        raise Mode4Error(f"{run_path}: unsupported mode-4 run schema")
+    if run.get("operation") != "generation":
+        raise Mode4Error(f"{run_path}: expected a generation pilot")
+    if int(run.get("noncore_events", -1)) != 0:
+        raise Mode4Error(
+            f"{run_path}: additional envelope evidence must contain only "
+            "inside-guard events"
+        )
+    event_path = run_path.with_suffix(".mode4.csv")
+    with event_path.open(encoding="utf-8", newline="") as source:
+        schema = source.readline().strip()
+        if schema != f"# schema={MODE4_KINEMATICS_SCHEMA}":
+            raise Mode4Error(f"{event_path}: unexpected event schema")
+        reader = csv.DictReader(source)
+        if tuple(reader.fieldnames or ()) != MODE4_KINEMATICS_COLUMNS:
+            raise Mode4Error(f"{event_path}: unexpected event columns")
+        rows = list(reader)
+    if len(rows) != int(run["events"]):
+        raise Mode4Error(
+            f"{event_path}: event count differs from {run_path}"
+        )
+    if not rows:
+        raise Mode4Error(f"{event_path}: no pilot events")
+    if any(int(row["proposal_component"]) != 1 for row in rows):
+        raise Mode4Error(
+            f"{event_path}: additional envelope evidence contains a "
+            "noncore proposal component"
+        )
+    values = [float(row["integrand_corrected"]) for row in rows]
+    if any(not math.isfinite(value) or value <= 0.0 for value in values):
+        raise Mode4Error(f"{event_path}: invalid corrected integrand")
+    return {
+        "stratum_id": str(run["stratum_id"]),
+        "flat_index": int(run["flat_index"]),
+        "indices": run["indices"],
+        "bounds": run["bounds"],
+        "guard": run["guard"],
+        "run_path": str(run_path),
+        "run_sha256": _sha256(run_path),
+        "event_path": str(event_path),
+        "event_sha256": _sha256(event_path),
+        "events": len(rows),
+        "observed_maximum_integrand_corrected": max(values),
+        "used_as_envelope_floor_only": True,
+        "excluded_from_fixed_trial_calibration_statistics": True,
+    }
+
+
 def _zero_success_upper_rate(trials: int, confidence: float) -> float:
     """Exact one-sided binomial upper rate after zero observed successes."""
     if trials <= 0:
@@ -1746,6 +1798,9 @@ def _finalize_calibration(
     minimum_targets = int(
         getattr(args, "minimum_component_targets", 20)
     )
+    minimum_provisional_inside_targets = int(
+        getattr(args, "minimum_provisional_inside_targets", 1000)
+    )
     allow_zero_complement = bool(
         getattr(args, "allow_zero_complement", False)
     )
@@ -1755,12 +1810,42 @@ def _finalize_calibration(
     maximum_zero_complement_target_rate = float(
         getattr(args, "maximum_zero_complement_target_rate", 1.0e-6)
     )
+    allow_revision_mismatch = bool(
+        getattr(args, "allow_calibration_revision_mismatch", False)
+    )
+    revision_compatibility_rationale = str(
+        getattr(args, "revision_compatibility_rationale", "") or ""
+    ).strip()
+    generator_revisions = sorted(
+        {str(source["generator_revision"]) for _, source in sources}
+    )
+    raw_pilot_paths = (
+        getattr(args, "additional_inside_pilot_run", None) or []
+    )
+    if len({Path(path).resolve() for path in raw_pilot_paths}) != len(
+        raw_pilot_paths
+    ):
+        raise ValueError(
+            "the same --additional-inside-pilot-run was supplied more "
+            "than once"
+        )
+    pilot_observations: dict[str, list[dict[str, object]]] = {}
+    for path in raw_pilot_paths:
+        observation = _additional_inside_pilot_observation(Path(path))
+        pilot_observations.setdefault(
+            str(observation["stratum_id"]), []
+        ).append(observation)
     if safety_factor < 1.0:
         raise ValueError("--envelope-safety-factor must be at least one")
     if not 0.0 <= maximum_duplicate_fraction < 1.0:
         raise ValueError("--maximum-duplicate-fraction must lie in [0,1)")
     if minimum_targets < 1:
         raise ValueError("--minimum-component-targets must be positive")
+    if minimum_provisional_inside_targets < minimum_targets:
+        raise ValueError(
+            "--minimum-provisional-inside-targets must be at least "
+            "--minimum-component-targets"
+        )
     if not 0.0 < zero_complement_confidence < 1.0:
         raise ValueError(
             "--zero-complement-confidence must lie strictly between zero "
@@ -1814,6 +1899,21 @@ def _finalize_calibration(
                 f"{stratum_id}: pooled runs disagree on phase-space volume"
             )
         first = items[0][1]
+        additional_observations = pilot_observations.pop(stratum_id, [])
+        for observation in additional_observations:
+            frozen = {
+                name: observation[name]
+                for name in ("flat_index", "indices", "bounds", "guard")
+            }
+            expected = {
+                name: first[name]
+                for name in ("flat_index", "indices", "bounds", "guard")
+            }
+            if frozen != expected:
+                raise Mode4Error(
+                    f"{observation['run_path']}: pilot stratum geometry "
+                    f"differs from calibration {stratum_id}"
+                )
         guard_volume = float(first["guard"]["normalized_volume"])
         inside_mass = alpha + (1.0 - alpha) * guard_volume
         complement_mass = (1.0 - alpha) * (1.0 - guard_volume)
@@ -1899,13 +1999,85 @@ def _finalize_calibration(
             if float(item["expected_duplicate_event_fraction"])
             <= maximum_duplicate_fraction
         ]
+        provisional_inside_support = (
+            len(inside_values) >= minimum_provisional_inside_targets
+        )
+        inside_observed_maximum = (
+            max(inside_values) if inside_values else None
+        )
+        additional_observed_maximum = (
+            max(
+                float(
+                    observation[
+                        "observed_maximum_integrand_corrected"
+                    ]
+                )
+                for observation in additional_observations
+            )
+            if additional_observations
+            else None
+        )
+        combined_observed_maximum = max(
+            value
+            for value in (
+                inside_observed_maximum,
+                additional_observed_maximum,
+            )
+            if value is not None
+        ) if (
+            inside_observed_maximum is not None
+            or additional_observed_maximum is not None
+        ) else None
+        provisional_envelope = (
+            safety_factor * combined_observed_maximum
+            if combined_observed_maximum is not None
+            else None
+        )
+        provisional_source = (
+            "additional_inside_pilot_observed_maximum"
+            if (
+                additional_observed_maximum is not None
+                and (
+                    inside_observed_maximum is None
+                    or additional_observed_maximum
+                    > inside_observed_maximum
+                )
+            )
+            else "inside_guard_maximum"
+        )
+        provisional_candidate = (
+            {
+                "source": provisional_source,
+                **_envelope_evaluation(
+                    provisional_envelope,
+                    inside_values,
+                    complement_values,
+                    inside_trials,
+                    complement_trials,
+                    inside_mass,
+                    complement_mass,
+                ),
+            }
+            if provisional_envelope is not None
+            else None
+        )
+        provisional_candidate_passes = (
+            provisional_candidate is not None
+            and float(
+                provisional_candidate[
+                    "expected_duplicate_event_fraction"
+                ]
+            )
+            <= maximum_duplicate_fraction
+        )
         strict_recommendation = enough_support and bool(acceptable)
         provisional_recommendation = (
             allow_zero_complement
             and inside_support
+            and provisional_inside_support
             and complement_zero
             and zero_rate_passes
-            and bool(acceptable)
+            and provisional_candidate_passes
         )
         recommendation: Optional[dict[str, object]] = None
         recommendation_status: str
@@ -1922,10 +2094,11 @@ def _finalize_calibration(
             pilot_readiness = "ready"
         elif provisional_recommendation:
             recommendation = {
-                **acceptable[0],
+                **provisional_candidate,
                 "provisional": True,
                 "basis": (
-                    "inside_guard_observed_with_zero_complement_rate_bound"
+                    "safety_scaled_inside_guard_observed_maximum_with_"
+                    "zero_complement_rate_bound"
                 ),
                 "unobserved_complement_warning": (
                     "Expected yield and duplicate metrics do not include an "
@@ -1952,7 +2125,16 @@ def _finalize_calibration(
             complement_zero
             and allow_zero_complement
             and zero_rate_passes
-            and not acceptable
+            and not provisional_inside_support
+        ):
+            recommendation_status = (
+                "insufficient_provisional_inside_envelope_support"
+            )
+        elif (
+            complement_zero
+            and allow_zero_complement
+            and zero_rate_passes
+            and not provisional_candidate_passes
         ):
             recommendation_status = "no_candidate_meets_duplicate_limit"
         elif not complement_support:
@@ -1986,6 +2168,35 @@ def _finalize_calibration(
                     else None
                 ),
                 "envelope_candidates": evaluations,
+                "additional_inside_pilot_observations": (
+                    additional_observations
+                ),
+                "provisional_inside_envelope_support": {
+                    "observed_targets": len(inside_values),
+                    "minimum_required_targets": (
+                        minimum_provisional_inside_targets
+                    ),
+                    "passes_target_threshold": (
+                        provisional_inside_support
+                    ),
+                    "empirical_next_target_rank_resolution": (
+                        1.0 / (len(inside_values) + 1.0)
+                    ),
+                    "observed_maximum_integrand_corrected": (
+                        inside_observed_maximum
+                    ),
+                    "additional_pilot_observed_maximum_"
+                    "integrand_corrected": (
+                        additional_observed_maximum
+                    ),
+                    "combined_observed_maximum_integrand_corrected": (
+                        combined_observed_maximum
+                    ),
+                    "safety_scaled_observed_maximum_sigr_max": (
+                        provisional_envelope
+                    ),
+                    "rank_resolution_is_not_a_confidence_bound": True,
+                },
                 "zero_complement_stopping_test": {
                     "policy_enabled": allow_zero_complement,
                     "observed_complement_targets": len(complement_values),
@@ -2005,6 +2216,12 @@ def _finalize_calibration(
                 "recommended_envelope": recommendation,
             }
         )
+    if pilot_observations:
+        unknown = ", ".join(sorted(pilot_observations))
+        raise Mode4Error(
+            "additional inside-pilot evidence does not match a finalized "
+            f"stratum: {unknown}"
+        )
     payload: dict[str, object] = {
         "schema": CALIBRATION_SCHEMA,
         "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -2021,10 +2238,24 @@ def _finalize_calibration(
                     "calibration_trials_per_replica"
                 ],
                 "replicas_per_stratum": source["replicas_per_stratum"],
+                "generator_revision": source["generator_revision"],
             }
             for path, source in sources
         ],
-        "generator_revision": manifest["generator_revision"],
+        "generator_revision": (
+            generator_revisions[0]
+            if len(generator_revisions) == 1
+            else None
+        ),
+        "generator_revisions": generator_revisions,
+        "revision_compatibility_override": {
+            "enabled": allow_revision_mismatch,
+            "rationale": (
+                revision_compatibility_rationale
+                if allow_revision_mismatch
+                else None
+            ),
+        },
         "analysis_config_sha256": manifest["analysis_config_sha256"],
         "guard_recipes_sha256": manifest["guard_recipes_sha256"],
         "guard_refinements_sha256": manifest.get(
@@ -2036,6 +2267,9 @@ def _finalize_calibration(
         "envelope_safety_factor": safety_factor,
         "maximum_duplicate_fraction": maximum_duplicate_fraction,
         "minimum_component_targets": minimum_targets,
+        "minimum_provisional_inside_targets": (
+            minimum_provisional_inside_targets
+        ),
         "zero_complement_policy": {
             "enabled": allow_zero_complement,
             "confidence_level": zero_complement_confidence,
@@ -2068,6 +2302,8 @@ def _finalize_calibration(
                 "expected_events_per_proposal",
                 "expected_duplicate_event_fraction",
                 "inside_guard_targets",
+                "inside_guard_targets_required_for_provisional",
+                "inside_empirical_next_target_rank_resolution",
                 "guard_complement_targets",
                 "zero_complement_upper_target_rate",
                 "zero_complement_rate_threshold",
@@ -2099,6 +2335,12 @@ def _finalize_calibration(
                         else ""
                     ),
                     stratum["inside_guard"]["target_candidates"],
+                    stratum["provisional_inside_envelope_support"][
+                        "minimum_required_targets"
+                    ],
+                    stratum["provisional_inside_envelope_support"][
+                        "empirical_next_target_rank_resolution"
+                    ],
                     stratum["guard_complement"]["target_candidates"],
                     stratum["zero_complement_stopping_test"][
                         "one_sided_upper_target_rate"
@@ -2132,9 +2374,25 @@ def finalize(args: argparse.Namespace) -> Path:
         sources.append((manifest_path, manifest))
     manifest_path, manifest = sources[0]
     operation = manifest["operation"]
+    allow_revision_mismatch = bool(
+        getattr(args, "allow_calibration_revision_mismatch", False)
+    )
+    revision_compatibility_rationale = str(
+        getattr(args, "revision_compatibility_rationale", "") or ""
+    ).strip()
+    if allow_revision_mismatch:
+        if operation != "calibration":
+            raise ValueError(
+                "--allow-calibration-revision-mismatch is valid only for "
+                "calibration manifests"
+            )
+        if not revision_compatibility_rationale:
+            raise ValueError(
+                "--revision-compatibility-rationale is required with "
+                "--allow-calibration-revision-mismatch"
+            )
     compatibility_keys = (
         "operation",
-        "generator_revision",
         "analysis_config_sha256",
         "guard_recipes_sha256",
         "guard_refinements_sha256",
@@ -2144,6 +2402,11 @@ def finalize(args: argparse.Namespace) -> Path:
         "analysis_selection",
         "calibration_proposal",
     )
+    if not allow_revision_mismatch:
+        compatibility_keys = (
+            "generator_revision",
+            *compatibility_keys,
+        )
     for path, candidate in sources[1:]:
         for name in compatibility_keys:
             if candidate.get(name) != manifest.get(name):
@@ -2461,6 +2724,25 @@ def _parser() -> argparse.ArgumentParser:
         "--minimum-component-targets", type=int, default=20
     )
     finalize_parser.add_argument(
+        "--minimum-provisional-inside-targets",
+        type=int,
+        default=1000,
+        help=(
+            "minimum observed inside-guard targets required before a "
+            "zero-complement envelope may be used for a pilot"
+        ),
+    )
+    finalize_parser.add_argument(
+        "--additional-inside-pilot-run",
+        type=Path,
+        action="append",
+        help=(
+            "validated inside-only mode-4 generation run JSON whose "
+            "observed maximum raises the provisional envelope floor; "
+            "repeat for more pilots"
+        ),
+    )
+    finalize_parser.add_argument(
         "--allow-zero-complement",
         action="store_true",
         help=(
@@ -2483,6 +2765,21 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "largest allowed upper occurrence-rate bound for a provisional "
             "zero-complement envelope"
+        ),
+    )
+    finalize_parser.add_argument(
+        "--allow-calibration-revision-mismatch",
+        action="store_true",
+        help=(
+            "pool calibration manifests with different recorded generator "
+            "revisions after an explicit compatibility audit"
+        ),
+    )
+    finalize_parser.add_argument(
+        "--revision-compatibility-rationale",
+        help=(
+            "required audit note explaining why differing generator "
+            "revisions have identical calibration physics and proposals"
         ),
     )
     return parser
