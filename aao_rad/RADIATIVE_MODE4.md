@@ -240,7 +240,10 @@ tail -f /printed/path/aao_rad.mode4.heartbeat.csv
 
 The heartbeat is flushed at the requested proposal interval and contains
 proposal, internal-valid, final-candidate, target-candidate, event, and
-inside/noncore component counts.
+inside/noncore component counts. Production heartbeats also record the
+number of distinct emitting candidates and the exact number of additional
+events created by `mcall > 1`; their ratio to all events is the observed
+duplicate-event fraction.
 
 Finalize the calibration:
 
@@ -426,9 +429,10 @@ runs/s04468/s04468__g0000
 
 The `.norm` and run JSON record the stratum cross section, event weight,
 proposal count, core/noncore trial and event counts, maximum multiplicity,
-and proposal efficiency. `aao_rad.mode4.csv` records accepted-event diagnostics
-and is independently checked against the manifest proposal density and
-final-coordinate bounds.
+distinct emitting candidates, exact multiplicity-generated duplicate count
+and fraction, and proposal efficiency. `aao_rad.mode4.csv` records
+accepted-event diagnostics and is independently checked against the manifest
+proposal density and final-coordinate bounds.
 
 Every run also preserves `*.heartbeat.csv`. Calibration runs preserve
 `*.calibration.csv`, emit no LUND events, and are summarized in

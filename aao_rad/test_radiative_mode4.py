@@ -480,6 +480,15 @@ class WorkflowTests(unittest.TestCase):
                 completed["core_trials"] + completed["legacy_trials"],
                 completed["ntries"],
             )
+            self.assertEqual(
+                completed["emitting_candidates"]
+                + completed["duplicate_events"],
+                completed["events"],
+            )
+            self.assertAlmostEqual(
+                completed["duplicate_event_fraction"],
+                completed["duplicate_events"] / completed["events"],
+            )
             stem = run_path.with_suffix("")
             lund_lines = [
                 line
@@ -512,6 +521,10 @@ class WorkflowTests(unittest.TestCase):
                 stratum["pooled_event_weight_microbarn"]
                 * stratum["total_events"],
                 stratum["combined_sig_sum_microbarn"],
+            )
+            self.assertEqual(
+                stratum["emitting_candidates"] + stratum["duplicate_events"],
+                stratum["total_events"],
             )
 
     @unittest.skipUnless(
@@ -546,6 +559,8 @@ class WorkflowTests(unittest.TestCase):
             )
             completed = json.loads(run_path.read_text(encoding="utf-8"))
             self.assertEqual(completed["events"], 0)
+            self.assertEqual(completed["emitting_candidates"], 0)
+            self.assertEqual(completed["duplicate_events"], 0)
             self.assertEqual(completed["ntries"], 1000)
             self.assertEqual(
                 completed["final_heartbeat"]["proposals"], 1000

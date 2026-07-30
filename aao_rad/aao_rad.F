@@ -222,6 +222,7 @@ cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
       integer*8 mode4_target_candidates
       integer*8 mode4_core_events,mode4_legacy_events
       integer*8 mode4_core_targets,mode4_legacy_targets
+      integer*8 mode4_emitting_candidates,mode4_duplicate_events
       integer*8 mode4_trial_limit,mode4_heartbeat_interval
       integer*8 mode4_last_heartbeat
       
@@ -895,6 +896,8 @@ c
       mode4_legacy_events=0
       mode4_core_targets=0
       mode4_legacy_targets=0
+      mode4_emitting_candidates=0
+      mode4_duplicate_events=0
       mode4_last_heartbeat=-1
 
 c     Use the internal clock to initialize the random number generator
@@ -1017,16 +1020,17 @@ c     filerz=aaoradgen-pi0-1.6-0811.rz.0, for example.
       endif
       if (sampling_mode .eq. 4) then
          open(unit=18,file=file_mode4_heartbeat,status='replace')
-         write(18,'(A)')'# schema=aao-rad-mode4-heartbeat-v2'
+         write(18,'(A)')'# schema=aao-rad-mode4-heartbeat-v3'
          write(18,'(A)')'proposals,events,core_trials,noncore_trials,'
      *      //'internal_rows,final_candidates,target_candidates,'
      *      //'core_targets,noncore_targets,core_events,noncore_events,'
-     *      //'mcall_max'
+     *      //'emitting_candidates,duplicate_events,mcall_max'
          write(18,9010)ntries,nevent,mode4_core_trials,
      *      mode4_legacy_trials,mode4_internal_rows,
      *      mode4_final_candidates,mode4_target_candidates,
      *      mode4_core_targets,mode4_legacy_targets,
-     *      mode4_core_events,mode4_legacy_events,mcall_max
+     *      mode4_core_events,mode4_legacy_events,
+     *      mode4_emitting_candidates,mode4_duplicate_events,mcall_max
          flush(18)
          mode4_last_heartbeat=ntries
       endif
@@ -1196,7 +1200,8 @@ c     distributed according to the Mo-Tsai integrand.
      *      mode4_legacy_trials,mode4_internal_rows,
      *      mode4_final_candidates,mode4_target_candidates,
      *      mode4_core_targets,mode4_legacy_targets,
-     *      mode4_core_events,mode4_legacy_events,mcall_max
+     *      mode4_core_events,mode4_legacy_events,
+     *      mode4_emitting_candidates,mode4_duplicate_events,mcall_max
          flush(18)
          flush(12)
          flush(13)
@@ -1856,6 +1861,9 @@ c     part of the sampled probability space rather than an afterthought.
          if (stest .gt. rtest)mcall=mcall+1
          if (mcall .gt. mcall_max)mcall_max=mcall
          if (mcall .eq. 0)go to 30
+         mode4_emitting_candidates=mode4_emitting_candidates+1
+         if (mcall .gt. 1) mode4_duplicate_events=
+     *      mode4_duplicate_events+mcall-1
          if (mcall .lt. 100)then
             dismc(intreg,mcall)=dismc(intreg,mcall)+1
          else
@@ -2197,7 +2205,8 @@ Clcs      call hrend('aaoradgen')
      *      mode4_legacy_trials,mode4_internal_rows,
      *      mode4_final_candidates,mode4_target_candidates,
      *      mode4_core_targets,mode4_legacy_targets,
-     *      mode4_core_events,mode4_legacy_events,mcall_max
+     *      mode4_core_events,mode4_legacy_events,
+     *      mode4_emitting_candidates,mode4_duplicate_events,mcall_max
          flush(18)
          flush(12)
          flush(13)
@@ -2416,6 +2425,9 @@ Clcs      call hrend('aaoradgen')
          write(15,*)'mode4_legacy_targets=',mode4_legacy_targets
          write(15,*)'mode4_core_events=',mode4_core_events
          write(15,*)'mode4_legacy_events=',mode4_legacy_events
+         write(15,*)'mode4_emitting_candidates=',
+     *      mode4_emitting_candidates
+         write(15,*)'mode4_duplicate_events=',mode4_duplicate_events
          write(15,*)'mode4_phase_volume=',analysis_volume
          if (mode4_operation .eq. 0 .and. events .gt. 0.) then
             write(15,*)'mode4_event_weight_microbarn=',sig_sum/events
@@ -2440,7 +2452,7 @@ Clcs      call hrend('aaoradgen')
  9001 format(I0,10(',',I0),51(',',ES24.16E3))
  9002 format(I0,',',I0,13(',',ES24.16E3))
  9003 format(I0,2(',',I0),14(',',ES24.16E3))
- 9010 format(I0,11(',',I0))
+ 9010 format(I0,13(',',I0))
 
       close(14)
 Cvpk      CALL bos_end(recname)

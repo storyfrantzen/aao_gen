@@ -31,7 +31,7 @@ import radiative_survey
 
 MANIFEST_SCHEMA = "aao-rad-mode4-manifest-v3"
 RUN_SCHEMA = "aao-rad-mode4-run-v3"
-WEIGHTS_SCHEMA = "aao-rad-mode4-weights-v1"
+WEIGHTS_SCHEMA = "aao-rad-mode4-weights-v2"
 CALIBRATION_SCHEMA = "aao-rad-mode4-envelope-calibration-v3"
 RECIPE_SCHEMA = "aao-rad-continuous-guard-recipes-v1"
 REFINEMENT_SCHEMA = "aao-rad-mode4-guard-refinements-v1"
@@ -57,7 +57,7 @@ MODE4_KINEMATICS_COLUMNS = (
     "integrand_corrected",
 )
 MODE4_HEARTBEAT_FILENAME = "aao_rad.mode4.heartbeat.csv"
-MODE4_HEARTBEAT_SCHEMA = "aao-rad-mode4-heartbeat-v2"
+MODE4_HEARTBEAT_SCHEMA = "aao-rad-mode4-heartbeat-v3"
 MODE4_HEARTBEAT_COLUMNS = (
     "proposals",
     "events",
@@ -70,6 +70,8 @@ MODE4_HEARTBEAT_COLUMNS = (
     "noncore_targets",
     "core_events",
     "noncore_events",
+    "emitting_candidates",
+    "duplicate_events",
     "mcall_max",
 )
 MODE4_CALIBRATION_FILENAME = "aao_rad.mode4.calibration.csv"
@@ -1086,6 +1088,19 @@ def _validate_norm(
         norm, "mode4_legacy_events"
     ) != _norm_int(norm, "nevent"):
         raise Mode4Error("mode-4 component event counts are inconsistent")
+    if _norm_int(norm, "mode4_emitting_candidates") + _norm_int(
+        norm, "mode4_duplicate_events"
+    ) != _norm_int(norm, "nevent"):
+        raise Mode4Error(
+            "mode-4 emitting and duplicate counts do not sum to nevent"
+        )
+    if manifest["operation"] == "calibration" and (
+        _norm_int(norm, "mode4_emitting_candidates") != 0
+        or _norm_int(norm, "mode4_duplicate_events") != 0
+    ):
+        raise Mode4Error(
+            "mode-4 calibration unexpectedly recorded emitted events"
+        )
 
 
 def _inside(value: float, bounds: list[float], tolerance: float) -> bool:
@@ -1211,6 +1226,10 @@ def _validate_heartbeat(
         "noncore_targets": _norm_int(norm, "mode4_legacy_targets"),
         "core_events": _norm_int(norm, "mode4_core_events"),
         "noncore_events": _norm_int(norm, "mode4_legacy_events"),
+        "emitting_candidates": _norm_int(
+            norm, "mode4_emitting_candidates"
+        ),
+        "duplicate_events": _norm_int(norm, "mode4_duplicate_events"),
         "mcall_max": _norm_int(norm, "mcall_max"),
     }
     if final != expected:
@@ -1522,6 +1541,15 @@ def run(args: argparse.Namespace) -> Path:
         "ntries": _norm_int(norm, "ntries"),
         "mcall_max": _norm_int(norm, "mcall_max"),
         "multiplicity_correction_used": _norm_int(norm, "mcall_max") > 1,
+        "emitting_candidates": _norm_int(
+            norm, "mode4_emitting_candidates"
+        ),
+        "duplicate_events": _norm_int(norm, "mode4_duplicate_events"),
+        "duplicate_event_fraction": (
+            _norm_int(norm, "mode4_duplicate_events") / events
+            if events
+            else 0.0
+        ),
         "event_weight_microbarn": (
             sig_sum / events if events else None
         ),
@@ -2235,6 +2263,16 @@ def finalize(args: argparse.Namespace) -> Path:
                 ),
                 "event_yield_per_proposal": total_events / total_proposals,
                 "mcall_max": max(int(run["mcall_max"]) for _, run in items),
+                "emitting_candidates": sum(
+                    int(run["emitting_candidates"]) for _, run in items
+                ),
+                "duplicate_events": sum(
+                    int(run["duplicate_events"]) for _, run in items
+                ),
+                "duplicate_event_fraction": (
+                    sum(int(run["duplicate_events"]) for _, run in items)
+                    / total_events
+                ),
                 "core_events": sum(
                     int(run["core_events"]) for _, run in items
                 ),
@@ -2281,6 +2319,9 @@ def finalize(args: argparse.Namespace) -> Path:
                 "combined_sig_sum_microbarn",
                 "pooled_event_weight_microbarn",
                 "event_yield_per_proposal",
+                "emitting_candidates",
+                "duplicate_events",
+                "duplicate_event_fraction",
                 "core_events",
                 "legacy_events",
             ]
@@ -2298,6 +2339,9 @@ def finalize(args: argparse.Namespace) -> Path:
                         "combined_sig_sum_microbarn",
                         "pooled_event_weight_microbarn",
                         "event_yield_per_proposal",
+                        "emitting_candidates",
+                        "duplicate_events",
+                        "duplicate_event_fraction",
                         "core_events",
                         "legacy_events",
                     )
