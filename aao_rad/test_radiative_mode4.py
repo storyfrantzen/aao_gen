@@ -14,14 +14,20 @@ import radiative_mode4
 import radiative_survey
 
 
-def _raw_axis(name: str, *, periodic: bool = False) -> dict:
+def _raw_axis(
+    name: str,
+    *,
+    periodic: bool = False,
+    lower: float = 0.0,
+    upper: float = 1.0,
+) -> dict:
     if not periodic:
         return {
             "name": name,
             "periodic": False,
-            "lower": 0.0,
-            "upper": 1.0,
-            "width": 1.0,
+            "lower": lower,
+            "upper": upper,
+            "width": upper - lower,
         }
     return {
         "name": name,
@@ -75,9 +81,11 @@ def _fixtures(root: Path) -> tuple[Path, Path, Path]:
                 "fit_source": "local_only",
                 "raw_box": {
                     "axes": [
-                        _raw_axis("r_u"),
+                        _raw_axis("r_u", lower=0.2, upper=0.8),
                         _raw_axis("r_ep"),
-                        _raw_axis("u_gamma"),
+                        _raw_axis(
+                            "u_gamma", lower=0.1, upper=0.8
+                        ),
                         _raw_axis("hadron_cosine_base"),
                         _raw_axis("hadron_phi_base", periodic=True),
                     ]
@@ -224,8 +232,26 @@ class ProposalTests(unittest.TestCase):
         }
         box = radiative_mode4.reconstruct_guard_box(recipe, 0.035)
         self.assertEqual(box.nonperiodic["r_u"], (0.0, 1.0))
+        self.assertEqual(box.nonperiodic["u_gamma"], (0.0, 1.0))
         self.assertEqual(box.phi_relative, (-0.5, 0.5))
         self.assertAlmostEqual(box.volume, 1.0)
+
+    def test_u_gamma_guard_is_anchored_at_soft_endpoint(self) -> None:
+        recipe = {
+            "padding_scale": 1.0,
+            "raw_box": {
+                "axes": [
+                    _raw_axis("r_u", lower=0.2, upper=0.8),
+                    _raw_axis("r_ep"),
+                    _raw_axis("u_gamma", lower=0.3, upper=0.7),
+                    _raw_axis("hadron_cosine_base"),
+                    _raw_axis("hadron_phi_base", periodic=True),
+                ]
+            },
+        }
+        box = radiative_mode4.reconstruct_guard_box(recipe, 0.05)
+        self.assertEqual(box.nonperiodic["u_gamma"], (0.25, 1.0))
+        self.assertAlmostEqual(box.volume, 0.7 * 0.75)
 
 
 class WorkflowTests(unittest.TestCase):
@@ -250,7 +276,10 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(record["generation_id"], "g0000")
             self.assertIn("s00000__g0000", record["output_stem"])
             self.assertAlmostEqual(
-                record["guard"]["normalized_volume"], 1.0
+                record["guard"]["normalized_volume"], 0.67 * 0.935
+            )
+            self.assertTrue(
+                record["guard"]["u_gamma_soft_endpoint_anchored"]
             )
             prepared = (
                 manifest_path.parent / record["input_file"]
@@ -265,8 +294,9 @@ class WorkflowTests(unittest.TestCase):
                 parsed[legacy_count + 3].split(),
                 ["0", "0", "0", "0", "0"],
             )
-            self.assertEqual(parsed[-4:-1], ["0", "0", "100"])
-            self.assertAlmostEqual(float(parsed[-1]), 0.9)
+            self.assertEqual(parsed[-5:-2], ["0", "0", "100"])
+            self.assertAlmostEqual(float(parsed[-2]), 0.9)
+            self.assertEqual(parsed[-1], "0")
             self.assertEqual(
                 hashlib.sha256(
                     (manifest_path.parent / "analysis_config.json").read_bytes()
@@ -357,6 +387,9 @@ class WorkflowTests(unittest.TestCase):
             self.assertAlmostEqual(
                 manifest["component_core_fraction"], 0.5
             )
+            self.assertEqual(
+                manifest["calibration_proposal"], "guard_partition"
+            )
             run_path = radiative_mode4.run(
                 argparse.Namespace(
                     manifest=manifest_path,
@@ -382,9 +415,29 @@ class WorkflowTests(unittest.TestCase):
                 encoding="utf-8"
             )
             self.assertIn("1000,0,", heartbeat)
+            second_args = _calibration_args(
+                root, config, recipes, legacy
+            )
+            second_args.output = root / "calibration_complement_heavy"
+            second_args.calibration_core_fraction = 0.2
+            second_args.seed_base = 681001
+            second_manifest_path = radiative_mode4.prepare(second_args)
+            second_run_path = radiative_mode4.run(
+                argparse.Namespace(
+                    manifest=second_manifest_path,
+                    flat_index=0,
+                    replica_index=0,
+                    executable=Path(__file__).with_name("build")
+                    / "aao_rad",
+                    overwrite=False,
+                )
+            )
+            second_completed = json.loads(
+                second_run_path.read_text(encoding="utf-8")
+            )
             report_path = radiative_mode4.finalize(
                 argparse.Namespace(
-                    manifest=manifest_path,
+                    manifests=[manifest_path, second_manifest_path],
                     output=None,
                     envelope_safety_factor=1.2,
                     maximum_duplicate_fraction=0.05,
@@ -396,12 +449,22 @@ class WorkflowTests(unittest.TestCase):
                 report["schema"], radiative_mode4.CALIBRATION_SCHEMA
             )
             self.assertEqual(report["stratum_count"], 1)
+            self.assertEqual(len(report["source_manifests"]), 2)
             result = report["strata"][0]
             self.assertGreater(
-                result["core"]["target_candidates"], 0
+                result["inside_guard"]["target_candidates"], 0
             )
             self.assertGreater(
-                result["legacy_tail"]["target_candidates"], 0
+                result["guard_complement"]["target_candidates"], 0
+            )
+            self.assertEqual(
+                result["inside_guard"]["trials"],
+                completed["core_trials"] + second_completed["core_trials"],
+            )
+            self.assertEqual(
+                result["guard_complement"]["trials"],
+                completed["noncore_trials"]
+                + second_completed["noncore_trials"],
             )
             self.assertTrue(result["envelope_candidates"])
             self.assertEqual(

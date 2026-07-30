@@ -38,6 +38,12 @@ hadron_phi_base
 The remaining legacy random variables, including radiative channel,
 photon-angle, target-loss, and rotation variables, are unrestricted.
 `hadron_phi_base` uses the recipe's periodic origin and wrapped interval.
+Every reconstructed guard is anchored at `u_gamma = 1`, the soft-photon
+endpoint. The lower `u_gamma` face still comes from the learned recipe and
+padding. The anchored bounds, their newly computed volume, and the anchor
+flag are frozen in the manifest. This prevents a harmless soft-endpoint
+sample from being treated as a high-weight outside-tail event merely because
+the finite survey did not reach exactly to one.
 
 The legacy component has strictly positive probability. Consequently, a
 guard that misses a physical region can reduce efficiency but cannot bias the
@@ -78,13 +84,41 @@ make test
 Do not guess `sigr_max`. A value large enough for the amplified legacy tail
 can make the densely sampled core extraordinarily inefficient, while a value
 near the core scale can make a rare tail proposal emit a large multiplicity.
-The fixed-trial calibration operation samples both components without
-acceptance-rejection or LUND output and records the corrected integrand.
+The fixed-trial calibration operation samples two **disjoint regions**
+without acceptance-rejection or LUND output:
 
-The intended generation mixture remains 90% core and 10% unrestricted tail.
-Calibration defaults to a 50/50 component allocation so the rare tail is
-measured more efficiently. Exact component importance factors preserve the
-intended 90/10 mixture normalization.
+```text
+C       = the learned guard
+C-bar   = the exact complement of that guard in the native unit hypercube
+```
+
+The inside component is uniform on `C`. The complement component is sampled
+uniformly on `C-bar` by rejecting the guard itself; therefore every noncore
+calibration trial is known to be outside the guard. This is a calibration
+proposal only. Production remains the 90% learned-core plus 10%
+unrestricted-legacy full-support mixture described above.
+
+If the production core fraction is `alpha` and the guard volume is `V`, the
+production proposal puts these probability masses in the two calibration
+regions:
+
+```text
+P(C)     = alpha + (1 - alpha) V
+P(C-bar) = (1 - alpha) (1 - V)
+```
+
+If calibration assigns a fraction `beta` of trials inside the guard, its
+regional importance factors are:
+
+```text
+inside guard:      P(C)     / beta
+guard complement:  P(C-bar) / (1 - beta)
+```
+
+These factors preserve both the intended production proposal and the
+physical cross-section integral. `beta` affects precision and runtime only;
+it does not alter the result. Campaigns with different values of `beta` can
+therefore be pooled component by component.
 
 Prepare a 100,000-trial first calibration for one representative stratum:
 
@@ -97,7 +131,7 @@ python3 radiative_mode4.py prepare-calibration \
   --output mode4_rgk_calibration_s04468 \
   --candidate padding_0p035 \
   --core-fraction 0.90 \
-  --calibration-core-fraction 0.50 \
+  --inside-guard-trial-fraction 0.50 \
   --trials 100000 \
   --heartbeat-interval 10000 \
   --replicas 1 \
@@ -134,7 +168,7 @@ tail -f /printed/path/aao_rad.mode4.heartbeat.csv
 
 The heartbeat is flushed at the requested proposal interval and contains
 proposal, internal-valid, final-candidate, target-candidate, event, and
-component counts.
+inside/noncore component counts.
 
 Finalize the calibration:
 
@@ -143,22 +177,58 @@ python3 radiative_mode4.py finalize \
   mode4_rgk_calibration_s04468/manifest.json \
   --envelope-safety-factor 1.20 \
   --maximum-duplicate-fraction 0.05 \
-  --minimum-component-targets 20 \
-  --minimum-outside-targets 5
+  --minimum-component-targets 20
 ```
 
 The resulting `envelope_calibration.json` reports:
 
-- core and legacy-tail target rates, cross sections, uncertainties, and ESS;
-- the number of legacy-tail targets inside and outside the learned core;
+- inside-guard and guard-complement target rates, cross sections,
+  uncertainties, and ESS;
+- the exact production probability mass assigned to each disjoint region;
 - corrected-integrand quantiles and observed maxima;
 - expected event yield, emitting-proposal rate, duplicate fraction, and
   maximum observed `mcall` ratio for each candidate envelope;
-- a recommendation only when both components and the outside-core tail have
-  enough target support.
+- a recommendation only when both disjoint regions have enough target
+  support.
 
-If the report says `insufficient_tail_outside_core_support`, increase the
-fixed trial count rather than accepting an unmeasured envelope.
+If the report says `insufficient_guard_complement_target_support`, add a
+complement-heavy calibration rather than discarding the completed work:
+
+```bash
+python3 radiative_mode4.py prepare-calibration \
+  --config ../../../configs/analysis/rgk/6.535.json \
+  --recipes \
+    migration_rgk_balanced_continuous_guards_iteration001/continuous_guard_recipes.json \
+  --input aao_input.inp \
+  --output mode4_rgk_calibration_s04468_complement_heavy \
+  --candidate padding_0p035 \
+  --core-fraction 0.90 \
+  --inside-guard-trial-fraction 0.20 \
+  --trials 1000000 \
+  --heartbeat-interval 10000 \
+  --replicas 1 \
+  --bin-start 4468 \
+  --bin-stop 4469 \
+  --seed-base 682001 \
+  --generator-revision `git rev-parse HEAD`
+```
+
+After running that manifest, pool both campaigns in one finalization:
+
+```bash
+python3 radiative_mode4.py finalize \
+  mode4_rgk_calibration_s04468/manifest.json \
+  mode4_rgk_calibration_s04468_complement_heavy/manifest.json \
+  --envelope-safety-factor 1.20 \
+  --maximum-duplicate-fraction 0.05 \
+  --minimum-component-targets 20 \
+  --output mode4_rgk_calibration_s04468_pooled.json
+```
+
+Pooling requires identical generator revision, configuration and recipe
+hashes, guard candidate, production core fraction, selections, and per-stratum
+guard bounds. Trial allocation, trial count, replica count, and seed may
+differ. Duplicate manifests and repeated stratum seeds are rejected.
 
 ## Generate after calibration
 
@@ -227,8 +297,8 @@ runs/s04468/s04468__g0000
 ```
 
 The `.norm` and run JSON record the stratum cross section, event weight,
-proposal count, core/tail trial and event counts, maximum multiplicity, and
-proposal efficiency. `aao_rad.mode4.csv` records accepted-event diagnostics
+proposal count, core/noncore trial and event counts, maximum multiplicity,
+and proposal efficiency. `aao_rad.mode4.csv` records accepted-event diagnostics
 and is independently checked against the manifest proposal density and
 final-coordinate bounds.
 

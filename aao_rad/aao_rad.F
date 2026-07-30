@@ -202,6 +202,7 @@ c      integer iext
       integer candidate_status,coordinate_status,final_valid
       integer mode4_apply_y_max,mode4_stratum_status
       integer mode4_operation,mode4_inside_core
+      integer mode4_calibration_proposal
       integer stratum_flat,stratum_iq2,stratum_ixb,stratum_it
       integer stratum_iphi
       integer nprint,ntell,ntold
@@ -518,6 +519,7 @@ c     of a learned continuous core and the unrestricted legacy proposal.
       mode4_apply_y_max=0
       mode4_y_maximum=1.
       mode4_operation=0
+      mode4_calibration_proposal=0
       mode4_trial_limit=0
       mode4_heartbeat_interval=100000
       mode4_component_core_fraction=0.
@@ -830,12 +832,27 @@ c     of a learned continuous core and the unrestricted legacy proposal.
                write(6,*)'Mode-4 component fraction must be in (0,1)'
                stop 2
             endif
+            read(5,*,iostat=input_status)mode4_calibration_proposal
+            if (input_status .lt. 0) mode4_calibration_proposal=0
+            if (input_status .gt. 0 .or.
+     *          (mode4_calibration_proposal .ne. 0 .and.
+     *           mode4_calibration_proposal .ne. 1)) then
+               write(6,*)'Mode-4 calibration proposal must be 0 or 1'
+               stop 2
+            endif
          endif
          if (mode4_operation .eq. 0) then
             mode4_trial_limit=0
             mode4_component_core_fraction=mode4_core_fraction
+            mode4_calibration_proposal=0
          elseif (mode4_trial_limit .le. 0) then
             write(6,*)'Mode-4 calibration requires positive trials'
+            stop 2
+         endif
+         if (mode4_operation .eq. 1 .and.
+     *       mode4_calibration_proposal .eq. 1 .and.
+     *       mode4_core_volume .ge. 1.-1.e-7) then
+            write(6,*)'Mode-4 guard complement has zero volume'
             stop 2
          endif
          if (fmcall .ne. 0. .or. sigr_max .le. 0.) then
@@ -857,6 +874,8 @@ c     of a learned continuous core and the unrestricted legacy proposal.
      *      mode4_operation,mode4_trial_limit
          write(6,*)'Mode 4 heartbeat/component fraction:',
      *      mode4_heartbeat_interval,mode4_component_core_fraction
+         write(6,*)'Mode 4 calibration proposal:',
+     *      mode4_calibration_proposal
       endif
 c
  1    mcall_max	= 0
@@ -987,7 +1006,7 @@ c     filerz=aaoradgen-pi0-1.6-0811.rz.0, for example.
       endif
       if (sampling_mode .eq. 4 .and. mode4_operation .eq. 1) then
          open(unit=19,file=file_mode4_calibration,status='replace')
-         write(19,'(A)')'# schema=aao-rad-mode4-calibration-events-v1'
+         write(19,'(A)')'# schema=aao-rad-mode4-calibration-events-v2'
          write(19,'(A)')'trial,proposal_component,inside_core,'
      *      //'proposal_density_ratio,integrand_corrected,'
      *      //'component_importance_weight,r_u,r_ep,u_gamma,'
@@ -998,10 +1017,10 @@ c     filerz=aaoradgen-pi0-1.6-0811.rz.0, for example.
       endif
       if (sampling_mode .eq. 4) then
          open(unit=18,file=file_mode4_heartbeat,status='replace')
-         write(18,'(A)')'# schema=aao-rad-mode4-heartbeat-v1'
-         write(18,'(A)')'proposals,events,core_trials,legacy_trials,'
+         write(18,'(A)')'# schema=aao-rad-mode4-heartbeat-v2'
+         write(18,'(A)')'proposals,events,core_trials,noncore_trials,'
      *      //'internal_rows,final_candidates,target_candidates,'
-     *      //'core_targets,legacy_targets,core_events,legacy_events,'
+     *      //'core_targets,noncore_targets,core_events,noncore_events,'
      *      //'mcall_max'
          write(18,9010)ntries,nevent,mode4_core_trials,
      *      mode4_legacy_trials,mode4_internal_rows,
@@ -1218,6 +1237,17 @@ c     distributed according to the Mo-Tsai integrand.
             mode4_core_trials=mode4_core_trials+1
          else
             mode4_legacy_trials=mode4_legacy_trials+1
+            if (mode4_operation .eq. 1 .and.
+     *          mode4_calibration_proposal .eq. 1) then
+               call mode4_sample_complement(r_u,r_ep,uek,
+     *            hadron_cosine_base,hadron_phi_base,
+     *            mode4_ru_low,mode4_ru_high,
+     *            mode4_rep_low,mode4_rep_high,
+     *            mode4_ugamma_low,mode4_ugamma_high,
+     *            mode4_hcos_low,mode4_hcos_high,
+     *            mode4_hphi_origin,mode4_hphi_relative_low,
+     *            mode4_hphi_relative_high)
+            endif
          endif
       endif
       if(flag_ehel.eq.1) ehel = get_spin(idum)
@@ -1276,6 +1306,12 @@ c     Cut off the incident energy at e_s=ebeam/4.
          q2=1./uq2
          r_ep=mode4_rep_low+
      *      (mode4_rep_high-mode4_rep_low)*myran()
+         ep=epmax-eprng*r_ep
+      elseif (sampling_mode .eq. 4 .and.
+     *        mode4_operation .eq. 1 .and.
+     *        mode4_calibration_proposal .eq. 1) then
+         uq2=uq2_min+uq2rng*r_u
+         q2=1./uq2
          ep=epmax-eprng*r_ep
       elseif (proposal_component .eq. 1) then
          proposal_q2_bin=min(int(survey_nq2_bins*myran())+1,
@@ -1494,6 +1530,11 @@ c     choose ek by making a change of variables
      *    proposal_component .eq. 1) then
          uek=mode4_ugamma_low+
      *      (mode4_ugamma_high-mode4_ugamma_low)*myran()
+      elseif (sampling_mode .eq. 4 .and.
+     *        mode4_operation .eq. 1 .and.
+     *        mode4_calibration_proposal .eq. 1) then
+c        The guard-complement component was sampled once at trial start.
+         uek=uek
       else
          uek=myran()
       endif
@@ -1525,6 +1566,11 @@ c     choose ek by making a change of variables
      *      myran()
          hadron_phi_base=modulo(mode4_hphi_origin+
      *      mode4_hphi_relative,1.)
+         phicm=360.*hadron_phi_base
+      elseif (sampling_mode .eq. 4 .and.
+     *        mode4_operation .eq. 1 .and.
+     *        mode4_calibration_proposal .eq. 1) then
+         csthcm=-1.+2.*hadron_cosine_base
          phicm=360.*hadron_phi_base
       elseif (proposal_component .eq. 1) then
          proposal_t_bin=min(int(survey_nt_bins*myran())+1,
@@ -1776,9 +1822,19 @@ c     part of the sampled probability space rather than an afterthought.
             mode4_legacy_targets=mode4_legacy_targets+1
          endif
          if (mode4_operation .eq. 1) then
-            if (proposal_component .eq. 1) then
+            if (mode4_calibration_proposal .eq. 1) then
+               if (proposal_component .eq. 1) then
+                  mode4_component_weight=(mode4_core_fraction+
+     *               mode4_legacy_fraction*mode4_core_volume)/
+     *               mode4_component_core_fraction
+               else
+                  mode4_component_weight=(mode4_legacy_fraction*
+     *               (1.-mode4_core_volume))/
+     *               (1.-mode4_component_core_fraction)
+               endif
+            elseif (proposal_component .eq. 1) then
                mode4_component_weight=mode4_core_fraction/
-     *            mode4_component_core_fraction
+     *               mode4_component_core_fraction
             else
                mode4_component_weight=mode4_legacy_fraction/
      *            (1.-mode4_component_core_fraction)
@@ -2311,8 +2367,10 @@ Clcs      call hrend('aaoradgen')
          write(15,*)'survey_emits_lund=0'
       endif
       if (sampling_mode .eq. 4)then
-         write(15,*)'mode4_schema=aao-rad-mode4-v2'
+         write(15,*)'mode4_schema=aao-rad-mode4-v3'
          write(15,*)'mode4_operation=',mode4_operation
+         write(15,*)'mode4_calibration_proposal=',
+     *      mode4_calibration_proposal
          write(15,*)'mode4_trial_limit=',mode4_trial_limit
          write(15,*)'mode4_heartbeat_interval=',
      *      mode4_heartbeat_interval
@@ -2391,6 +2449,45 @@ Cvpk      CALL bos_end(recname)
 
        write(6,*)' END OF LOOP'
        stop
+      end
+
+c   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+      subroutine mode4_sample_complement(r_u,r_ep,u_gamma,hcos,hphi,
+     * ru_low,ru_high,rep_low,rep_high,ugamma_low,ugamma_high,
+     * hcos_low,hcos_high,hphi_origin,hphi_relative_low,
+     * hphi_relative_high)
+
+c     Draw uniformly from the complement of the five-dimensional guard.
+c     Rejection from the unit hypercube is exact.  This operation is used
+c     only by fixed-trial calibration; production retains the unrestricted
+c     legacy component and its full-support mixture correction.
+
+      implicit none
+
+      real r_u,r_ep,u_gamma,hcos,hphi
+      real ru_low,ru_high,rep_low,rep_high
+      real ugamma_low,ugamma_high,hcos_low,hcos_high
+      real hphi_origin,hphi_relative_low,hphi_relative_high
+      real relative_phi,myran
+      integer inside
+
+ 10   r_u=myran()
+      r_ep=myran()
+      u_gamma=myran()
+      hcos=myran()
+      hphi=myran()
+      inside=1
+      if (r_u .lt. ru_low .or. r_u .gt. ru_high)inside=0
+      if (r_ep .lt. rep_low .or. r_ep .gt. rep_high)inside=0
+      if (u_gamma .lt. ugamma_low .or.
+     *    u_gamma .gt. ugamma_high)inside=0
+      if (hcos .lt. hcos_low .or. hcos .gt. hcos_high)inside=0
+      relative_phi=modulo(hphi-hphi_origin+.5,1.)-.5
+      if (relative_phi .lt. hphi_relative_low .or.
+     *    relative_phi .gt. hphi_relative_high)inside=0
+      if (inside .eq. 1)go to 10
+      return
       end
 
 c   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%

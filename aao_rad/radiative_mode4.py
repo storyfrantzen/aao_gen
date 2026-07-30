@@ -29,10 +29,10 @@ import radiative_guards
 import radiative_survey
 
 
-MANIFEST_SCHEMA = "aao-rad-mode4-manifest-v2"
-RUN_SCHEMA = "aao-rad-mode4-run-v2"
+MANIFEST_SCHEMA = "aao-rad-mode4-manifest-v3"
+RUN_SCHEMA = "aao-rad-mode4-run-v3"
 WEIGHTS_SCHEMA = "aao-rad-mode4-weights-v1"
-CALIBRATION_SCHEMA = "aao-rad-mode4-envelope-calibration-v1"
+CALIBRATION_SCHEMA = "aao-rad-mode4-envelope-calibration-v2"
 RECIPE_SCHEMA = "aao-rad-continuous-guard-recipes-v1"
 SAMPLING_MODE = 4
 MODE4_KINEMATICS_FILENAME = "aao_rad.mode4.csv"
@@ -55,23 +55,23 @@ MODE4_KINEMATICS_COLUMNS = (
     "integrand_corrected",
 )
 MODE4_HEARTBEAT_FILENAME = "aao_rad.mode4.heartbeat.csv"
-MODE4_HEARTBEAT_SCHEMA = "aao-rad-mode4-heartbeat-v1"
+MODE4_HEARTBEAT_SCHEMA = "aao-rad-mode4-heartbeat-v2"
 MODE4_HEARTBEAT_COLUMNS = (
     "proposals",
     "events",
     "core_trials",
-    "legacy_trials",
+    "noncore_trials",
     "internal_rows",
     "final_candidates",
     "target_candidates",
     "core_targets",
-    "legacy_targets",
+    "noncore_targets",
     "core_events",
-    "legacy_events",
+    "noncore_events",
     "mcall_max",
 )
 MODE4_CALIBRATION_FILENAME = "aao_rad.mode4.calibration.csv"
-MODE4_CALIBRATION_EVENT_SCHEMA = "aao-rad-mode4-calibration-events-v1"
+MODE4_CALIBRATION_EVENT_SCHEMA = "aao-rad-mode4-calibration-events-v2"
 MODE4_CALIBRATION_COLUMNS = (
     "trial",
     "proposal_component",
@@ -141,6 +141,7 @@ class GuardBox:
                 "width": self.phi_relative[1] - self.phi_relative[0],
             },
             "normalized_volume": self.volume,
+            "u_gamma_soft_endpoint_anchored": True,
         }
 
 
@@ -197,7 +198,11 @@ def reconstruct_guard_box(recipe: dict, base_padding: float) -> GuardBox:
             if bool(axis["periodic"]):
                 raise ValueError(f"{name} is unexpectedly periodic")
             lower = max(0.0, float(axis["lower"]) - amount)
-            upper = min(1.0, float(axis["upper"]) + amount)
+            upper = (
+                1.0
+                if name == "u_gamma"
+                else min(1.0, float(axis["upper"]) + amount)
+            )
         except (KeyError, TypeError, ValueError) as error:
             if isinstance(error, ValueError) and "unexpectedly" in str(error):
                 raise
@@ -267,6 +272,10 @@ def _guard_box_from_manifest(record: dict) -> GuardBox:
         raise Mode4Error("manifest contains a malformed guard box") from error
     if not _close(box.volume, float(guard["normalized_volume"])):
         raise Mode4Error("manifest guard volume differs from its bounds")
+    if not bool(guard.get("u_gamma_soft_endpoint_anchored")):
+        raise Mode4Error("manifest guard lacks the soft-photon endpoint anchor")
+    if not _close(box.nonperiodic["u_gamma"][1], 1.0):
+        raise Mode4Error("manifest guard does not end at u_gamma=1")
     return box
 
 
@@ -318,6 +327,7 @@ def _mode4_trailer(
     trial_limit: int,
     heartbeat_interval: int,
     component_core_fraction: float,
+    calibration_proposal: int,
 ) -> str:
     axes = box.nonperiodic
     return "\n".join(
@@ -353,6 +363,7 @@ def _mode4_trailer(
             str(trial_limit),
             str(heartbeat_interval),
             f"{component_core_fraction:.17g}",
+            str(calibration_proposal),
         ]
     ) + "\n"
 
@@ -411,8 +422,13 @@ def prepare(args: argparse.Namespace) -> Path:
     calibration_trials = int(getattr(args, "trials", 0))
     heartbeat_interval = int(getattr(args, "heartbeat_interval", 100000))
     component_core_fraction = float(
-        getattr(args, "calibration_core_fraction", args.core_fraction)
+        getattr(
+            args,
+            "calibration_inside_guard_fraction",
+            getattr(args, "calibration_core_fraction", args.core_fraction),
+        )
     )
+    calibration_proposal = 1 if operation == "calibration" else 0
     if operation == "generation" and events_per_stratum <= 0:
         raise ValueError("--events-per-stratum must be positive")
     if operation == "calibration" and calibration_trials <= 0:
@@ -421,7 +437,8 @@ def prepare(args: argparse.Namespace) -> Path:
         raise ValueError("--heartbeat-interval must be positive")
     if not 0.0 < component_core_fraction < 1.0:
         raise ValueError(
-            "--calibration-core-fraction must lie strictly between zero and one"
+            "--inside-guard-trial-fraction must lie strictly between zero "
+            "and one"
         )
     if args.replicas <= 0:
         raise ValueError("--replicas must be positive")
@@ -494,6 +511,11 @@ def prepare(args: argparse.Namespace) -> Path:
                 f"{stratum.identifier}: recipe bounds differ from config"
             )
         box = reconstruct_guard_box(recipe, base_padding)
+        if operation == "calibration" and box.volume >= 1.0 - 1.0e-7:
+            raise ValueError(
+                f"{stratum.identifier}: the anchored guard fills the native "
+                "hypercube, so its complement cannot be calibrated"
+            )
         for replica_index in range(args.replicas):
             seed = (
                 args.seed_base + 1000 * stratum.flat_index + replica_index
@@ -518,6 +540,7 @@ def prepare(args: argparse.Namespace) -> Path:
                 ),
                 heartbeat_interval=heartbeat_interval,
                 component_core_fraction=component_core_fraction,
+                calibration_proposal=calibration_proposal,
             )
             (output / input_relative).write_text(text, encoding="utf-8")
             records.append(
@@ -579,7 +602,21 @@ def prepare(args: argparse.Namespace) -> Path:
         "calibration_trials_per_replica": (
             calibration_trials if operation == "calibration" else 0
         ),
+        "calibration_proposal": (
+            "guard_partition" if operation == "calibration" else None
+        ),
+        "calibration_component_mapping": (
+            {
+                "1": "inside_guard",
+                "0": "guard_complement",
+            }
+            if operation == "calibration"
+            else None
+        ),
         "component_core_fraction": component_core_fraction,
+        "calibration_inside_guard_fraction": (
+            component_core_fraction if operation == "calibration" else None
+        ),
         "heartbeat_interval": heartbeat_interval,
         "replicas_per_stratum": args.replicas,
         "sigr_max": sigr_max if operation == "generation" else None,
@@ -643,6 +680,9 @@ def _validate_norm(
         "mode4_operation": int(manifest["operation"] == "calibration"),
         "mode4_trial_limit": int(record["trials_requested"]),
         "mode4_heartbeat_interval": int(manifest["heartbeat_interval"]),
+        "mode4_calibration_proposal": int(
+            manifest["operation"] == "calibration"
+        ),
     }
     for name, expected in expected_ints.items():
         actual = _norm_int(norm, name)
@@ -805,14 +845,14 @@ def _validate_heartbeat(
         "proposals": _norm_int(norm, "ntries"),
         "events": _norm_int(norm, "nevent"),
         "core_trials": _norm_int(norm, "mode4_core_trials"),
-        "legacy_trials": _norm_int(norm, "mode4_legacy_trials"),
+        "noncore_trials": _norm_int(norm, "mode4_legacy_trials"),
         "internal_rows": _norm_int(norm, "mode4_internal_rows"),
         "final_candidates": _norm_int(norm, "mode4_final_candidates"),
         "target_candidates": _norm_int(norm, "mode4_target_candidates"),
         "core_targets": _norm_int(norm, "mode4_core_targets"),
-        "legacy_targets": _norm_int(norm, "mode4_legacy_targets"),
+        "noncore_targets": _norm_int(norm, "mode4_legacy_targets"),
         "core_events": _norm_int(norm, "mode4_core_events"),
-        "legacy_events": _norm_int(norm, "mode4_legacy_events"),
+        "noncore_events": _norm_int(norm, "mode4_legacy_events"),
         "mcall_max": _norm_int(norm, "mcall_max"),
     }
     if final != expected:
@@ -842,6 +882,8 @@ def _validate_calibration_diagnostics(
     alpha = float(manifest["core_fraction"])
     beta = float(manifest["component_core_fraction"])
     box = _guard_box_from_manifest(record)
+    inside_mass = alpha + (1.0 - alpha) * box.volume
+    complement_mass = (1.0 - alpha) * (1.0 - box.volume)
     bounds = record["bounds"]
     rows: list[dict[str, object]] = []
     previous_trial = 0
@@ -864,7 +906,11 @@ def _validate_calibration_diagnostics(
             raise Mode4Error(f"{path}: nonpositive target integrand")
         coordinates = {name: values[name] for name in AXES}
         expected_inside = int(box.contains(coordinates))
-        if inside != expected_inside or (component == 1 and inside != 1):
+        if (
+            inside != expected_inside
+            or (component == 1 and inside != 1)
+            or (component == 0 and inside != 0)
+        ):
             raise Mode4Error(f"{path}: inconsistent learned-core membership")
         expected_ratio = proposal_density_ratio(coordinates, box, alpha)
         if not math.isclose(
@@ -874,8 +920,8 @@ def _validate_calibration_diagnostics(
             abs_tol=3.0e-7,
         ):
             raise Mode4Error(f"{path}: inconsistent proposal correction")
-        expected_weight = alpha / beta if component == 1 else (
-            (1.0 - alpha) / (1.0 - beta)
+        expected_weight = inside_mass / beta if component == 1 else (
+            complement_mass / (1.0 - beta)
         )
         if not _close(
             values["component_importance_weight"], expected_weight
@@ -1107,12 +1153,20 @@ def run(args: argparse.Namespace) -> Path:
         ),
         "event_yield_per_proposal": events / _norm_int(norm, "ntries"),
         "core_trials": _norm_int(norm, "mode4_core_trials"),
+        "noncore_trials": _norm_int(norm, "mode4_legacy_trials"),
         "legacy_trials": _norm_int(norm, "mode4_legacy_trials"),
         "target_candidates": _norm_int(norm, "mode4_target_candidates"),
         "core_targets": _norm_int(norm, "mode4_core_targets"),
+        "noncore_targets": _norm_int(norm, "mode4_legacy_targets"),
         "legacy_targets": _norm_int(norm, "mode4_legacy_targets"),
         "core_events": event_summary["core_events"],
+        "noncore_events": event_summary["legacy_events"],
         "legacy_events": event_summary["legacy_events"],
+        "noncore_component": (
+            "guard_complement"
+            if manifest["operation"] == "calibration"
+            else "legacy"
+        ),
         "maximum_event_density_ratio": event_summary[
             "maximum_event_density_ratio"
         ],
@@ -1122,6 +1176,9 @@ def run(args: argparse.Namespace) -> Path:
         run_record["calibration_target_rows"] = len(calibration_rows)
         run_record["calibration_component_core_fraction"] = manifest[
             "component_core_fraction"
+        ]
+        run_record["calibration_proposal"] = manifest[
+            "calibration_proposal"
         ]
     _write_json(run_record_path, run_record)
     return run_record_path
@@ -1143,7 +1200,7 @@ def _quantile(values: list[float], probability: float) -> Optional[float]:
 def _component_summary(
     values: list[float],
     trials: int,
-    mixture_fraction: float,
+    production_probability_mass: float,
     phase_volume: float,
 ) -> dict[str, object]:
     if trials <= 0:
@@ -1158,11 +1215,16 @@ def _component_summary(
             (total_squared - total * total / trials) / (trials - 1),
         )
         variance_of_mean = variance / trials
-    integral = phase_volume * mixture_fraction * mean
-    sem = phase_volume * mixture_fraction * math.sqrt(variance_of_mean)
+    integral = phase_volume * production_probability_mass * mean
+    sem = (
+        phase_volume
+        * production_probability_mass
+        * math.sqrt(variance_of_mean)
+    )
     ess = total * total / total_squared if total_squared > 0.0 else 0.0
     return {
         "trials": trials,
+        "production_probability_mass": production_probability_mass,
         "target_candidates": len(values),
         "target_candidate_rate": len(values) / trials,
         "sum_corrected_integrand": total,
@@ -1181,11 +1243,12 @@ def _component_summary(
 
 def _envelope_evaluation(
     envelope: float,
-    core_values: list[float],
-    legacy_values: list[float],
-    core_trials: int,
-    legacy_trials: int,
-    core_fraction: float,
+    inside_values: list[float],
+    complement_values: list[float],
+    inside_trials: int,
+    complement_trials: int,
+    inside_probability_mass: float,
+    complement_probability_mass: float,
 ) -> dict[str, float]:
     def component(values: list[float], trials: int) -> tuple[float, float, float]:
         ratios = [value / envelope for value in values]
@@ -1194,23 +1257,25 @@ def _envelope_evaluation(
         duplicates = sum(max(0.0, ratio - 1.0) for ratio in ratios) / trials
         return emitted, emitting, duplicates
 
-    core_emitted, core_emitting, core_duplicates = component(
-        core_values, core_trials
+    inside_emitted, inside_emitting, inside_duplicates = component(
+        inside_values, inside_trials
     )
-    tail_emitted, tail_emitting, tail_duplicates = component(
-        legacy_values, legacy_trials
+    complement_emitted, complement_emitting, complement_duplicates = component(
+        complement_values, complement_trials
     )
-    tail_fraction = 1.0 - core_fraction
     emitted = (
-        core_fraction * core_emitted + tail_fraction * tail_emitted
+        inside_probability_mass * inside_emitted
+        + complement_probability_mass * complement_emitted
     )
     emitting = (
-        core_fraction * core_emitting + tail_fraction * tail_emitting
+        inside_probability_mass * inside_emitting
+        + complement_probability_mass * complement_emitting
     )
     duplicates = (
-        core_fraction * core_duplicates + tail_fraction * tail_duplicates
+        inside_probability_mass * inside_duplicates
+        + complement_probability_mass * complement_duplicates
     )
-    maximum = max(core_values + legacy_values, default=0.0)
+    maximum = max(inside_values + complement_values, default=0.0)
     return {
         "sigr_max": envelope,
         "expected_events_per_proposal": emitted,
@@ -1225,11 +1290,15 @@ def _envelope_evaluation(
         "observed_maximum_mcall_ratio": (
             maximum / envelope if envelope > 0.0 else math.inf
         ),
-        "expected_core_event_fraction": (
-            core_fraction * core_emitted / emitted if emitted > 0.0 else 0.0
+        "expected_inside_guard_event_fraction": (
+            inside_probability_mass * inside_emitted / emitted
+            if emitted > 0.0
+            else 0.0
         ),
-        "expected_tail_event_fraction": (
-            tail_fraction * tail_emitted / emitted if emitted > 0.0 else 0.0
+        "expected_guard_complement_event_fraction": (
+            complement_probability_mass * complement_emitted / emitted
+            if emitted > 0.0
+            else 0.0
         ),
     }
 
@@ -1254,11 +1323,11 @@ def _calibration_rows(path: Path) -> list[tuple[int, int, float]]:
 
 def _finalize_calibration(
     args: argparse.Namespace,
-    manifest_path: Path,
-    manifest: dict,
-    grouped: dict[str, list[tuple[dict, dict]]],
+    sources: list[tuple[Path, dict]],
+    grouped: dict[str, list[tuple[Path, dict, dict, Path]]],
 ) -> Path:
-    root = manifest_path.parent
+    first_manifest_path, manifest = sources[0]
+    root = first_manifest_path.parent
     safety_factor = float(getattr(args, "envelope_safety_factor", 1.2))
     maximum_duplicate_fraction = float(
         getattr(args, "maximum_duplicate_fraction", 0.05)
@@ -1266,71 +1335,85 @@ def _finalize_calibration(
     minimum_targets = int(
         getattr(args, "minimum_component_targets", 20)
     )
-    minimum_outside_targets = int(
-        getattr(args, "minimum_outside_targets", 5)
-    )
     if safety_factor < 1.0:
         raise ValueError("--envelope-safety-factor must be at least one")
     if not 0.0 <= maximum_duplicate_fraction < 1.0:
         raise ValueError("--maximum-duplicate-fraction must lie in [0,1)")
     if minimum_targets < 1:
         raise ValueError("--minimum-component-targets must be positive")
-    if minimum_outside_targets < 1:
-        raise ValueError("--minimum-outside-targets must be positive")
     alpha = float(manifest["core_fraction"])
     strata: list[dict[str, object]] = []
     for stratum_id, items in sorted(
-        grouped.items(), key=lambda item: int(item[1][0][0]["flat_index"])
+        grouped.items(), key=lambda item: int(item[1][0][1]["flat_index"])
     ):
-        core_values: list[float] = []
-        legacy_values: list[float] = []
-        legacy_inside_values: list[float] = []
-        legacy_outside_values: list[float] = []
-        for record, _run in items:
-            csv_path = root / (
+        inside_values: list[float] = []
+        complement_values: list[float] = []
+        for item_root, record, _run, _source_path in items:
+            csv_path = item_root / (
                 str(record["output_stem"]) + ".calibration.csv"
             )
             for component, inside, value in _calibration_rows(csv_path):
                 if component == 1:
-                    core_values.append(value)
+                    if inside != 1:
+                        raise Mode4Error(
+                            f"{csv_path}: inside-guard component escaped guard"
+                        )
+                    inside_values.append(value)
                 elif component == 0:
-                    legacy_values.append(value)
-                    if inside:
-                        legacy_inside_values.append(value)
-                    else:
-                        legacy_outside_values.append(value)
+                    if inside != 0:
+                        raise Mode4Error(
+                            f"{csv_path}: complement component entered guard"
+                        )
+                    complement_values.append(value)
                 else:
                     raise Mode4Error(f"{csv_path}: invalid component")
-        core_trials = sum(int(run["core_trials"]) for _, run in items)
-        legacy_trials = sum(int(run["legacy_trials"]) for _, run in items)
-        phase_volume = float(
-            radiative_survey.parse_norm(
-                root / (str(items[0][0]["output_stem"]) + ".norm")
-            )["mode4_phase_volume"]
+        inside_trials = sum(int(run["core_trials"]) for _, _, run, _ in items)
+        complement_trials = sum(
+            int(run["noncore_trials"]) for _, _, run, _ in items
         )
-        guard_volume = float(
-            items[0][0]["guard"]["normalized_volume"]
+        phase_volumes = [
+            float(
+                radiative_survey.parse_norm(
+                    item_root / (str(record["output_stem"]) + ".norm")
+                )["mode4_phase_volume"]
+            )
+            for item_root, record, _run, _source_path in items
+        ]
+        phase_volume = phase_volumes[0]
+        if any(not _close(value, phase_volume) for value in phase_volumes[1:]):
+            raise Mode4Error(
+                f"{stratum_id}: pooled runs disagree on phase-space volume"
+            )
+        first = items[0][1]
+        guard_volume = float(first["guard"]["normalized_volume"])
+        inside_mass = alpha + (1.0 - alpha) * guard_volume
+        complement_mass = (1.0 - alpha) * (1.0 - guard_volume)
+        inside_summary = _component_summary(
+            inside_values, inside_trials, inside_mass, phase_volume
         )
-        outside_support_required = guard_volume < 1.0 - 1.0e-12
-        core_summary = _component_summary(
-            core_values, core_trials, alpha, phase_volume
-        )
-        legacy_summary = _component_summary(
-            legacy_values, legacy_trials, 1.0 - alpha, phase_volume
+        complement_summary = _component_summary(
+            complement_values,
+            complement_trials,
+            complement_mass,
+            phase_volume,
         )
         sigma = (
-            float(core_summary["integrated_cross_section_microbarn"])
-            + float(legacy_summary["integrated_cross_section_microbarn"])
+            float(inside_summary["integrated_cross_section_microbarn"])
+            + float(complement_summary["integrated_cross_section_microbarn"])
         )
         sem = math.hypot(
-            float(core_summary["integrated_cross_section_sem_microbarn"]),
-            float(legacy_summary["integrated_cross_section_sem_microbarn"]),
+            float(inside_summary["integrated_cross_section_sem_microbarn"]),
+            float(
+                complement_summary[
+                    "integrated_cross_section_sem_microbarn"
+                ]
+            ),
         )
-        sources: list[tuple[str, float]] = []
+        envelope_sources: list[tuple[str, float]] = []
         for prefix, values in (
-            ("core", core_values),
-            ("tail", legacy_values),
-            ("all", core_values + legacy_values),
+            ("inside_guard", inside_values),
+            ("guard_complement", complement_values),
+            ("all", inside_values + complement_values),
         ):
             for label, probability in (
                 ("p90", 0.90),
@@ -1340,10 +1423,14 @@ def _finalize_calibration(
             ):
                 value = _quantile(values, probability)
                 if value is not None and value > 0.0:
-                    sources.append((f"{prefix}_{label}", safety_factor * value))
+                    envelope_sources.append(
+                        (f"{prefix}_{label}", safety_factor * value)
+                    )
         evaluations: list[dict[str, object]] = []
         seen: list[float] = []
-        for source, envelope in sorted(sources, key=lambda item: item[1]):
+        for source, envelope in sorted(
+            envelope_sources, key=lambda item: item[1]
+        ):
             if any(math.isclose(envelope, old, rel_tol=1.0e-12)
                    for old in seen):
                 continue
@@ -1353,22 +1440,18 @@ def _finalize_calibration(
                     "source": source,
                     **_envelope_evaluation(
                         envelope,
-                        core_values,
-                        legacy_values,
-                        core_trials,
-                        legacy_trials,
-                        alpha,
+                        inside_values,
+                        complement_values,
+                        inside_trials,
+                        complement_trials,
+                        inside_mass,
+                        complement_mass,
                     ),
                 }
             )
-        enough_support = (
-            len(core_values) >= minimum_targets
-            and len(legacy_values) >= minimum_targets
-            and (
-                not outside_support_required
-                or len(legacy_outside_values) >= minimum_outside_targets
-            )
-        )
+        inside_support = len(inside_values) >= minimum_targets
+        complement_support = len(complement_values) >= minimum_targets
+        enough_support = inside_support and complement_support
         acceptable = [
             item
             for item in evaluations
@@ -1378,39 +1461,26 @@ def _finalize_calibration(
         recommendation = (
             acceptable[0] if enough_support and acceptable else None
         )
-        first = items[0][0]
         strata.append(
             {
                 "stratum_id": stratum_id,
                 "flat_index": first["flat_index"],
                 "indices": first["indices"],
                 "bounds": first["bounds"],
-                "replicas": len(items),
-                "core": core_summary,
-                "legacy_tail": legacy_summary,
-                "legacy_tail_geometry": {
-                    "inside_core_target_candidates": len(
-                        legacy_inside_values
-                    ),
-                    "outside_core_target_candidates": len(
-                        legacy_outside_values
-                    ),
-                    "inside_core_integrand_maximum": (
-                        max(legacy_inside_values)
-                        if legacy_inside_values
-                        else None
-                    ),
-                    "outside_core_integrand_maximum": (
-                        max(legacy_outside_values)
-                        if legacy_outside_values
-                        else None
-                    ),
-                },
+                "calibration_runs": len(items),
+                "source_campaigns": len(
+                    {str(source_path) for *_, source_path in items}
+                ),
+                "guard_volume": guard_volume,
+                "inside_guard": inside_summary,
+                "guard_complement": complement_summary,
                 "integrated_cross_section_microbarn": sigma,
                 "integrated_cross_section_sem_microbarn": sem,
-                "estimated_tail_cross_section_fraction": (
+                "estimated_guard_complement_cross_section_fraction": (
                     float(
-                        legacy_summary["integrated_cross_section_microbarn"]
+                        complement_summary[
+                            "integrated_cross_section_microbarn"
+                        ]
                     ) / sigma
                     if sigma > 0.0
                     else None
@@ -1420,12 +1490,12 @@ def _finalize_calibration(
                     "recommended"
                     if recommendation is not None
                     else (
-                        "insufficient_tail_outside_core_support"
-                        if outside_support_required
-                        and len(legacy_outside_values)
-                        < minimum_outside_targets
-                        else "insufficient_component_target_support"
-                        if not enough_support
+                        "insufficient_both_component_target_support"
+                        if not inside_support and not complement_support
+                        else "insufficient_inside_guard_target_support"
+                        if not inside_support
+                        else "insufficient_guard_complement_target_support"
+                        if not complement_support
                         else "no_candidate_meets_duplicate_limit"
                     )
                 ),
@@ -1435,20 +1505,29 @@ def _finalize_calibration(
     payload: dict[str, object] = {
         "schema": CALIBRATION_SCHEMA,
         "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "source_manifest": str(manifest_path),
-        "source_manifest_sha256": _sha256(manifest_path),
+        "source_manifests": [
+            {
+                "path": str(path),
+                "sha256": _sha256(path),
+                "inside_guard_trial_fraction": source[
+                    "calibration_inside_guard_fraction"
+                ],
+                "trials_per_replica": source[
+                    "calibration_trials_per_replica"
+                ],
+                "replicas_per_stratum": source["replicas_per_stratum"],
+            }
+            for path, source in sources
+        ],
         "generator_revision": manifest["generator_revision"],
         "analysis_config_sha256": manifest["analysis_config_sha256"],
         "guard_recipes_sha256": manifest["guard_recipes_sha256"],
         "guard_candidate": manifest["guard_candidate"],
         "core_fraction": alpha,
-        "calibration_component_core_fraction": manifest[
-            "component_core_fraction"
-        ],
+        "calibration_proposal": "guard_partition",
         "envelope_safety_factor": safety_factor,
         "maximum_duplicate_fraction": maximum_duplicate_fraction,
         "minimum_component_targets": minimum_targets,
-        "minimum_outside_targets": minimum_outside_targets,
         "stratum_count": len(strata),
         "strata": strata,
     }
@@ -1470,9 +1549,9 @@ def _finalize_calibration(
                 "recommended_sigr_max",
                 "expected_events_per_proposal",
                 "expected_duplicate_event_fraction",
-                "core_targets",
-                "tail_targets",
-                "estimated_tail_cross_section_fraction",
+                "inside_guard_targets",
+                "guard_complement_targets",
+                "estimated_guard_complement_cross_section_fraction",
             ]
         )
         for stratum in strata:
@@ -1497,19 +1576,116 @@ def _finalize_calibration(
                         if recommendation is not None
                         else ""
                     ),
-                    stratum["core"]["target_candidates"],
-                    stratum["legacy_tail"]["target_candidates"],
-                    stratum["estimated_tail_cross_section_fraction"],
+                    stratum["inside_guard"]["target_candidates"],
+                    stratum["guard_complement"]["target_candidates"],
+                    stratum[
+                        "estimated_guard_complement_cross_section_fraction"
+                    ],
                 ]
             )
     return output
 
 
 def finalize(args: argparse.Namespace) -> Path:
-    manifest_path = args.manifest.resolve()
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("schema") != MANIFEST_SCHEMA:
-        raise ValueError(f"unsupported manifest schema: {manifest.get('schema')}")
+    raw_paths = getattr(args, "manifests", None)
+    if raw_paths is None:
+        raw_paths = [args.manifest]
+    manifest_paths = [path.resolve() for path in raw_paths]
+    if len(set(manifest_paths)) != len(manifest_paths):
+        raise ValueError("the same manifest was supplied more than once")
+    sources: list[tuple[Path, dict]] = []
+    for manifest_path in manifest_paths:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("schema") != MANIFEST_SCHEMA:
+            raise ValueError(
+                f"{manifest_path}: unsupported manifest schema "
+                f"{manifest.get('schema')}"
+            )
+        sources.append((manifest_path, manifest))
+    manifest_path, manifest = sources[0]
+    operation = manifest["operation"]
+    compatibility_keys = (
+        "operation",
+        "generator_revision",
+        "analysis_config_sha256",
+        "guard_recipes_sha256",
+        "guard_candidate",
+        "base_padding",
+        "core_fraction",
+        "analysis_selection",
+        "calibration_proposal",
+    )
+    for path, candidate in sources[1:]:
+        for name in compatibility_keys:
+            if candidate.get(name) != manifest.get(name):
+                raise Mode4Error(
+                    f"{path}: {name} is incompatible with "
+                    f"{manifest_path}"
+                )
+    if len(sources) > 1 and operation != "calibration":
+        raise ValueError(
+            "multiple-manifest pooling is supported only for calibration"
+        )
+
+    if operation == "calibration":
+        grouped_calibration: dict[
+            str, list[tuple[Path, dict, dict, Path]]
+        ] = {}
+        frozen_records: dict[str, dict[str, object]] = {}
+        seen_stratum_seeds: set[tuple[str, int]] = set()
+        for source_path, source in sources:
+            source_root = source_path.parent
+            for record in source["runs"]:
+                stratum_seed = (
+                    str(record["stratum_id"]),
+                    int(record["seed"]),
+                )
+                if stratum_seed in seen_stratum_seeds:
+                    raise Mode4Error(
+                        f"{source_path}: repeated seed {record['seed']} for "
+                        f"{record['stratum_id']} would double count or "
+                        "correlate calibration trials"
+                    )
+                seen_stratum_seeds.add(stratum_seed)
+                frozen = {
+                    name: record[name]
+                    for name in ("flat_index", "indices", "bounds", "guard")
+                }
+                old = frozen_records.setdefault(record["stratum_id"], frozen)
+                if old != frozen:
+                    raise Mode4Error(
+                        f"{source_path}: {record['stratum_id']} guard or "
+                        "analysis bounds differ across campaigns"
+                    )
+                run_path = source_root / (
+                    str(record["output_stem"]) + ".json"
+                )
+                if not run_path.is_file():
+                    raise FileNotFoundError(run_path)
+                completed = json.loads(run_path.read_text(encoding="utf-8"))
+                if completed.get("schema") != RUN_SCHEMA:
+                    raise Mode4Error(f"{run_path}: unsupported run schema")
+                if completed.get("source_manifest_sha256") != _sha256(
+                    source_path
+                ):
+                    raise Mode4Error(
+                        f"{run_path}: source manifest hash differs from "
+                        "the supplied manifest"
+                    )
+                for name in ("stratum_id", "flat_index", "replica_index"):
+                    if completed[name] != record[name]:
+                        raise Mode4Error(
+                            f"{run_path}: {name} differs from manifest"
+                        )
+                if completed.get("operation") != operation:
+                    raise Mode4Error(
+                        f"{run_path}: operation differs from manifest"
+                    )
+                grouped_calibration.setdefault(
+                    record["stratum_id"], []
+                ).append((source_root, record, completed, source_path))
+        return _finalize_calibration(args, sources, grouped_calibration)
+
     root = manifest_path.parent
     grouped: dict[str, list[tuple[dict, dict]]] = {}
     for record in manifest["runs"]:
@@ -1519,17 +1695,18 @@ def finalize(args: argparse.Namespace) -> Path:
         completed = json.loads(run_path.read_text(encoding="utf-8"))
         if completed.get("schema") != RUN_SCHEMA:
             raise Mode4Error(f"{run_path}: unsupported run schema")
+        if completed.get("source_manifest_sha256") != _sha256(manifest_path):
+            raise Mode4Error(
+                f"{run_path}: source manifest hash differs from the "
+                "supplied manifest"
+            )
         for name in ("stratum_id", "flat_index", "replica_index"):
             if completed[name] != record[name]:
                 raise Mode4Error(f"{run_path}: {name} differs from manifest")
-        if completed.get("operation") != manifest["operation"]:
+        if completed.get("operation") != operation:
             raise Mode4Error(f"{run_path}: operation differs from manifest")
         grouped.setdefault(record["stratum_id"], []).append(
             (record, completed)
-        )
-    if manifest["operation"] == "calibration":
-        return _finalize_calibration(
-            args, manifest_path, manifest, grouped
         )
     strata: list[dict[str, object]] = []
     for stratum_id, items in sorted(
@@ -1656,7 +1833,15 @@ def _parser() -> argparse.ArgumentParser:
     add_prepare_common(calibration_parser)
     calibration_parser.add_argument("--trials", type=int, required=True)
     calibration_parser.add_argument(
-        "--calibration-core-fraction", type=float, default=0.5
+        "--inside-guard-trial-fraction",
+        "--calibration-core-fraction",
+        dest="calibration_inside_guard_fraction",
+        type=float,
+        default=0.5,
+        help=(
+            "fraction of calibration trials drawn uniformly inside the "
+            "guard; the remainder are drawn from its exact complement"
+        ),
     )
 
     run_parser = subparsers.add_parser(
@@ -1669,9 +1854,13 @@ def _parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--overwrite", action="store_true")
 
     finalize_parser = subparsers.add_parser(
-        "finalize", help="pool replicas into one weight per stratum"
+        "finalize",
+        help=(
+            "pool generation replicas, or compatible calibration campaigns, "
+            "by stratum"
+        ),
     )
-    finalize_parser.add_argument("manifest", type=Path)
+    finalize_parser.add_argument("manifests", type=Path, nargs="+")
     finalize_parser.add_argument("--output", type=Path)
     finalize_parser.add_argument(
         "--envelope-safety-factor", type=float, default=1.2
@@ -1681,9 +1870,6 @@ def _parser() -> argparse.ArgumentParser:
     )
     finalize_parser.add_argument(
         "--minimum-component-targets", type=int, default=20
-    )
-    finalize_parser.add_argument(
-        "--minimum-outside-targets", type=int, default=5
     )
     return parser
 
