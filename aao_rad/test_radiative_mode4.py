@@ -310,6 +310,16 @@ class ProposalTests(unittest.TestCase):
                 stratum_id="s00000",
             )
 
+    def test_zero_success_upper_rate_is_exact_and_stable(self) -> None:
+        trials = 5_750_000
+        confidence = 0.95
+        expected = 1.0 - (1.0 - confidence) ** (1.0 / trials)
+        observed = radiative_mode4._zero_success_upper_rate(
+            trials, confidence
+        )
+        self.assertAlmostEqual(observed, expected, places=15)
+        self.assertLess(observed, 1.0e-6)
+
 
 class WorkflowTests(unittest.TestCase):
     def test_prepare_snapshots_provenance_and_writes_mode4_trailer(self) -> None:
@@ -582,6 +592,8 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(
                 report["schema"], radiative_mode4.CALIBRATION_SCHEMA
             )
+            self.assertEqual(len(report["finalizer_source_sha256"]), 64)
+            self.assertTrue(report["finalizer_revision"])
             self.assertEqual(report["stratum_count"], 1)
             self.assertEqual(len(report["source_manifests"]), 2)
             result = report["strata"][0]
@@ -612,6 +624,105 @@ class WorkflowTests(unittest.TestCase):
                     "expected_duplicate_event_fraction"
                 ],
                 0.05,
+            )
+            for source_manifest in (
+                manifest_path,
+                second_manifest_path,
+            ):
+                source = json.loads(
+                    source_manifest.read_text(encoding="utf-8")
+                )
+                for record in source["runs"]:
+                    csv_path = source_manifest.parent / (
+                        record["output_stem"] + ".calibration.csv"
+                    )
+                    lines = csv_path.read_text(encoding="utf-8").splitlines()
+                    inside_only = lines[:2] + [
+                        line
+                        for line in lines[2:]
+                        if line.split(",")[1] == "1"
+                    ]
+                    csv_path.write_text(
+                        "\n".join(inside_only) + "\n", encoding="utf-8"
+                    )
+            strict_zero_path = radiative_mode4.finalize(
+                argparse.Namespace(
+                    manifests=[manifest_path, second_manifest_path],
+                    output=root / "strict_zero.json",
+                    envelope_safety_factor=1.2,
+                    maximum_duplicate_fraction=0.05,
+                    minimum_component_targets=5,
+                    allow_zero_complement=False,
+                    zero_complement_confidence=0.95,
+                    maximum_zero_complement_target_rate=0.01,
+                )
+            )
+            strict_zero = json.loads(
+                strict_zero_path.read_text(encoding="utf-8")
+            )["strata"][0]
+            self.assertEqual(
+                strict_zero["recommendation_status"],
+                "insufficient_guard_complement_target_support",
+            )
+            insufficient_path = radiative_mode4.finalize(
+                argparse.Namespace(
+                    manifests=[manifest_path, second_manifest_path],
+                    output=root / "insufficient_zero_exposure.json",
+                    envelope_safety_factor=1.2,
+                    maximum_duplicate_fraction=0.05,
+                    minimum_component_targets=5,
+                    allow_zero_complement=True,
+                    zero_complement_confidence=0.95,
+                    maximum_zero_complement_target_rate=1.0e-12,
+                )
+            )
+            insufficient = json.loads(
+                insufficient_path.read_text(encoding="utf-8")
+            )["strata"][0]
+            self.assertEqual(
+                insufficient["recommendation_status"],
+                "insufficient_zero_complement_exposure",
+            )
+            provisional_path = radiative_mode4.finalize(
+                argparse.Namespace(
+                    manifests=[manifest_path, second_manifest_path],
+                    output=root / "provisional.json",
+                    envelope_safety_factor=1.2,
+                    maximum_duplicate_fraction=0.05,
+                    minimum_component_targets=5,
+                    allow_zero_complement=True,
+                    zero_complement_confidence=0.95,
+                    maximum_zero_complement_target_rate=0.01,
+                )
+            )
+            provisional_report = json.loads(
+                provisional_path.read_text(encoding="utf-8")
+            )
+            provisional = provisional_report["strata"][0]
+            self.assertEqual(
+                provisional["recommendation_status"],
+                "provisional_zero_complement",
+            )
+            self.assertEqual(
+                provisional["pilot_readiness"],
+                "ready_provisional_zero_complement",
+            )
+            self.assertTrue(
+                provisional["recommended_envelope"]["provisional"]
+            )
+            self.assertTrue(
+                provisional["zero_complement_stopping_test"][
+                    "passes_rate_threshold"
+                ]
+            )
+            self.assertTrue(
+                provisional_report["zero_complement_policy"]["enabled"]
+            )
+            self.assertIn(
+                "zero_complement_upper_target_rate",
+                provisional_path.with_suffix(".tsv").read_text(
+                    encoding="utf-8"
+                ).splitlines()[0],
             )
 
 

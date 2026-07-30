@@ -260,7 +260,7 @@ The resulting `envelope_calibration.json` reports:
 - corrected-integrand quantiles and observed maxima;
 - expected event yield, emitting-proposal rate, duplicate fraction, and
   maximum observed `mcall` ratio for each candidate envelope;
-- a recommendation only when both disjoint regions have enough target
+- a strict recommendation only when both disjoint regions have enough target
   support.
 
 If the report says `insufficient_guard_complement_target_support`, add a
@@ -301,6 +301,60 @@ Pooling requires identical generator revision, configuration and recipe
 hashes, guard candidate, production core fraction, selections, and per-stratum
 guard bounds. Trial allocation, trial count, replica count, and seed may
 differ. Duplicate manifests and repeated stratum seeds are rejected.
+
+### Provisional zero-complement stopping rule
+
+A well-tuned guard may produce no complement targets even after a large,
+independent complement-directed campaign. The default finalizer remains
+strict and will not recommend an envelope in that case. An explicit opt-in
+policy can instead certify a small production pilot:
+
+```bash
+python3 radiative_mode4.py finalize \
+  refined_equal_allocation/manifest.json \
+  refined_complement_heavy/manifest.json \
+  --envelope-safety-factor 1.20 \
+  --maximum-duplicate-fraction 0.05 \
+  --minimum-component-targets 20 \
+  --allow-zero-complement \
+  --zero-complement-confidence 0.95 \
+  --maximum-zero-complement-target-rate 1e-6 \
+  --output refined_provisional_envelope.json
+```
+
+For zero observed complement targets in `N` independent complement trials,
+the report evaluates the exact one-sided binomial upper occurrence rate:
+
+```text
+p_upper = 1 - (1 - confidence)^(1/N)
+```
+
+The provisional policy is allowed only when:
+
+- the inside guard meets `--minimum-component-targets`;
+- exactly zero complement targets were observed;
+- `p_upper` does not exceed the configured maximum target rate;
+- an inside-derived envelope meets the duplicate-fraction requirement.
+
+If even one complement target is observed, the zero-target exception is
+disabled and the ordinary component-support requirement remains in force.
+The resulting status is `provisional_zero_complement`, not `recommended`.
+The JSON and TSV record:
+
+- the confidence level, complement trial count, exact upper occurrence rate,
+  and configured threshold;
+- the finalizer's repository revision and exact source-file hash;
+- the recommendation basis and provisional flag;
+- `pilot_readiness=ready_provisional_zero_complement`;
+- a warning that the occurrence-rate bound does **not** bound an unseen
+  event's cross section or corrected-integrand magnitude.
+
+The envelope's predicted yield and duplicate metrics are conditional on the
+observed calibration sample. Full proposal support and stochastic
+multiplicity preserve correctness if a complement event later exceeds the
+inside-derived envelope, but such an event can create duplicates and reduce
+effective precision. Therefore this policy authorizes only a small monitored
+pilot before broader production.
 
 ## Generate after calibration
 

@@ -32,7 +32,7 @@ import radiative_survey
 MANIFEST_SCHEMA = "aao-rad-mode4-manifest-v3"
 RUN_SCHEMA = "aao-rad-mode4-run-v3"
 WEIGHTS_SCHEMA = "aao-rad-mode4-weights-v1"
-CALIBRATION_SCHEMA = "aao-rad-mode4-envelope-calibration-v2"
+CALIBRATION_SCHEMA = "aao-rad-mode4-envelope-calibration-v3"
 RECIPE_SCHEMA = "aao-rad-continuous-guard-recipes-v1"
 REFINEMENT_SCHEMA = "aao-rad-mode4-guard-refinements-v1"
 REFINEMENT_COORDINATE_SPACE = "post_padding_guard_bounds"
@@ -153,6 +153,24 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _source_revision() -> str:
+    """Best-effort revision of the repository containing this wrapper."""
+    completed = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(Path(__file__).resolve().parent),
+            "rev-parse",
+            "HEAD",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    revision = completed.stdout.strip()
+    return revision if completed.returncode == 0 and revision else "UNKNOWN"
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
@@ -1677,6 +1695,15 @@ def _calibration_rows(path: Path) -> list[tuple[int, int, float]]:
         ]
 
 
+def _zero_success_upper_rate(trials: int, confidence: float) -> float:
+    """Exact one-sided binomial upper rate after zero observed successes."""
+    if trials <= 0:
+        raise ValueError("zero-success bound requires positive trials")
+    if not 0.0 < confidence < 1.0:
+        raise ValueError("zero-success confidence must lie in (0,1)")
+    return -math.expm1(math.log1p(-confidence) / trials)
+
+
 def _finalize_calibration(
     args: argparse.Namespace,
     sources: list[tuple[Path, dict]],
@@ -1691,12 +1718,30 @@ def _finalize_calibration(
     minimum_targets = int(
         getattr(args, "minimum_component_targets", 20)
     )
+    allow_zero_complement = bool(
+        getattr(args, "allow_zero_complement", False)
+    )
+    zero_complement_confidence = float(
+        getattr(args, "zero_complement_confidence", 0.95)
+    )
+    maximum_zero_complement_target_rate = float(
+        getattr(args, "maximum_zero_complement_target_rate", 1.0e-6)
+    )
     if safety_factor < 1.0:
         raise ValueError("--envelope-safety-factor must be at least one")
     if not 0.0 <= maximum_duplicate_fraction < 1.0:
         raise ValueError("--maximum-duplicate-fraction must lie in [0,1)")
     if minimum_targets < 1:
         raise ValueError("--minimum-component-targets must be positive")
+    if not 0.0 < zero_complement_confidence < 1.0:
+        raise ValueError(
+            "--zero-complement-confidence must lie strictly between zero "
+            "and one"
+        )
+    if not 0.0 < maximum_zero_complement_target_rate < 1.0:
+        raise ValueError(
+            "--maximum-zero-complement-target-rate must lie in (0,1)"
+        )
     alpha = float(manifest["core_fraction"])
     strata: list[dict[str, object]] = []
     for stratum_id, items in sorted(
@@ -1808,15 +1853,86 @@ def _finalize_calibration(
         inside_support = len(inside_values) >= minimum_targets
         complement_support = len(complement_values) >= minimum_targets
         enough_support = inside_support and complement_support
+        complement_zero = not complement_values
+        zero_upper_rate = (
+            _zero_success_upper_rate(
+                complement_trials, zero_complement_confidence
+            )
+            if complement_zero
+            else None
+        )
+        zero_rate_passes = (
+            zero_upper_rate is not None
+            and zero_upper_rate <= maximum_zero_complement_target_rate
+        )
         acceptable = [
             item
             for item in evaluations
             if float(item["expected_duplicate_event_fraction"])
             <= maximum_duplicate_fraction
         ]
-        recommendation = (
-            acceptable[0] if enough_support and acceptable else None
+        strict_recommendation = enough_support and bool(acceptable)
+        provisional_recommendation = (
+            allow_zero_complement
+            and inside_support
+            and complement_zero
+            and zero_rate_passes
+            and bool(acceptable)
         )
+        recommendation: Optional[dict[str, object]] = None
+        recommendation_status: str
+        recommendation_basis: Optional[str] = None
+        pilot_readiness = "not_ready"
+        if strict_recommendation:
+            recommendation = {
+                **acceptable[0],
+                "provisional": False,
+                "basis": "both_calibration_components_observed",
+            }
+            recommendation_status = "recommended"
+            recommendation_basis = str(recommendation["basis"])
+            pilot_readiness = "ready"
+        elif provisional_recommendation:
+            recommendation = {
+                **acceptable[0],
+                "provisional": True,
+                "basis": (
+                    "inside_guard_observed_with_zero_complement_rate_bound"
+                ),
+                "unobserved_complement_warning": (
+                    "Expected yield and duplicate metrics do not include an "
+                    "unobserved complement contribution; stochastic "
+                    "multiplicity preserves correctness if one appears."
+                ),
+            }
+            recommendation_status = "provisional_zero_complement"
+            recommendation_basis = str(recommendation["basis"])
+            pilot_readiness = "ready_provisional_zero_complement"
+        elif not inside_support and not complement_support:
+            recommendation_status = (
+                "insufficient_both_component_target_support"
+            )
+        elif not inside_support:
+            recommendation_status = "insufficient_inside_guard_target_support"
+        elif (
+            complement_zero
+            and allow_zero_complement
+            and not zero_rate_passes
+        ):
+            recommendation_status = "insufficient_zero_complement_exposure"
+        elif (
+            complement_zero
+            and allow_zero_complement
+            and zero_rate_passes
+            and not acceptable
+        ):
+            recommendation_status = "no_candidate_meets_duplicate_limit"
+        elif not complement_support:
+            recommendation_status = (
+                "insufficient_guard_complement_target_support"
+            )
+        else:
+            recommendation_status = "no_candidate_meets_duplicate_limit"
         strata.append(
             {
                 "stratum_id": stratum_id,
@@ -1842,25 +1958,30 @@ def _finalize_calibration(
                     else None
                 ),
                 "envelope_candidates": evaluations,
-                "recommendation_status": (
-                    "recommended"
-                    if recommendation is not None
-                    else (
-                        "insufficient_both_component_target_support"
-                        if not inside_support and not complement_support
-                        else "insufficient_inside_guard_target_support"
-                        if not inside_support
-                        else "insufficient_guard_complement_target_support"
-                        if not complement_support
-                        else "no_candidate_meets_duplicate_limit"
-                    )
-                ),
+                "zero_complement_stopping_test": {
+                    "policy_enabled": allow_zero_complement,
+                    "observed_complement_targets": len(complement_values),
+                    "complement_trials": complement_trials,
+                    "confidence_level": zero_complement_confidence,
+                    "one_sided_upper_target_rate": zero_upper_rate,
+                    "maximum_allowed_target_rate": (
+                        maximum_zero_complement_target_rate
+                    ),
+                    "passes_rate_threshold": zero_rate_passes,
+                    "bounds_occurrence_rate_only": True,
+                    "does_not_bound_cross_section_or_integrand_magnitude": True,
+                },
+                "recommendation_status": recommendation_status,
+                "recommendation_basis": recommendation_basis,
+                "pilot_readiness": pilot_readiness,
                 "recommended_envelope": recommendation,
             }
         )
     payload: dict[str, object] = {
         "schema": CALIBRATION_SCHEMA,
         "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "finalizer_revision": _source_revision(),
+        "finalizer_source_sha256": _sha256(Path(__file__).resolve()),
         "source_manifests": [
             {
                 "path": str(path),
@@ -1887,6 +2008,14 @@ def _finalize_calibration(
         "envelope_safety_factor": safety_factor,
         "maximum_duplicate_fraction": maximum_duplicate_fraction,
         "minimum_component_targets": minimum_targets,
+        "zero_complement_policy": {
+            "enabled": allow_zero_complement,
+            "confidence_level": zero_complement_confidence,
+            "maximum_target_rate": maximum_zero_complement_target_rate,
+            "bounds_occurrence_rate_only": True,
+            "does_not_bound_cross_section_or_integrand_magnitude": True,
+            "strict_observed_complement_rule_retained": True,
+        },
         "stratum_count": len(strata),
         "strata": strata,
     }
@@ -1905,11 +2034,15 @@ def _finalize_calibration(
                 "flat_index",
                 "stratum_id",
                 "recommendation_status",
+                "pilot_readiness",
+                "recommendation_basis",
                 "recommended_sigr_max",
                 "expected_events_per_proposal",
                 "expected_duplicate_event_fraction",
                 "inside_guard_targets",
                 "guard_complement_targets",
+                "zero_complement_upper_target_rate",
+                "zero_complement_rate_threshold",
                 "estimated_guard_complement_cross_section_fraction",
             ]
         )
@@ -1920,6 +2053,8 @@ def _finalize_calibration(
                     stratum["flat_index"],
                     stratum["stratum_id"],
                     stratum["recommendation_status"],
+                    stratum["pilot_readiness"],
+                    stratum["recommendation_basis"] or "",
                     (
                         recommendation["sigr_max"]
                         if recommendation is not None
@@ -1937,6 +2072,12 @@ def _finalize_calibration(
                     ),
                     stratum["inside_guard"]["target_candidates"],
                     stratum["guard_complement"]["target_candidates"],
+                    stratum["zero_complement_stopping_test"][
+                        "one_sided_upper_target_rate"
+                    ],
+                    stratum["zero_complement_stopping_test"][
+                        "maximum_allowed_target_rate"
+                    ],
                     stratum[
                         "estimated_guard_complement_cross_section_fraction"
                     ],
@@ -2105,6 +2246,8 @@ def finalize(args: argparse.Namespace) -> Path:
     payload: dict[str, object] = {
         "schema": WEIGHTS_SCHEMA,
         "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "finalizer_revision": _source_revision(),
+        "finalizer_source_sha256": _sha256(Path(__file__).resolve()),
         "source_manifest": str(manifest_path),
         "source_manifest_sha256": _sha256(manifest_path),
         "generator_revision": manifest["generator_revision"],
@@ -2272,6 +2415,31 @@ def _parser() -> argparse.ArgumentParser:
     )
     finalize_parser.add_argument(
         "--minimum-component-targets", type=int, default=20
+    )
+    finalize_parser.add_argument(
+        "--allow-zero-complement",
+        action="store_true",
+        help=(
+            "allow a provisional inside-derived envelope after zero observed "
+            "complement targets pass the configured occurrence-rate bound"
+        ),
+    )
+    finalize_parser.add_argument(
+        "--zero-complement-confidence",
+        type=float,
+        default=0.95,
+        help=(
+            "one-sided binomial confidence level for zero complement targets"
+        ),
+    )
+    finalize_parser.add_argument(
+        "--maximum-zero-complement-target-rate",
+        type=float,
+        default=1.0e-6,
+        help=(
+            "largest allowed upper occurrence-rate bound for a provisional "
+            "zero-complement envelope"
+        ),
     )
     return parser
 
