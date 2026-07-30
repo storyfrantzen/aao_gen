@@ -993,31 +993,39 @@ def _validate_proposal_mapping(
             )
         if int(row["proposal_component"]) == 1:
             binning = proposal_spec["binning"]
+            proposal_coordinates = _proposal_density_coordinates(row)
+            if proposal_coordinates is None:
+                raise SurveyValidationError(
+                    f"trial {row['trial']} has no physical proposal xB"
+                )
+            proposal_q2, proposal_xb, proposal_t, proposal_phi = (
+                proposal_coordinates
+            )
             values = (
                 (
                     "proposal_q2_bin",
-                    float(row["q2_leptonic"]),
+                    proposal_q2,
                     binning["Q2"],
                     COORDINATE_TOLERANCES["q2_observed"],
                     False,
                 ),
                 (
                     "proposal_xb_bin",
-                    float(row["xb_leptonic"]),
+                    proposal_xb,
                     binning["xB"],
                     COORDINATE_TOLERANCES["xb_observed"],
                     False,
                 ),
                 (
                     "proposal_t_bin",
-                    float(row["minus_t_hard"]),
+                    proposal_t,
                     binning["minus_t"],
                     COORDINATE_TOLERANCES["minus_t_observed"],
                     False,
                 ),
                 (
                     "proposal_phi_bin",
-                    float(row["phi_cm_deg"]),
+                    proposal_phi,
                     binning["phi_deg"],
                     COORDINATE_TOLERANCES["phi_observed_deg"],
                     True,

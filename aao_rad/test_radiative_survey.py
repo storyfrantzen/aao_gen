@@ -192,6 +192,7 @@ class ProposalDensityTests(unittest.TestCase):
         }
 
         first = radiative_survey._proposal_density_ratio(row, norm, spec)
+        reconstructed = radiative_survey._proposal_density_coordinates(row)
         row["xb_leptonic"] = 0.300002
         second = radiative_survey._proposal_density_ratio(row, norm, spec)
         boundary_candidates = (
@@ -201,6 +202,7 @@ class ProposalDensityTests(unittest.TestCase):
         )
 
         self.assertAlmostEqual(first, second)
+        self.assertAlmostEqual(reconstructed[1], proposal_xb)
         self.assertGreater(len(boundary_candidates), 1)
         self.assertTrue(
             any(
