@@ -165,6 +165,20 @@ c     and make a new version.
       real proposal_xb,proposal_minus_t,proposal_t_jacobian
       real proposal_t_at_cosine_zero
       real proposal_balanced_to_legacy
+      real mode4_core_fraction,mode4_legacy_fraction
+      real mode4_base_padding,mode4_core_volume
+      real mode4_q2_low,mode4_q2_high
+      real mode4_xb_low,mode4_xb_high
+      real mode4_t_low,mode4_t_high
+      real mode4_phi_low,mode4_phi_high
+      real mode4_w_minimum,mode4_y_maximum
+      real mode4_ru_low,mode4_ru_high
+      real mode4_rep_low,mode4_rep_high
+      real mode4_ugamma_low,mode4_ugamma_high
+      real mode4_hcos_low,mode4_hcos_high
+      real mode4_hphi_origin,mode4_hphi_relative_low
+      real mode4_hphi_relative_high,mode4_hphi_relative
+      real mode4_density_denominator
 
       integer dismc(6,100)
       integer intreg
@@ -184,6 +198,9 @@ c      integer iext
       integer proposal_component,proposal_q2_bin,proposal_xb_bin
       integer proposal_t_bin,proposal_phi_bin,proposal_mapping_status
       integer candidate_status,coordinate_status,final_valid
+      integer mode4_apply_y_max,mode4_stratum_status
+      integer stratum_flat,stratum_iq2,stratum_ixb,stratum_it
+      integer stratum_iphi
       integer nprint,ntell,ntold
 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
       integer get_spin
@@ -195,6 +212,11 @@ cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
       integer*8 survey_ntrials,survey_seed,survey_replica
       integer*8 survey_rows,survey_final_valid
       integer*8 survey_legacy_trials,survey_balanced_trials
+      integer*8 mode4_seed,mode4_replica
+      integer*8 mode4_core_trials,mode4_legacy_trials
+      integer*8 mode4_internal_rows,mode4_final_candidates
+      integer*8 mode4_target_candidates
+      integer*8 mode4_core_events,mode4_legacy_events
       
       real cfac,asig
 
@@ -220,6 +242,7 @@ c     character*1 ich1
       character*13 file_norm
       character*13 file_bos
       character*18 file_survey
+      character*18 file_mode4
       character*8 recname
       character*28  ctime
 
@@ -247,6 +270,7 @@ c     character*1 ich1
       data file_norm /'aao_rad.norm'/
       data file_bos /'aao_rad.bos'/
       data file_survey /'aao_rad.survey.csv'/
+      data file_mode4 /'aao_rad.mode4.csv'/
       data ctime    /'                            '/
 
       do j=1,6
@@ -440,7 +464,7 @@ c     Select the number of events desired in the rz file
       read(5,*)nmax
       print *, 'Number of events in the ntuple=', nmax
       
-      nprint	= nmax/25
+      nprint	= max(1,nmax/25)
 
       write(6,*)' Input a multiplication factor for sigr_max'
       read(5,*)fmcall
@@ -461,8 +485,8 @@ c
 c     Optional backward-compatible sampling trailer.  Legacy input files end
 c     above and therefore retain sampling_mode=0.  Fixed-trial survey mode 1
 c     requires an exact proposal count, explicit nonzero seed, and replica ID.
-c     A second optional survey record selects either the original proposal
-c     (0) or a full-support legacy/analysis-balanced mixture (1).
+c     Mode 4 generates one final-LUND analysis stratum from an exact mixture
+c     of a learned continuous core and the unrestricted legacy proposal.
 
       sampling_mode=0
       survey_ntrials=0
@@ -475,14 +499,29 @@ c     (0) or a full-support legacy/analysis-balanced mixture (1).
       survey_nxb_bins=0
       survey_nt_bins=0
       survey_nphi_bins=0
+      mode4_seed=0
+      mode4_replica=0
+      mode4_core_fraction=0.
+      mode4_legacy_fraction=0.
+      mode4_base_padding=0.
+      mode4_core_volume=0.
+      mode4_apply_y_max=0
+      mode4_y_maximum=1.
+      stratum_flat=-1
+      stratum_iq2=-1
+      stratum_ixb=-1
+      stratum_it=-1
+      stratum_iphi=-1
       read(5,*,iostat=input_status)sampling_mode
       if (input_status .lt. 0) sampling_mode=0
       if (input_status .gt. 0) then
          write(6,*)'Invalid optional sampling mode input'
          stop 2
       endif
-      if (sampling_mode .ne. 0 .and. sampling_mode .ne. 1) then
-         write(6,*)'sampling_mode must be 0 (legacy) or 1 (survey)'
+      if (sampling_mode .ne. 0 .and. sampling_mode .ne. 1 .and.
+     *    sampling_mode .ne. 4) then
+         write(6,*)'sampling_mode must be 0 (legacy), 1 (survey),'
+     *      //' or 4 (bin conditional)'
          stop 2
       endif
       if (sampling_mode .eq. 1) then
@@ -627,6 +666,141 @@ c     (0) or a full-support legacy/analysis-balanced mixture (1).
          write(6,*)'Survey proposal mode:',survey_proposal_mode
          write(6,*)'Survey legacy fraction:',survey_legacy_fraction
       endif
+      if (sampling_mode .eq. 4) then
+         read(5,*,iostat=input_status)mode4_seed
+         if (input_status .ne. 0 .or. mode4_seed .eq. 0) then
+            write(6,*)'Mode 4 requires an explicit nonzero seed'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)mode4_replica
+         if (input_status .ne. 0 .or. mode4_replica .lt. 0) then
+            write(6,*)'Mode 4 requires a nonnegative replica ID'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)stratum_flat,stratum_iq2,
+     *      stratum_ixb,stratum_it,stratum_iphi
+         if (input_status .ne. 0 .or. stratum_flat .lt. 0 .or.
+     *       stratum_iq2 .lt. 0 .or. stratum_ixb .lt. 0 .or.
+     *       stratum_it .lt. 0 .or. stratum_iphi .lt. 0) then
+            write(6,*)'Mode 4 requires nonnegative stratum indices'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)mode4_q2_low,mode4_q2_high
+         if (input_status .ne. 0) stop 2
+         read(5,*,iostat=input_status)mode4_xb_low,mode4_xb_high
+         if (input_status .ne. 0) stop 2
+         read(5,*,iostat=input_status)mode4_t_low,mode4_t_high
+         if (input_status .ne. 0) stop 2
+         read(5,*,iostat=input_status)mode4_phi_low,mode4_phi_high
+         if (input_status .ne. 0) stop 2
+         if (mode4_q2_high .le. mode4_q2_low .or.
+     *       mode4_xb_high .le. mode4_xb_low .or.
+     *       mode4_t_high .le. mode4_t_low .or.
+     *       mode4_phi_high .le. mode4_phi_low) then
+            write(6,*)'Mode 4 stratum bounds must increase'
+            stop 2
+         endif
+         if (mode4_q2_low .lt. q2_min .or.
+     *       mode4_q2_high .gt. q2_max .or.
+     *       mode4_xb_low .le. 0. .or. mode4_t_low .lt. 0. .or.
+     *       mode4_phi_low .lt. 0. .or.
+     *       mode4_phi_high .gt. 360.) then
+            write(6,*)'Mode 4 stratum bounds exceed generator domain'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)mode4_w_minimum
+         if (input_status .ne. 0 .or. mode4_w_minimum .le. 0.) then
+            write(6,*)'Mode 4 requires a positive W minimum'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)mode4_apply_y_max,
+     *      mode4_y_maximum
+         if (input_status .ne. 0 .or.
+     *       (mode4_apply_y_max .ne. 0 .and.
+     *        mode4_apply_y_max .ne. 1) .or.
+     *       mode4_y_maximum .le. 0. .or.
+     *       mode4_y_maximum .gt. 1.) then
+            write(6,*)'Invalid optional mode-4 y selection'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)mode4_core_fraction
+         if (input_status .ne. 0 .or. mode4_core_fraction .le. 0.
+     *       .or. mode4_core_fraction .ge. 1.) then
+            write(6,*)'Mode 4 core fraction must lie in (0,1)'
+            stop 2
+         endif
+         mode4_legacy_fraction=1.-mode4_core_fraction
+         read(5,*,iostat=input_status)mode4_base_padding
+         if (input_status .ne. 0 .or. mode4_base_padding .lt. 0.) then
+            write(6,*)'Mode 4 base padding must be nonnegative'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)mode4_core_volume
+         if (input_status .ne. 0 .or. mode4_core_volume .le. 0.
+     *       .or. mode4_core_volume .gt. 1.) then
+            write(6,*)'Mode 4 core volume must lie in (0,1]'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)mode4_ru_low,mode4_ru_high
+         if (input_status .ne. 0) stop 2
+         read(5,*,iostat=input_status)mode4_rep_low,mode4_rep_high
+         if (input_status .ne. 0) stop 2
+         read(5,*,iostat=input_status)mode4_ugamma_low,
+     *      mode4_ugamma_high
+         if (input_status .ne. 0) stop 2
+         read(5,*,iostat=input_status)mode4_hcos_low,
+     *      mode4_hcos_high
+         if (input_status .ne. 0) stop 2
+         if (mode4_ru_low .lt. 0. .or. mode4_ru_high .gt. 1. .or.
+     *       mode4_ru_high .le. mode4_ru_low .or.
+     *       mode4_rep_low .lt. 0. .or. mode4_rep_high .gt. 1. .or.
+     *       mode4_rep_high .le. mode4_rep_low .or.
+     *       mode4_ugamma_low .lt. 0. .or.
+     *       mode4_ugamma_high .gt. 1. .or.
+     *       mode4_ugamma_high .le. mode4_ugamma_low .or.
+     *       mode4_hcos_low .lt. 0. .or. mode4_hcos_high .gt. 1.
+     *       .or. mode4_hcos_high .le. mode4_hcos_low) then
+            write(6,*)'Invalid nonperiodic mode-4 guard bounds'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)mode4_hphi_origin,
+     *      mode4_hphi_relative_low,mode4_hphi_relative_high
+         if (input_status .ne. 0 .or. mode4_hphi_origin .lt. 0.
+     *       .or. mode4_hphi_origin .ge. 1. .or.
+     *       mode4_hphi_relative_low .lt. -.5 .or.
+     *       mode4_hphi_relative_high .gt. .5 .or.
+     *       mode4_hphi_relative_high .le.
+     *          mode4_hphi_relative_low) then
+            write(6,*)'Invalid periodic mode-4 guard bounds'
+            stop 2
+         endif
+         mode4_density_denominator=
+     *      (mode4_ru_high-mode4_ru_low)*
+     *      (mode4_rep_high-mode4_rep_low)*
+     *      (mode4_ugamma_high-mode4_ugamma_low)*
+     *      (mode4_hcos_high-mode4_hcos_low)*
+     *      (mode4_hphi_relative_high-mode4_hphi_relative_low)
+         if (abs(mode4_density_denominator-mode4_core_volume)
+     *       .gt. 2.e-5*mode4_core_volume) then
+            write(6,*)'Mode 4 core volume disagrees with guard bounds'
+            stop 2
+         endif
+         if (fmcall .ne. 0. .or. sigr_max .le. 0.) then
+            write(6,*)'Mode 4 requires fmcall=0 and positive sigr_max'
+            stop 2
+         endif
+         if (epirea .ne. 1 .or. npart .ne. 4) then
+            write(6,*)'Mode 4 currently requires pi0 and npart=4'
+            stop 2
+         endif
+         write(6,*)'Radiative bin-conditional mode 4'
+         write(6,*)'Mode 4 seed/replica:',mode4_seed,mode4_replica
+         write(6,*)'Mode 4 stratum:',stratum_flat,stratum_iq2,
+     *      stratum_ixb,stratum_it,stratum_iphi
+         write(6,*)'Mode 4 core/tail fractions:',
+     *      mode4_core_fraction,mode4_legacy_fraction
+         write(6,*)'Mode 4 core volume:',mode4_core_volume
+      endif
 c
  1    mcall_max	= 0
       ntold	= 0
@@ -636,6 +810,13 @@ c
       survey_sig_internal_tot=0.
       survey_legacy_trials=0
       survey_balanced_trials=0
+      mode4_core_trials=0
+      mode4_legacy_trials=0
+      mode4_internal_rows=0
+      mode4_final_candidates=0
+      mode4_target_candidates=0
+      mode4_core_events=0
+      mode4_legacy_events=0
 
 c     Use the internal clock to initialize the random number generator
 
@@ -673,6 +854,8 @@ c     Use the internal clock to initialize the random number generator
       do i=1,ssize
          if (sampling_mode .eq. 1) then
             seed_value = abs(survey_seed) + 7919_8*i
+         elseif (sampling_mode .eq. 4) then
+            seed_value = abs(mode4_seed) + 7919_8*i
          else
             seed_value = timevals(8) + 1000_8*timevals(7)
      *         + 100000_8*timevals(6) + 10000000_8*timevals(5)
@@ -731,6 +914,16 @@ c     filerz=aaoradgen-pi0-1.6-0811.rz.0, for example.
      *   //'trial_xsec_observed_microbarn,rotation_deg,'
      *   //'incoming_loss_fraction,outgoing_loss_fraction'
       endif
+      if (sampling_mode .eq. 4) then
+         open(unit=17,file=file_mode4,status='replace')
+         write(17,'(A)')'# schema=aao-rad-mode4-events-v1'
+         write(17,'(A)')'event,proposal_component,'
+     *      //'proposal_density_ratio,r_u,r_ep,u_gamma,'
+     *      //'hadron_cosine_base,hadron_phi_base,'
+     *      //'q2_observed,xb_observed,'
+     *      //'minus_t_observed,phi_observed_deg,w_observed,'
+     *      //'y_observed,integrand_corrected'
+      endif
 
 c     Initialize BOS
      
@@ -774,6 +967,7 @@ c     This requires a jacobian. Jacobian=1./(kexp*uek)=(1./kexp)exp(kexp*ek)
          sigr_max=0.
          go to 20
       endif
+      if (sampling_mode .eq. 4)go to 20
       if (fmcall .eq. 0.)then
          write(6,*)' sigr_max from input data =',sigr_max
          write(12,*)' sigr_max from input data =',sigr_max
@@ -912,6 +1106,14 @@ c     distributed according to the Mo-Tsai integrand.
          endif
       elseif (sampling_mode .eq. 1) then
          survey_legacy_trials=survey_legacy_trials+1
+      elseif (sampling_mode .eq. 4) then
+         proposal_selector=myran()
+         if (proposal_selector .lt. mode4_core_fraction) then
+            proposal_component=1
+            mode4_core_trials=mode4_core_trials+1
+         else
+            mode4_legacy_trials=mode4_legacy_trials+1
+         endif
       endif
       if(flag_ehel.eq.1) ehel = get_spin(idum)
 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
@@ -961,7 +1163,16 @@ c     Cut off the incident energy at e_s=ebeam/4.
       ps	= sqrt(es**2-mel**2)
       rs	= ps/es
 
-      if (proposal_component .eq. 1) then
+      if (sampling_mode .eq. 4 .and.
+     *    proposal_component .eq. 1) then
+         r_u=mode4_ru_low+
+     *      (mode4_ru_high-mode4_ru_low)*myran()
+         uq2=uq2_min+uq2rng*r_u
+         q2=1./uq2
+         r_ep=mode4_rep_low+
+     *      (mode4_rep_high-mode4_rep_low)*myran()
+         ep=epmax-eprng*r_ep
+      elseif (proposal_component .eq. 1) then
          proposal_q2_bin=min(int(survey_nq2_bins*myran())+1,
      *      survey_nq2_bins)
          q2=survey_q2_edges(proposal_q2_bin)+
@@ -1174,7 +1385,13 @@ c     end of jan 19, 1999 correction
       
 c     choose ek by making a change of variables
 
- 78   uek	= myran()
+ 78   if (sampling_mode .eq. 4 .and.
+     *    proposal_component .eq. 1) then
+         uek=mode4_ugamma_low+
+     *      (mode4_ugamma_high-mode4_ugamma_low)*myran()
+      else
+         uek=myran()
+      endif
  
       if (uek .lt. 0.1E-20)then
         write(6,*)' Main-6: uek =',uek
@@ -1193,7 +1410,18 @@ c     choose ek by making a change of variables
          if (proposal_mapping_status .ne. 0)go to 20
       endif
 
-      if (proposal_component .eq. 1) then
+      if (sampling_mode .eq. 4 .and.
+     *    proposal_component .eq. 1) then
+         hadron_cosine_base=mode4_hcos_low+
+     *      (mode4_hcos_high-mode4_hcos_low)*myran()
+         csthcm=-1.+2.*hadron_cosine_base
+         mode4_hphi_relative=mode4_hphi_relative_low+
+     *      (mode4_hphi_relative_high-mode4_hphi_relative_low)*
+     *      myran()
+         hadron_phi_base=modulo(mode4_hphi_origin+
+     *      mode4_hphi_relative,1.)
+         phicm=360.*hadron_phi_base
+      elseif (proposal_component .eq. 1) then
          proposal_t_bin=min(int(survey_nt_bins*myran())+1,
      *      survey_nt_bins)
          proposal_minus_t=survey_t_edges(proposal_t_bin)+
@@ -1390,6 +1618,98 @@ c     integrand and gives invalid final candidates zero observed contribution.
      *      survey_nphi_bins,survey_phi_edges,
      *      proposal_balanced_to_legacy,proposal_density_ratio)
          sigr=sigr*proposal_density_ratio
+      endif
+
+c     Mode 4 samples a full-support mixture in the five learned native
+c     coordinates.  Correct every point by q_legacy/q_mixture, including
+c     legacy-component points that happen to lie inside the learned core.
+
+      if (sampling_mode .eq. 4) then
+         call mode4_proposal_ratio(r_u,r_ep,uek,
+     *      hadron_cosine_base,hadron_phi_base,
+     *      mode4_core_fraction,mode4_core_volume,
+     *      mode4_ru_low,mode4_ru_high,
+     *      mode4_rep_low,mode4_rep_high,
+     *      mode4_ugamma_low,mode4_ugamma_high,
+     *      mode4_hcos_low,mode4_hcos_high,
+     *      mode4_hphi_origin,mode4_hphi_relative_low,
+     *      mode4_hphi_relative_high,proposal_density_ratio)
+         sigr=sigr*proposal_density_ratio
+         mode4_internal_rows=mode4_internal_rows+1
+      endif
+
+c     A radiative stratum is defined from the final LUND electron and proton.
+c     Construct one complete post-external-loss candidate before applying the
+c     stratum indicator and acceptance-rejection.  This makes outgoing loss
+c     part of the sampled probability space rather than an afterthought.
+
+      if (sampling_mode .eq. 4) then
+         ep_sav=ep
+         call build_final_candidate(ebeam,es,ep_sav,ep,ep_min,th0,
+     *      theta,ek,cstk,phik,mpi_s,csthcm,phicm,targp,delta,
+     *      ppx,ppy,ppz,eprot,ppix,ppiy,ppiz,epi,ekx,eky,ekz,
+     *      wreal,mm2,epw,phir,outgoing_loss_base,
+     *      outgoing_loss_accept_test,candidate_status)
+         if (candidate_status .ne. 0)go to 30
+         mode4_final_candidates=mode4_final_candidates+1
+         call observed_analysis_coordinates(ebeam,analysis_mp,
+     *      q2_obs,xb_obs,minus_t_obs,phi_obs,w_obs,y_obs,
+     *      coordinate_status)
+         if (coordinate_status .ne. 0)go to 30
+         call mode4_stratum_membership(q2_obs,xb_obs,minus_t_obs,
+     *      phi_obs,w_obs,y_obs,mode4_q2_low,mode4_q2_high,
+     *      mode4_xb_low,mode4_xb_high,mode4_t_low,mode4_t_high,
+     *      mode4_phi_low,mode4_phi_high,mode4_w_minimum,
+     *      mode4_apply_y_max,mode4_y_maximum,
+     *      mode4_stratum_status)
+         if (mode4_stratum_status .ne. 0)go to 30
+         mode4_target_candidates=mode4_target_candidates+1
+         sig_tot=sig_tot+dble(sigr)
+         sig_ratio=sigr/sigr_max
+         rtest=myran()
+         mcall=sig_ratio
+         stest=sig_ratio-mcall
+         if (stest .gt. rtest)mcall=mcall+1
+         if (mcall .gt. mcall_max)mcall_max=mcall
+         if (mcall .eq. 0)go to 30
+         if (mcall .lt. 100)then
+            dismc(intreg,mcall)=dismc(intreg,mcall)+1
+         else
+            dismc(intreg,100)=dismc(intreg,100)+1
+         endif
+         lundmass(1)=MEL
+         lundmass(4)=0.
+         lundmass(2)=MP
+         lundmass(3)=MPI
+         do j=1,mcall
+            write(13,*) "4 1 1 0 0 ",
+     *         q2/(2.0*MP*(ebeam-p(1,4))),0,epw,
+     *         q2,(ebeam-p(1,4))
+            write(13,*)1,q(1),1,pdgid(1),0,0,
+     *         p(1,1),p(1,2),p(1,3),p(1,4),
+     *         lundmass(1),vertex_x,vertex_y,vertex_z
+            write(13,*)2,q(2),1,pdgid(2),0,0,
+     *         p(2,1),p(2,2),p(2,3),p(2,4),
+     *         lundmass(2),vertex_x,vertex_y,vertex_z
+            write(13,*)3,q(3),1,pdgid(3),0,0,
+     *         p(3,1),p(3,2),p(3,3),p(3,4),
+     *         lundmass(3),vertex_x,vertex_y,vertex_z
+            write(13,*)4,q(4),1,pdgid(4),0,0,
+     *         p(4,1),p(4,2),p(4,3),p(4,4),
+     *         lundmass(4),vertex_x,vertex_y,vertex_z
+            nevent=nevent+1
+            if (proposal_component .eq. 1) then
+               mode4_core_events=mode4_core_events+1
+            else
+               mode4_legacy_events=mode4_legacy_events+1
+            endif
+            write(17,9002)nevent,proposal_component,
+     *         proposal_density_ratio,r_u,r_ep,uek,
+     *         hadron_cosine_base,hadron_phi_base,
+     *         q2_obs,xb_obs,minus_t_obs,
+     *         phi_obs,w_obs,y_obs,sigr
+         enddo
+         go to 124
       endif
 
       if (sampling_mode .eq. 1) then
@@ -1676,7 +1996,8 @@ C          t_elapse	= t_elapse+INT(itime2-itime1)
 
 c     Do we have enough events in the n-tuple?
 
-       if (nevent .gt. nmax)go to 50
+       if (sampling_mode .eq. 4 .and. nevent .ge. nmax)go to 50
+       if (sampling_mode .ne. 4 .and. nevent .gt. nmax)go to 50
        
  30    go to 20
 
@@ -1714,10 +2035,35 @@ Clcs      call hrend('aaoradgen')
          write(12,*)' Survey observed cross section =',sig_sum,
      *      ' micro-barns'
       endif
+      if (sampling_mode .eq. 4)then
+         tries=ntries
+         events=nevent
+         sig_int=events/tries*sigr_max*analysis_volume
+         sig_sum=sig_tot*analysis_volume/tries
+         write(6,*)' Mode-4 proposals/events =',ntries,nevent
+         write(6,*)' Mode-4 core/legacy trials =',
+     *      mode4_core_trials,mode4_legacy_trials
+         write(6,*)' Mode-4 final/target candidates =',
+     *      mode4_final_candidates,mode4_target_candidates
+         write(6,*)' Mode-4 core/legacy events =',
+     *      mode4_core_events,mode4_legacy_events
+         write(6,*)' Mode-4 integrated cross section =',
+     *      sig_int,sig_sum,' micro-barns'
+         write(12,*)' Mode-4 proposals/events =',ntries,nevent
+         write(12,*)' Mode-4 core/legacy trials =',
+     *      mode4_core_trials,mode4_legacy_trials
+         write(12,*)' Mode-4 final/target candidates =',
+     *      mode4_final_candidates,mode4_target_candidates
+         write(12,*)' Mode-4 core/legacy events =',
+     *      mode4_core_events,mode4_legacy_events
+         write(12,*)' Mode-4 integrated cross section =',
+     *      sig_int,sig_sum,' micro-barns'
+      endif
 
       close(12)
       close(13)
       if (sampling_mode .eq. 1)close(16)
+      if (sampling_mode .eq. 4)close(17)
 
       open(unit=14,file=file_sum)
       
@@ -1743,14 +2089,22 @@ Clcs      call hrend('aaoradgen')
       if (sampling_mode .eq. 0)then
          write(14,*)' Beam time at Lum=1.0E34 =',events/sig_sum*1.E-4
      *      ,' seconds'
-      else
+      elseif (sampling_mode .eq. 1)then
          write(14,*)' Survey rows, final valid =',
      *      survey_rows,survey_final_valid
          write(14,*)' Survey internal cross section =',
      *      survey_sig_internal_tot*analysis_volume/tries
+      else
+         write(14,*)' Mode-4 core/legacy trials =',
+     *      mode4_core_trials,mode4_legacy_trials
+         write(14,*)' Mode-4 final/target candidates =',
+     *      mode4_final_candidates,mode4_target_candidates
+         write(14,*)' Mode-4 core/legacy events =',
+     *      mode4_core_events,mode4_legacy_events
       endif
       write(14,*)' Elapsed CPU time = ',t_elapse/60,' minutes'
-      if (sampling_mode .eq. 0 .and. nevent .gt. 0)then
+      if ((sampling_mode .eq. 0 .or. sampling_mode .eq. 4)
+     *    .and. nevent .gt. 0)then
          write(14,*)' CPU time/event = ', t_elapse/nevent,' sec'
       endif
 
@@ -1805,6 +2159,41 @@ Clcs      call hrend('aaoradgen')
          write(15,*)'survey_observed_sig_sum=',sig_sum
          write(15,*)'survey_emits_lund=0'
       endif
+      if (sampling_mode .eq. 4)then
+         write(15,*)'mode4_schema=aao-rad-mode4-v1'
+         write(15,*)'mode4_event_file=',file_mode4
+         write(15,*)'mode4_seed=',mode4_seed
+         write(15,*)'mode4_replica=',mode4_replica
+         write(15,*)'stratum_flat_index=',stratum_flat
+         write(15,*)'stratum_iq2=',stratum_iq2
+         write(15,*)'stratum_ixb=',stratum_ixb
+         write(15,*)'stratum_it=',stratum_it
+         write(15,*)'stratum_iphi=',stratum_iphi
+         write(15,*)'mode4_q2_low=',mode4_q2_low
+         write(15,*)'mode4_q2_high=',mode4_q2_high
+         write(15,*)'mode4_xb_low=',mode4_xb_low
+         write(15,*)'mode4_xb_high=',mode4_xb_high
+         write(15,*)'mode4_t_low=',mode4_t_low
+         write(15,*)'mode4_t_high=',mode4_t_high
+         write(15,*)'mode4_phi_low=',mode4_phi_low
+         write(15,*)'mode4_phi_high=',mode4_phi_high
+         write(15,*)'mode4_w_minimum=',mode4_w_minimum
+         write(15,*)'mode4_apply_y_max=',mode4_apply_y_max
+         write(15,*)'mode4_y_maximum=',mode4_y_maximum
+         write(15,*)'mode4_core_fraction=',mode4_core_fraction
+         write(15,*)'mode4_legacy_fraction=',mode4_legacy_fraction
+         write(15,*)'mode4_base_padding=',mode4_base_padding
+         write(15,*)'mode4_core_volume=',mode4_core_volume
+         write(15,*)'mode4_core_trials=',mode4_core_trials
+         write(15,*)'mode4_legacy_trials=',mode4_legacy_trials
+         write(15,*)'mode4_internal_rows=',mode4_internal_rows
+         write(15,*)'mode4_final_candidates=',mode4_final_candidates
+         write(15,*)'mode4_target_candidates=',mode4_target_candidates
+         write(15,*)'mode4_core_events=',mode4_core_events
+         write(15,*)'mode4_legacy_events=',mode4_legacy_events
+         write(15,*)'mode4_event_weight_microbarn=',sig_sum/events
+         write(15,*)'mode4_lund_structure=legacy-four-particle'
+      endif
       close(unit=15)
 
       write(14,1425)reg1,reg2-reg1,reg3-reg2, reg4-reg3,1.-reg4
@@ -1816,6 +2205,7 @@ Clcs      call hrend('aaoradgen')
 
  1410 format(' Distribution of mcall values, region', i2 /10(1x,10i7/))
  9001 format(I0,10(',',I0),51(',',ES24.16E3))
+ 9002 format(I0,',',I0,13(',',ES24.16E3))
 
       close(14)
 Cvpk      CALL bos_end(recname)
@@ -1823,7 +2213,82 @@ Cvpk      CALL bos_end(recname)
  99   continue
 
        write(6,*)' END OF LOOP'
-      stop
+       stop
+      end
+
+c   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+      subroutine mode4_proposal_ratio(r_u,r_ep,u_gamma,hcos,hphi,
+     * core_fraction,core_volume,ru_low,ru_high,rep_low,rep_high,
+     * ugamma_low,ugamma_high,hcos_low,hcos_high,hphi_origin,
+     * hphi_relative_low,hphi_relative_high,density_ratio)
+
+c     Return q_legacy/q_mixture for
+c
+c       q_mixture = core_fraction*q_core
+c                 + (1-core_fraction)*q_legacy.
+c
+c     q_core is uniform in one five-dimensional native-coordinate box and
+c     zero outside it.  q_legacy is uniform on the complete unit hypercube.
+c     The periodic hadron-phi coordinate is compared relative to the frozen
+c     recipe origin.
+
+      implicit none
+
+      real r_u,r_ep,u_gamma,hcos,hphi
+      real core_fraction,core_volume
+      real ru_low,ru_high,rep_low,rep_high
+      real ugamma_low,ugamma_high,hcos_low,hcos_high
+      real hphi_origin,hphi_relative_low,hphi_relative_high
+      real density_ratio,legacy_fraction,relative_phi,denominator
+      integer inside
+
+      legacy_fraction=1.-core_fraction
+      density_ratio=1./legacy_fraction
+      inside=1
+      if (r_u .lt. ru_low .or. r_u .gt. ru_high)inside=0
+      if (r_ep .lt. rep_low .or. r_ep .gt. rep_high)inside=0
+      if (u_gamma .lt. ugamma_low .or.
+     *    u_gamma .gt. ugamma_high)inside=0
+      if (hcos .lt. hcos_low .or. hcos .gt. hcos_high)inside=0
+      relative_phi=modulo(hphi-hphi_origin+.5,1.)-.5
+      if (relative_phi .lt. hphi_relative_low .or.
+     *    relative_phi .gt. hphi_relative_high)inside=0
+      if (inside .eq. 1)then
+         denominator=legacy_fraction+core_fraction/core_volume
+         density_ratio=1./denominator
+      endif
+      return
+      end
+
+c   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+      subroutine mode4_stratum_membership(q2,xb,minus_t,phi,w,y,
+     * q2_low,q2_high,xb_low,xb_high,t_low,t_high,phi_low,phi_high,
+     * w_minimum,apply_y_max,y_maximum,status)
+
+c     Classify the exact final-LUND analysis coordinates used by mode 4.
+c     Bounds are inclusive within roundoff.  The unrestricted proposal and
+c     physical checks remain outside this routine.
+
+      implicit none
+
+      real q2,xb,minus_t,phi,w,y
+      real q2_low,q2_high,xb_low,xb_high,t_low,t_high
+      real phi_low,phi_high,w_minimum,y_maximum,phi_wrapped
+      integer apply_y_max,status
+
+      status=1
+      phi_wrapped=modulo(phi,360.)
+      if (q2 .lt. q2_low .or. q2 .gt. q2_high)return
+      if (xb .lt. xb_low .or. xb .gt. xb_high)return
+      if (minus_t .lt. t_low .or. minus_t .gt. t_high)return
+      if (phi_wrapped .lt. phi_low .or.
+     *    phi_wrapped .gt. phi_high)return
+      if (w .lt. w_minimum)return
+      if (apply_y_max .eq. 1 .and. y .gt. y_maximum)return
+      status=0
+      return
       end
 
 c   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%

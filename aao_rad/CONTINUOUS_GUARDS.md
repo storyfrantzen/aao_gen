@@ -4,10 +4,10 @@
 representation: one continuous axis-aligned box per final-LUND analysis
 stratum in AAO's normalized native proposal coordinates.
 
-This is a diagnostic. It does not change AAO sampling, perform
-acceptance-rejection, or write LUND events. `production_ready` remains false
-until mode 4 samples a frozen core-plus-global-tail mixture and evaluates its
-exact proposal density.
+This learner remains a diagnostic and does not itself write LUND events.
+`radiative_mode4.py` and AAO sampling mode 4 now consume its recipes through
+an exact core-plus-global-tail mixture. `production_ready` remains false until
+the mode-4 implementation and tuning are frozen and tested on fresh replicas.
 
 ## Coordinate definitions
 
@@ -196,15 +196,15 @@ influenced this design. Use them to choose and refine the continuous
 procedure. Once the algorithm, regularization, and padding are frozen, assess
 the result on fresh replicas that were not used in any design decision.
 
-The eventual proposal must retain:
+The mode-4 proposal retains:
 
 ```text
 g_i = alpha * g_core,i + (1 - alpha) * g_global
 ```
 
 with `1 - alpha` strictly positive. The global component supplies complete
-legacy support. Mode 4 must evaluate the sum of both mixture densities at
-every trial before unweighting.
+legacy support. Mode 4 evaluates the sum of both mixture densities at every
+trial before unweighting. See `RADIATIVE_MODE4.md`.
 
 ## Tests
 

@@ -23,7 +23,8 @@ test: aao_rad
 		test_radiative_guards.py \
 		test_radiative_migrations.py \
 		test_radiative_guard_geometries.py \
-		test_radiative_continuous_guards.py
+		test_radiative_continuous_guards.py \
+		test_radiative_mode4.py
 
 
 

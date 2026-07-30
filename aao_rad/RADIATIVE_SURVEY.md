@@ -8,8 +8,9 @@ The two radiative run-control modes are:
 - `0`: unchanged legacy unweighted generation;
 - `1`: deterministic fixed-trial survey.
 
-Mode `4` remains reserved for the future bin-conditional unweighted radiative
-generator described in `GUARD_PROPOSAL_WORKFLOW.md`.
+Mode `4` is now a development bin-conditional unweighted prototype. Its
+core-plus-legacy-tail proposal and workflow are documented in
+`RADIATIVE_MODE4.md`; fresh-replica production validation is still required.
 
 Mode `1` now has two proposal choices:
 
