@@ -30,7 +30,8 @@ import radiative_guards
 import radiative_survey
 
 
-MANIFEST_SCHEMA = "aao-rad-mode4-manifest-v3"
+MANIFEST_SCHEMA = "aao-rad-mode4-manifest-v4"
+LEGACY_MANIFEST_SCHEMAS = ("aao-rad-mode4-manifest-v3",)
 RUN_SCHEMA = "aao-rad-mode4-run-v3"
 WEIGHTS_SCHEMA = "aao-rad-mode4-weights-v2"
 CALIBRATION_SCHEMA = "aao-rad-mode4-envelope-calibration-v4"
@@ -182,6 +183,22 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+
+def _supported_manifest_schema(payload: dict) -> bool:
+    return payload.get("schema") in (MANIFEST_SCHEMA, *LEGACY_MANIFEST_SCHEMAS)
+
+
+def _run_sigr_max(manifest: dict, record: dict) -> float:
+    """Resolve a run envelope, including legacy shared-envelope manifests."""
+    raw = record.get("sigr_max", manifest.get("sigr_max"))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as error:
+        raise Mode4Error("manifest run lacks a valid sigr_max") from error
+    if not math.isfinite(value) or value <= 0.0:
+        raise Mode4Error("manifest run sigr_max must be finite and positive")
+    return value
 
 
 def _candidate_padding(recipes: dict, candidate: str) -> float:
@@ -642,6 +659,159 @@ def _load_guard_refinements(
     return payload, hashlib.sha256(raw).hexdigest()
 
 
+def _analysis_selection(config: dict, *, apply_y_max: bool) -> dict[str, object]:
+    return {
+        "coordinate_definition": "final_lund_analysis",
+        "w_minimum": float(config["phase_space"]["W_min"]),
+        "apply_y_max": bool(apply_y_max),
+        "y_maximum": (
+            float(config["phase_space"].get("y_max", 1.0))
+            if apply_y_max
+            else None
+        ),
+        "no_implicit_y_minimum": True,
+    }
+
+
+def _selected_strata(
+    strata: list[radiative_guards.Stratum], args: argparse.Namespace
+) -> tuple[list[radiative_guards.Stratum], dict[str, object]]:
+    raw_sparse = getattr(args, "flat_indices", None) or []
+    start = int(getattr(args, "bin_start", 0) or 0)
+    stop = getattr(args, "bin_stop", None)
+    if raw_sparse:
+        if start != 0 or stop is not None:
+            raise ValueError(
+                "--flat-index cannot be combined with --bin-start or "
+                "--bin-stop"
+            )
+        indices = [int(value) for value in raw_sparse]
+        if len(set(indices)) != len(indices):
+            raise ValueError("--flat-index values must be unique")
+        if any(index < 0 or index >= len(strata) for index in indices):
+            raise ValueError(
+                f"--flat-index values must lie in [0,{len(strata)})"
+            )
+        ordered = sorted(indices)
+        return (
+            [strata[index] for index in ordered],
+            {"mode": "sparse_flat_indices", "flat_indices": ordered},
+        )
+    resolved_stop = len(strata) if stop is None else int(stop)
+    if start < 0 or resolved_stop < start or resolved_stop > len(strata):
+        raise ValueError(f"invalid stratum range [{start},{resolved_stop})")
+    return (
+        strata[start:resolved_stop],
+        {
+            "mode": "contiguous_range",
+            "bin_start": start,
+            "bin_stop": resolved_stop,
+        },
+    )
+
+
+def _load_generation_envelopes(
+    path: Path,
+    *,
+    config_sha256: str,
+    recipes_sha256: str,
+    refinements_sha256: Optional[str],
+    candidate: str,
+    core_fraction: float,
+    selection: dict[str, object],
+    generator_revision: str,
+    allow_revision_mismatch: bool,
+    revision_compatibility_rationale: str,
+) -> tuple[dict, str, dict[str, dict], dict[str, object]]:
+    raw = path.read_bytes()
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{path}: invalid envelope JSON: {error}") from error
+    if payload.get("schema") != CALIBRATION_SCHEMA:
+        raise ValueError(
+            f"{path}: expected calibration schema {CALIBRATION_SCHEMA}"
+        )
+    expected = {
+        "analysis_config_sha256": config_sha256,
+        "guard_recipes_sha256": recipes_sha256,
+        "guard_refinements_sha256": refinements_sha256,
+        "guard_candidate": candidate,
+    }
+    for name, value in expected.items():
+        if payload.get(name) != value:
+            raise ValueError(
+                f"{path}: {name} does not match the selected generation inputs"
+            )
+    try:
+        report_core_fraction = float(payload["core_fraction"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"{path}: invalid calibration core fraction") from error
+    if not _close(report_core_fraction, core_fraction):
+        raise ValueError(
+            f"{path}: core_fraction does not match the generation mixture"
+        )
+    report_selection, revisions, report_guards = (
+        _calibration_validation_metadata(path, payload)
+    )
+    if report_selection != selection:
+        raise ValueError(
+            f"{path}: analysis selection does not match generation"
+        )
+    revision_matches = generator_revision in revisions
+    if not revision_matches and not allow_revision_mismatch:
+        raise ValueError(
+            f"{path}: generator revision {generator_revision!r} is absent "
+            "from the calibration report; use the explicit audited override"
+        )
+    if allow_revision_mismatch and not revision_compatibility_rationale:
+        raise ValueError(
+            "--envelope-revision-compatibility-rationale is required with "
+            "--allow-envelope-revision-mismatch"
+        )
+    records: dict[str, dict] = {}
+    for item in payload.get("strata", []):
+        stratum_id = str(item.get("stratum_id", ""))
+        if not stratum_id or stratum_id in records:
+            raise ValueError(f"{path}: duplicate or empty calibration stratum")
+        readiness = item.get("pilot_readiness")
+        recommendation = item.get("recommended_envelope")
+        if readiness not in ("ready", "ready_provisional_zero_complement"):
+            continue
+        if not isinstance(recommendation, dict):
+            raise ValueError(
+                f"{path}: ready stratum {stratum_id} lacks an envelope"
+            )
+        try:
+            envelope = float(recommendation["sigr_max"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"{path}: {stratum_id} has an invalid envelope"
+            ) from error
+        if not math.isfinite(envelope) or envelope <= 0.0:
+            raise ValueError(
+                f"{path}: {stratum_id} envelope must be finite and positive"
+            )
+        if stratum_id not in report_guards:
+            raise ValueError(f"{path}: {stratum_id} lacks a calibrated guard")
+        records[stratum_id] = {
+            **item,
+            "guard": report_guards[stratum_id],
+            "resolved_sigr_max": envelope,
+        }
+    override = {
+        "enabled": bool(not revision_matches and allow_revision_mismatch),
+        "calibration_generator_revisions": sorted(revisions),
+        "generation_generator_revision": generator_revision,
+        "rationale": (
+            revision_compatibility_rationale
+            if not revision_matches and allow_revision_mismatch
+            else None
+        ),
+    }
+    return payload, hashlib.sha256(raw).hexdigest(), records, override
+
+
 def create_refinement(args: argparse.Namespace) -> Path:
     """Create one validated, evidence-hashed stratum refinement artifact."""
     config_path = args.config.resolve()
@@ -763,11 +933,29 @@ def prepare(args: argparse.Namespace) -> Path:
         raise ValueError("--seed-base must be positive")
     if not 0.0 < args.core_fraction < 1.0:
         raise ValueError("--core-fraction must lie strictly between zero and one")
-    sigr_max = (
-        float(args.sigr_max) if operation == "generation" else 1.0
-    )
-    if not math.isfinite(sigr_max) or sigr_max <= 0.0:
-        raise ValueError("--sigr-max must be finite and positive")
+    raw_shared_sigr_max = getattr(args, "sigr_max", None)
+    raw_envelope_path = getattr(args, "envelope_report", None)
+    if operation == "generation":
+        if (raw_shared_sigr_max is None) == (raw_envelope_path is None):
+            raise ValueError(
+                "generation requires exactly one of --sigr-max or "
+                "--envelope-report"
+            )
+        shared_sigr_max = (
+            float(raw_shared_sigr_max)
+            if raw_shared_sigr_max is not None
+            else None
+        )
+        if shared_sigr_max is not None and (
+            not math.isfinite(shared_sigr_max) or shared_sigr_max <= 0.0
+        ):
+            raise ValueError("--sigr-max must be finite and positive")
+    else:
+        shared_sigr_max = 1.0
+        if raw_envelope_path is not None:
+            raise ValueError(
+                "--envelope-report is valid only for generation"
+            )
 
     config_path = args.config.resolve()
     recipes_path = args.recipes.resolve()
@@ -798,38 +986,62 @@ def prepare(args: argparse.Namespace) -> Path:
             recipes=recipes,
             base_padding=base_padding,
         )
-    legacy_input, legacy_records = _legacy_mode4_input(
-        legacy_source,
-        input_path,
-        events=events_per_stratum if operation == "generation" else 1,
-        sigr_max=sigr_max,
+    selection = _analysis_selection(
+        config, apply_y_max=bool(args.apply_y_max)
     )
+    envelope_path: Optional[Path] = None
+    envelope_sha256: Optional[str] = None
+    envelope_records: dict[str, dict] = {}
+    envelope_revision_override: Optional[dict[str, object]] = None
+    if raw_envelope_path is not None:
+        envelope_path = Path(raw_envelope_path).expanduser().resolve()
+        if not envelope_path.is_file():
+            raise FileNotFoundError(envelope_path)
+        revision_rationale = str(
+            getattr(
+                args,
+                "envelope_revision_compatibility_rationale",
+                "",
+            )
+            or ""
+        ).strip()
+        (
+            _envelope_payload,
+            envelope_sha256,
+            envelope_records,
+            envelope_revision_override,
+        ) = _load_generation_envelopes(
+            envelope_path,
+            config_sha256=config_sha256,
+            recipes_sha256=recipes_sha256,
+            refinements_sha256=refinements_sha256,
+            candidate=args.candidate,
+            core_fraction=float(args.core_fraction),
+            selection=selection,
+            generator_revision=str(args.generator_revision),
+            allow_revision_mismatch=bool(
+                getattr(args, "allow_envelope_revision_mismatch", False)
+            ),
+            revision_compatibility_rationale=revision_rationale,
+        )
+    elif bool(getattr(args, "allow_envelope_revision_mismatch", False)):
+        raise ValueError(
+            "--allow-envelope-revision-mismatch requires --envelope-report"
+        )
+    strata = radiative_guards.enumerate_strata(config)
+    selected_strata, stratum_selection = _selected_strata(strata, args)
     output = args.output.resolve()
     manifest_path = output / "manifest.json"
     if output.exists() and any(output.iterdir()) and not args.overwrite:
         raise FileExistsError(
             f"{output} is not empty; pass --overwrite to replace prepared files"
         )
-    input_directory = output / "inputs"
-    input_directory.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(config_path, output / "analysis_config.json")
-    shutil.copy2(recipes_path, output / "continuous_guard_recipes.json")
-    if refinements_path is not None:
-        shutil.copy2(
-            refinements_path, output / "guard_refinements.json"
-        )
-    (output / "legacy_input.inp").write_text(
-        legacy_source, encoding="utf-8"
-    )
 
-    strata = radiative_guards.enumerate_strata(config)
-    stop = len(strata) if args.bin_stop is None else args.bin_stop
-    if args.bin_start < 0 or stop < args.bin_start or stop > len(strata):
-        raise ValueError(f"invalid stratum range [{args.bin_start},{stop})")
     records: list[dict[str, object]] = []
-    for stratum in strata:
-        if not args.bin_start <= stratum.flat_index < stop:
-            continue
+    prepared_inputs: dict[Path, str] = {}
+    shared_legacy_records: Optional[list[str]] = None
+    used_envelope_strata: set[str] = set()
+    for stratum in selected_strata:
         try:
             recipe = recipes["strata"][stratum.identifier]
         except KeyError as error:
@@ -861,11 +1073,44 @@ def prepare(args: argparse.Namespace) -> Path:
             )
         else:
             box = original_box
+        envelope_record = envelope_records.get(stratum.identifier)
+        if operation == "generation" and envelope_path is not None:
+            if envelope_record is None:
+                raise ValueError(
+                    f"{envelope_path}: selected stratum {stratum.identifier} "
+                    "is absent or not pilot-ready"
+                )
+            if int(envelope_record["flat_index"]) != stratum.flat_index:
+                raise ValueError(
+                    f"{envelope_path}: {stratum.identifier} flat index differs"
+                )
+            if envelope_record.get("bounds") != expected_bounds:
+                raise ValueError(
+                    f"{envelope_path}: {stratum.identifier} bounds differ"
+                )
+            if envelope_record.get("guard") != box.manifest_record():
+                raise ValueError(
+                    f"{envelope_path}: {stratum.identifier} guard differs"
+                )
+            stratum_sigr_max = float(
+                envelope_record["resolved_sigr_max"]
+            )
+            used_envelope_strata.add(stratum.identifier)
+        else:
+            stratum_sigr_max = float(shared_sigr_max)
         if operation == "calibration" and box.volume >= 1.0 - 1.0e-7:
             raise ValueError(
                 f"{stratum.identifier}: the anchored guard fills the native "
                 "hypercube, so its complement cannot be calibrated"
             )
+        legacy_input, legacy_records = _legacy_mode4_input(
+            legacy_source,
+            input_path,
+            events=(events_per_stratum if operation == "generation" else 1),
+            sigr_max=stratum_sigr_max,
+        )
+        if envelope_path is None:
+            shared_legacy_records = legacy_records
         for replica_index in range(args.replicas):
             seed = (
                 args.seed_base + 1000 * stratum.flat_index + replica_index
@@ -892,7 +1137,7 @@ def prepare(args: argparse.Namespace) -> Path:
                 component_core_fraction=component_core_fraction,
                 calibration_proposal=calibration_proposal,
             )
-            (output / input_relative).write_text(text, encoding="utf-8")
+            prepared_inputs[input_relative] = text
             records.append(
                 {
                     "stratum_id": stratum.identifier,
@@ -910,6 +1155,26 @@ def prepare(args: argparse.Namespace) -> Path:
                     "replica_index": replica_index,
                     "seed": seed,
                     "operation": operation,
+                    "sigr_max": (
+                        stratum_sigr_max
+                        if operation == "generation"
+                        else None
+                    ),
+                    "envelope_recommendation_status": (
+                        envelope_record.get("recommendation_status")
+                        if envelope_record is not None
+                        else None
+                    ),
+                    "envelope_pilot_readiness": (
+                        envelope_record.get("pilot_readiness")
+                        if envelope_record is not None
+                        else None
+                    ),
+                    "envelope_recommendation_basis": (
+                        envelope_record.get("recommendation_basis")
+                        if envelope_record is not None
+                        else None
+                    ),
                     "events_requested": (
                         events_per_stratum if operation == "generation" else 0
                     ),
@@ -917,6 +1182,10 @@ def prepare(args: argparse.Namespace) -> Path:
                         calibration_trials if operation == "calibration" else 0
                     ),
                     "input_file": str(input_relative),
+                    "input_sha256": hashlib.sha256(
+                        text.encode("utf-8")
+                    ).hexdigest(),
+                    "legacy_input_records": legacy_records,
                     "output_stem": str(output_stem),
                     "guard_original": original_box.manifest_record(),
                     "guard": box.manifest_record(),
@@ -924,7 +1193,7 @@ def prepare(args: argparse.Namespace) -> Path:
                 }
             )
     if not records:
-        raise ValueError("selected stratum range produced no runs")
+        raise ValueError("selected strata produced no runs")
     manifest: dict[str, object] = {
         "schema": MANIFEST_SCHEMA,
         "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -933,6 +1202,7 @@ def prepare(args: argparse.Namespace) -> Path:
         "sampling_mode": SAMPLING_MODE,
         "operation": operation,
         "generator_revision": args.generator_revision,
+        "stratum_selection": stratum_selection,
         "analysis_config_source": str(config_path),
         "analysis_config_sha256": config_sha256,
         "guard_recipes_source": str(recipes_path),
@@ -981,21 +1251,53 @@ def prepare(args: argparse.Namespace) -> Path:
         ),
         "heartbeat_interval": heartbeat_interval,
         "replicas_per_stratum": args.replicas,
-        "sigr_max": sigr_max if operation == "generation" else None,
-        "analysis_selection": {
-            "coordinate_definition": "final_lund_analysis",
-            "w_minimum": float(config["phase_space"]["W_min"]),
-            "apply_y_max": bool(args.apply_y_max),
-            "y_maximum": (
-                float(config["phase_space"].get("y_max", 1.0))
-                if args.apply_y_max
-                else None
-            ),
-            "no_implicit_y_minimum": True,
-        },
-        "legacy_input_records": legacy_records,
+        "envelope_mode": (
+            "per_stratum_calibration"
+            if envelope_path is not None
+            else "shared_scalar"
+            if operation == "generation"
+            else None
+        ),
+        "sigr_max": (
+            shared_sigr_max
+            if operation == "generation" and envelope_path is None
+            else None
+        ),
+        "envelope_calibration_source": (
+            str(envelope_path) if envelope_path is not None else None
+        ),
+        "envelope_calibration_sha256": envelope_sha256,
+        "envelope_calibration_schema": (
+            CALIBRATION_SCHEMA if envelope_path is not None else None
+        ),
+        "envelope_calibration_snapshot": (
+            "envelope_calibration.json" if envelope_path is not None else None
+        ),
+        "envelope_revision_compatibility_override": (
+            envelope_revision_override
+        ),
+        "envelope_strata_used": sorted(used_envelope_strata),
+        "analysis_selection": selection,
+        "legacy_input_records": shared_legacy_records,
         "runs": records,
     }
+    input_directory = output / "inputs"
+    input_directory.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(config_path, output / "analysis_config.json")
+    shutil.copy2(recipes_path, output / "continuous_guard_recipes.json")
+    if refinements_path is not None:
+        shutil.copy2(
+            refinements_path, output / "guard_refinements.json"
+        )
+    if envelope_path is not None:
+        shutil.copy2(
+            envelope_path, output / "envelope_calibration.json"
+        )
+    (output / "legacy_input.inp").write_text(
+        legacy_source, encoding="utf-8"
+    )
+    for relative, text in prepared_inputs.items():
+        (output / relative).write_text(text, encoding="utf-8")
     _write_json(manifest_path, manifest)
     return manifest_path
 
@@ -1383,7 +1685,7 @@ def _validate_lund(path: Path, events: int) -> None:
 def run(args: argparse.Namespace) -> Path:
     manifest_path = args.manifest.resolve()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("schema") != MANIFEST_SCHEMA:
+    if not _supported_manifest_schema(manifest):
         raise ValueError(f"unsupported manifest schema: {manifest.get('schema')}")
     matches = [
         record
@@ -1397,6 +1699,11 @@ def run(args: argparse.Namespace) -> Path:
         )
     record = matches[0]
     root = manifest_path.parent
+    run_sigr_max = (
+        _run_sigr_max(manifest, record)
+        if manifest["operation"] == "generation"
+        else None
+    )
     refinements_sha256 = manifest.get("guard_refinements_sha256")
     if refinements_sha256 is not None:
         refinement_snapshot = root / "guard_refinements.json"
@@ -1408,7 +1715,27 @@ def run(args: argparse.Namespace) -> Path:
                 "guard-refinement snapshot is missing or differs from "
                 "the manifest"
             )
+    envelope_sha256 = manifest.get("envelope_calibration_sha256")
+    if envelope_sha256 is not None:
+        envelope_snapshot = root / str(
+            manifest.get(
+                "envelope_calibration_snapshot",
+                "envelope_calibration.json",
+            )
+        )
+        if (
+            not envelope_snapshot.is_file()
+            or _sha256(envelope_snapshot) != envelope_sha256
+        ):
+            raise Mode4Error(
+                "envelope-calibration snapshot is missing or differs from "
+                "the manifest"
+            )
     input_path = root / record["input_file"]
+    if record.get("input_sha256") is not None and _sha256(input_path) != record[
+        "input_sha256"
+    ]:
+        raise Mode4Error("prepared mode-4 input differs from the manifest")
     output_stem = root / record["output_stem"]
     output_stem.parent.mkdir(parents=True, exist_ok=True)
     run_record_path = output_stem.with_suffix(".json")
@@ -1502,6 +1829,13 @@ def run(args: argparse.Namespace) -> Path:
                     "mode4_guard_refinements_sha256="
                     f"{manifest['guard_refinements_sha256']}\n"
                 )
+            if run_sigr_max is not None:
+                norm_output.write(f"mode4_sigr_max={run_sigr_max:.17g}\n")
+            if envelope_sha256 is not None:
+                norm_output.write(
+                    "mode4_envelope_calibration_sha256="
+                    f"{envelope_sha256}\n"
+                )
         products = [
             (".norm", radiative_survey.NORM_FILENAME),
             (".heartbeat.csv", MODE4_HEARTBEAT_FILENAME),
@@ -1535,6 +1869,7 @@ def run(args: argparse.Namespace) -> Path:
         "schema": RUN_SCHEMA,
         "source_manifest": str(manifest_path),
         "source_manifest_sha256": _sha256(manifest_path),
+        "sigr_max": run_sigr_max,
         "sig_sum_microbarn": sig_sum,
         "sig_int_microbarn": _norm_float(norm, "sig_int"),
         "operation": manifest["operation"],
@@ -2370,7 +2705,7 @@ def finalize(args: argparse.Namespace) -> Path:
     sources: list[tuple[Path, dict]] = []
     for manifest_path in manifest_paths:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest.get("schema") != MANIFEST_SCHEMA:
+        if not _supported_manifest_schema(manifest):
             raise ValueError(
                 f"{manifest_path}: unsupported manifest schema "
                 f"{manifest.get('schema')}"
@@ -2501,6 +2836,11 @@ def finalize(args: argparse.Namespace) -> Path:
                 raise Mode4Error(f"{run_path}: {name} differs from manifest")
         if completed.get("operation") != operation:
             raise Mode4Error(f"{run_path}: operation differs from manifest")
+        expected_envelope = _run_sigr_max(manifest, record)
+        if completed.get("sigr_max") is not None and not _close(
+            float(completed["sigr_max"]), expected_envelope
+        ):
+            raise Mode4Error(f"{run_path}: sigr_max differs from manifest")
         grouped.setdefault(record["stratum_id"], []).append(
             (record, completed)
         )
@@ -2508,6 +2848,13 @@ def finalize(args: argparse.Namespace) -> Path:
     for stratum_id, items in sorted(
         grouped.items(), key=lambda item: int(item[1][0][0]["flat_index"])
     ):
+        envelopes = [
+            _run_sigr_max(manifest, record) for record, _run in items
+        ]
+        if any(not _close(value, envelopes[0]) for value in envelopes[1:]):
+            raise Mode4Error(
+                f"{stratum_id}: generation replicas use different envelopes"
+            )
         total_proposals = sum(int(run["ntries"]) for _, run in items)
         total_events = sum(int(run["events"]) for _, run in items)
         combined_sigma = sum(
@@ -2521,6 +2868,7 @@ def finalize(args: argparse.Namespace) -> Path:
                 "flat_index": first["flat_index"],
                 "indices": first["indices"],
                 "bounds": first["bounds"],
+                "sigr_max": envelopes[0],
                 "replicas": len(items),
                 "total_proposals": total_proposals,
                 "total_events": total_events,
@@ -2561,6 +2909,10 @@ def finalize(args: argparse.Namespace) -> Path:
         "guard_refinements_sha256": manifest.get(
             "guard_refinements_sha256"
         ),
+        "envelope_mode": manifest.get("envelope_mode", "shared_scalar"),
+        "envelope_calibration_sha256": manifest.get(
+            "envelope_calibration_sha256"
+        ),
         "guard_candidate": manifest["guard_candidate"],
         "core_fraction": manifest["core_fraction"],
         "legacy_tail_fraction": manifest["legacy_tail_fraction"],
@@ -2583,6 +2935,7 @@ def finalize(args: argparse.Namespace) -> Path:
                 "replicas",
                 "total_events",
                 "total_proposals",
+                "sigr_max",
                 "combined_sig_sum_microbarn",
                 "pooled_event_weight_microbarn",
                 "event_yield_per_proposal",
@@ -2603,6 +2956,7 @@ def finalize(args: argparse.Namespace) -> Path:
                         "replicas",
                         "total_events",
                         "total_proposals",
+                        "sigr_max",
                         "combined_sig_sum_microbarn",
                         "pooled_event_weight_microbarn",
                         "event_yield_per_proposal",
@@ -2716,10 +3070,22 @@ def _pilot_source_manifest(
         if _sha256(resolved) != expected_hash:
             continue
         manifest = json.loads(resolved.read_text(encoding="utf-8"))
-        if manifest.get("schema") != MANIFEST_SCHEMA:
+        if not _supported_manifest_schema(manifest):
             raise Mode4Error(f"{resolved}: unsupported manifest schema")
         if manifest.get("operation") != "generation":
             raise Mode4Error(f"{resolved}: expected generation manifest")
+        envelope_sha256 = manifest.get("envelope_calibration_sha256")
+        if envelope_sha256 is not None:
+            snapshot = resolved.parent / str(
+                manifest.get(
+                    "envelope_calibration_snapshot",
+                    "envelope_calibration.json",
+                )
+            )
+            if not snapshot.is_file() or _sha256(snapshot) != envelope_sha256:
+                raise Mode4Error(
+                    f"{resolved}: envelope-calibration snapshot changed"
+                )
         return resolved, manifest
     raise Mode4Error(
         f"{run_path}: cannot locate the hashed source generation manifest"
@@ -2800,9 +3166,11 @@ def _load_pilot_run(path: Path) -> dict[str, object]:
         )
     if not rows:
         raise Mode4Error(f"{event_path}: pilot has no events")
-    envelope = float(manifest["sigr_max"])
-    if not math.isfinite(envelope) or envelope <= 0.0:
-        raise Mode4Error(f"{manifest_path}: invalid sigr_max")
+    envelope = _run_sigr_max(manifest, record)
+    if run.get("sigr_max") is not None and not _close(
+        float(run["sigr_max"]), envelope
+    ):
+        raise Mode4Error(f"{run_path}: sigr_max differs from manifest")
     groups: dict[tuple[str, ...], list[dict[str, str]]] = {}
     for expected_event, row in enumerate(rows, start=1):
         if int(row["event"]) != expected_event:
@@ -3080,7 +3448,7 @@ def _calibration_validation_metadata(
                 f"{source_path}: calibration source-manifest hash changed"
             )
         manifest = json.loads(source_path.read_text(encoding="utf-8"))
-        if manifest.get("schema") != MANIFEST_SCHEMA:
+        if not _supported_manifest_schema(manifest):
             raise Mode4Error(
                 f"{source_path}: unsupported calibration source manifest"
             )
@@ -3705,6 +4073,16 @@ def _parser() -> argparse.ArgumentParser:
         target.add_argument("--seed-base", type=int, default=481001)
         target.add_argument("--bin-start", type=int, default=0)
         target.add_argument("--bin-stop", type=int)
+        target.add_argument(
+            "--flat-index",
+            dest="flat_indices",
+            type=int,
+            action="append",
+            help=(
+                "select one sparse analysis stratum; repeat as needed and "
+                "do not combine with --bin-start/--bin-stop"
+            ),
+        )
         target.add_argument("--apply-y-max", action="store_true")
         target.add_argument("--heartbeat-interval", type=int, default=100000)
         target.add_argument("--generator-revision", default="UNKNOWN")
@@ -3714,7 +4092,37 @@ def _parser() -> argparse.ArgumentParser:
         "prepare", help="write one radiative mode-4 input per stratum"
     )
     add_prepare_common(prepare_parser)
-    prepare_parser.add_argument("--sigr-max", type=float, required=True)
+    envelope_group = prepare_parser.add_mutually_exclusive_group(
+        required=True
+    )
+    envelope_group.add_argument(
+        "--sigr-max",
+        type=float,
+        help="one shared generation envelope for every selected stratum",
+    )
+    envelope_group.add_argument(
+        "--envelope-report",
+        type=Path,
+        help=(
+            "finalized calibration report supplying one audited envelope "
+            "per selected stratum"
+        ),
+    )
+    prepare_parser.add_argument(
+        "--allow-envelope-revision-mismatch",
+        action="store_true",
+        help=(
+            "use an envelope report from a different generator revision "
+            "after an explicit compatibility audit"
+        ),
+    )
+    prepare_parser.add_argument(
+        "--envelope-revision-compatibility-rationale",
+        help=(
+            "required audit note when the envelope calibration and "
+            "generation revisions differ"
+        ),
+    )
     prepare_parser.add_argument("--events-per-stratum", type=int, default=5000)
     calibration_parser = subparsers.add_parser(
         "prepare-calibration",

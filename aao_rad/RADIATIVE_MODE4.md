@@ -393,7 +393,8 @@ authorizes only a small monitored pilot before broader production.
 
 ## Generate after calibration
 
-Use the recommended `sigr_max` from the frozen calibration report:
+For a one-stratum or deliberately conservative smoke test, a shared scalar
+envelope remains supported:
 
 ```bash
 python3 radiative_mode4.py prepare \
@@ -412,6 +413,53 @@ python3 radiative_mode4.py prepare \
   --bin-stop 4469 \
   --generator-revision `git rev-parse HEAD`
 ```
+
+For a heterogeneous multi-stratum campaign, use the finalized calibration
+report directly instead. Each selected stratum must have
+`pilot_readiness=ready` or `ready_provisional_zero_complement` and a positive
+`recommended_envelope.sigr_max`:
+
+```bash
+python3 radiative_mode4.py prepare \
+  --config ../../../configs/analysis/rgk/6.535.json \
+  --recipes continuous_guard_recipes.json \
+  --refinements guard_refinements.json \
+  --input aao_input.inp \
+  --output mode4_rgk_sparse_pilot \
+  --candidate padding_0p035 \
+  --core-fraction 0.90 \
+  --envelope-report multi_stratum_envelope_calibration.json \
+  --events-per-stratum 200 \
+  --heartbeat-interval 100000 \
+  --replicas 2 \
+  --flat-index 4468 \
+  --flat-index 9012 \
+  --seed-base 997101 \
+  --generator-revision `git rev-parse HEAD`
+```
+
+`--flat-index` is repeatable and selects disjoint strata without preparing
+the bins between them. It is mutually exclusive with `--bin-start` and
+`--bin-stop`. A contiguous range may still be used with an envelope report.
+
+The report must match the selected analysis-config, recipe, refinement,
+guard-candidate, core-fraction, analysis-selection, bounds, and reconstructed
+guard hashes and values. A selected missing or unready stratum is rejected.
+If a wrapper-only revision separates the calibration and generation commits,
+an explicit audited exception is required:
+
+```bash
+  --allow-envelope-revision-mismatch \
+  --envelope-revision-compatibility-rationale \
+    "Wrapper-only change; Fortran physics and proposal are unchanged."
+```
+
+The complete calibration report is copied to
+`envelope_calibration.json` inside the prepared campaign and hashed by the
+manifest. Every run record freezes its own `sigr_max`, readiness state, and
+recommendation basis. Execution and pilot validation reject a changed
+snapshot or a run-level envelope inconsistent with the manifest. Legacy v3
+shared-envelope manifests remain readable.
 
 Run and finalize generation:
 
@@ -499,7 +547,8 @@ final production certification.
 ## Artifacts and type-2 compatibility
 
 `prepare` snapshots the exact analysis configuration, continuous recipes, and
-legacy input. Its immutable manifest records:
+legacy input. When used, it also snapshots the finalized envelope-calibration
+report. Its immutable v4 manifest records:
 
 - canonical `sNNNNN` stratum and `gNNNN` generation identifiers;
 - requested bin bounds and indices;
@@ -508,7 +557,10 @@ legacy input. Its immutable manifest records:
 - optional evidence-hashed guard refinements, with original and refined
   bounds;
 - core and unrestricted-tail fractions;
-- explicit seed, event count, and `sigr_max`.
+- explicit seed, event count, and per-run `sigr_max`;
+- contiguous-range or sparse-flat-index selection;
+- envelope mode, report SHA-256, selected readiness states, and any explicit
+  revision-compatibility audit.
 
 `run` writes products under a stem such as:
 
@@ -516,7 +568,8 @@ legacy input. Its immutable manifest records:
 runs/s04468/s04468__g0000
 ```
 
-The `.norm` and run JSON record the stratum cross section, event weight,
+The `.norm` and run JSON record the resolved per-stratum envelope, stratum
+cross section, event weight,
 proposal count, core/noncore trial and event counts, maximum multiplicity,
 distinct emitting candidates, exact multiplicity-generated duplicate count
 and fraction, and proposal efficiency. `aao_rad.mode4.csv` records

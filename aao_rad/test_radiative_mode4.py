@@ -125,6 +125,93 @@ def _fixtures(root: Path) -> tuple[Path, Path, Path]:
     return config_path, recipes_path, input_path
 
 
+def _multistratum_fixtures(
+    root: Path,
+) -> tuple[Path, Path, Path, Path]:
+    config_path, recipes_path, input_path = _fixtures(root)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["binning"]["minus_t"] = [0.0, 1.0, 2.0]
+    config_path.write_text(
+        json.dumps(config, indent=2) + "\n", encoding="utf-8"
+    )
+    recipes = json.loads(recipes_path.read_text(encoding="utf-8"))
+    recipes["analysis_config_sha256"] = hashlib.sha256(
+        config_path.read_bytes()
+    ).hexdigest()
+    prototype = recipes["strata"]["s00000"]
+    recipes["strata"] = {}
+    guards: dict[str, dict] = {}
+    for index, bounds in enumerate(((0.0, 1.0), (1.0, 2.0))):
+        stratum_id = f"s{index:05d}"
+        record = json.loads(json.dumps(prototype))
+        record["bounds"] = {
+            **config["binning"],
+            "minus_t": list(bounds),
+        }
+        recipes["strata"][stratum_id] = record
+    recipes_path.write_text(
+        json.dumps(recipes, indent=2) + "\n", encoding="utf-8"
+    )
+    for stratum_id, recipe in recipes["strata"].items():
+        guards[stratum_id] = radiative_mode4.reconstruct_guard_box(
+            recipe, 0.035
+        ).manifest_record()
+    report = {
+        "schema": radiative_mode4.CALIBRATION_SCHEMA,
+        "analysis_config_sha256": hashlib.sha256(
+            config_path.read_bytes()
+        ).hexdigest(),
+        "guard_recipes_sha256": hashlib.sha256(
+            recipes_path.read_bytes()
+        ).hexdigest(),
+        "guard_refinements_sha256": None,
+        "guard_candidate": "padding_0p035",
+        "core_fraction": 0.9,
+        "generator_revision": "generator-test",
+        "generator_revisions": ["generator-test"],
+        "analysis_selection": {
+            "coordinate_definition": "final_lund_analysis",
+            "w_minimum": 1.08,
+            "apply_y_max": False,
+            "y_maximum": None,
+            "no_implicit_y_minimum": True,
+        },
+        "strata": [
+            {
+                "stratum_id": f"s{index:05d}",
+                "flat_index": index,
+                "indices": {
+                    "iq2": 0,
+                    "ixb": 0,
+                    "it": index,
+                    "iphi": 0,
+                },
+                "bounds": {
+                    "Q2": [0.2, 5.0],
+                    "xB": [0.02, 0.99],
+                    "minus_t": list(bounds),
+                    "phi_deg": [0.0, 360.0],
+                },
+                "guard": guards[f"s{index:05d}"],
+                "recommendation_status": "recommended",
+                "recommendation_basis": (
+                    "both_calibration_components_observed"
+                ),
+                "pilot_readiness": "ready",
+                "recommended_envelope": {
+                    "sigr_max": 0.004 + 0.002 * index
+                },
+            }
+            for index, bounds in enumerate(((0.0, 1.0), (1.0, 2.0)))
+        ],
+    }
+    report_path = root / "multi_envelopes.json"
+    report_path.write_text(
+        json.dumps(report, indent=2) + "\n", encoding="utf-8"
+    )
+    return config_path, recipes_path, input_path, report_path
+
+
 def _prepare_args(
     root: Path, config: Path, recipes: Path, legacy: Path
 ) -> argparse.Namespace:
@@ -216,6 +303,7 @@ def _write_pilot_artifacts(
         },
         "guard": guard,
         "seed": seed,
+        "sigr_max": sigr_max,
     }
     manifest = {
         "schema": radiative_mode4.MANIFEST_SCHEMA,
@@ -419,6 +507,16 @@ def _write_calibration_report(
 
 
 class ProposalTests(unittest.TestCase):
+    def test_legacy_shared_envelope_manifest_remains_supported(self) -> None:
+        manifest = {
+            "schema": radiative_mode4.LEGACY_MANIFEST_SCHEMAS[0],
+            "sigr_max": 0.005,
+        }
+        self.assertTrue(radiative_mode4._supported_manifest_schema(manifest))
+        self.assertAlmostEqual(
+            radiative_mode4._run_sigr_max(manifest, {}), 0.005
+        )
+
     def test_periodic_guard_wrap_and_exact_mixture_identity(self) -> None:
         box = radiative_mode4.GuardBox(
             nonperiodic={
@@ -757,6 +855,136 @@ class WorkflowTests(unittest.TestCase):
                 manifest["analysis_config_sha256"],
             )
 
+    def test_prepare_uses_sparse_per_stratum_envelopes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, recipes, legacy, report = _multistratum_fixtures(root)
+            args = _prepare_args(root, config, recipes, legacy)
+            args.sigr_max = None
+            args.envelope_report = report
+            args.flat_indices = [1, 0]
+            args.allow_envelope_revision_mismatch = False
+            args.envelope_revision_compatibility_rationale = None
+            manifest_path = radiative_mode4.prepare(args)
+            manifest = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                manifest["envelope_mode"], "per_stratum_calibration"
+            )
+            self.assertIsNone(manifest["sigr_max"])
+            self.assertEqual(
+                manifest["stratum_selection"],
+                {
+                    "mode": "sparse_flat_indices",
+                    "flat_indices": [0, 1],
+                },
+            )
+            self.assertEqual(manifest["envelope_strata_used"], [
+                "s00000",
+                "s00001",
+            ])
+            self.assertEqual(
+                hashlib.sha256(
+                    (
+                        manifest_path.parent / "envelope_calibration.json"
+                    ).read_bytes()
+                ).hexdigest(),
+                manifest["envelope_calibration_sha256"],
+            )
+            records = {
+                record["stratum_id"]: record for record in manifest["runs"]
+            }
+            self.assertAlmostEqual(records["s00000"]["sigr_max"], 0.004)
+            self.assertAlmostEqual(records["s00001"]["sigr_max"], 0.006)
+            for stratum_id, expected in (
+                ("s00000", 0.004),
+                ("s00001", 0.006),
+            ):
+                prepared = (
+                    manifest_path.parent / records[stratum_id]["input_file"]
+                ).read_text(encoding="utf-8")
+                parsed = radiative_survey._records(prepared)
+                self.assertAlmostEqual(float(parsed[17]), expected)
+                self.assertEqual(
+                    records[stratum_id]["envelope_pilot_readiness"],
+                    "ready",
+                )
+            snapshot = manifest_path.parent / "envelope_calibration.json"
+            snapshot.write_text("{}\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                radiative_mode4.Mode4Error,
+                "envelope-calibration snapshot",
+            ):
+                radiative_mode4.run(
+                    argparse.Namespace(
+                        manifest=manifest_path,
+                        flat_index=0,
+                        replica_index=0,
+                        executable=root / "missing-generator",
+                        overwrite=False,
+                    )
+                )
+
+    def test_envelope_report_requires_readiness_and_audited_revision(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, recipes, legacy, report = _multistratum_fixtures(root)
+            payload = json.loads(report.read_text(encoding="utf-8"))
+            payload["generator_revision"] = "older-generator"
+            payload["generator_revisions"] = ["older-generator"]
+            report.write_text(
+                json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+            )
+            args = _prepare_args(root, config, recipes, legacy)
+            args.sigr_max = None
+            args.envelope_report = report
+            args.flat_indices = [0]
+            args.allow_envelope_revision_mismatch = False
+            args.envelope_revision_compatibility_rationale = None
+            with self.assertRaisesRegex(ValueError, "explicit audited override"):
+                radiative_mode4.prepare(args)
+            args.output = root / "audited_campaign"
+            args.allow_envelope_revision_mismatch = True
+            args.envelope_revision_compatibility_rationale = (
+                "Wrapper-only revision; generator physics and proposal "
+                "are unchanged."
+            )
+            manifest_path = radiative_mode4.prepare(args)
+            manifest = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )
+            self.assertTrue(
+                manifest["envelope_revision_compatibility_override"][
+                    "enabled"
+                ]
+            )
+            payload["strata"][1]["pilot_readiness"] = "not_ready"
+            report.write_text(
+                json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+            )
+            args.output = root / "unready_campaign"
+            args.flat_indices = [1]
+            with self.assertRaisesRegex(ValueError, "not pilot-ready"):
+                radiative_mode4.prepare(args)
+
+    def test_sparse_selection_rejects_range_and_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, recipes, legacy, _report = _multistratum_fixtures(root)
+            args = _prepare_args(root, config, recipes, legacy)
+            args.flat_indices = [0]
+            args.bin_stop = 1
+            with self.assertRaisesRegex(ValueError, "cannot be combined"):
+                radiative_mode4.prepare(args)
+            args.output = root / "duplicate_selection"
+            args.bin_stop = None
+            args.flat_indices = [0, 0]
+            with self.assertRaisesRegex(ValueError, "must be unique"):
+                radiative_mode4.prepare(args)
+
     def test_create_and_prepare_refinement_freezes_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -862,6 +1090,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertGreaterEqual(completed["events"], 2)
             self.assertGreater(completed["ntries"], 0)
             self.assertGreater(completed["sig_sum_microbarn"], 0.0)
+            self.assertAlmostEqual(completed["sigr_max"], 0.005)
             self.assertEqual(
                 completed["core_trials"] + completed["legacy_trials"],
                 completed["ntries"],
@@ -903,6 +1132,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(weights["stratum_count"], 1)
             stratum = weights["strata"][0]
             self.assertEqual(stratum["total_events"], completed["events"])
+            self.assertAlmostEqual(stratum["sigr_max"], 0.005)
             self.assertAlmostEqual(
                 stratum["pooled_event_weight_microbarn"]
                 * stratum["total_events"],
@@ -911,6 +1141,12 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(
                 stratum["emitting_candidates"] + stratum["duplicate_events"],
                 stratum["total_events"],
+            )
+            self.assertIn(
+                "sigr_max",
+                weights_path.with_suffix(".tsv")
+                .read_text(encoding="utf-8")
+                .splitlines()[0],
             )
 
     @unittest.skipUnless(
