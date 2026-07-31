@@ -985,6 +985,52 @@ class WorkflowTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "must be unique"):
                 radiative_mode4.prepare(args)
 
+    def test_flat_index_file_is_snapshotted_and_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, recipes, legacy, report = _multistratum_fixtures(root)
+            selection = root / "production_ready_flat_indices.txt"
+            selection.write_text("1\n# audited active mask\n0\n", encoding="utf-8")
+            args = _prepare_args(root, config, recipes, legacy)
+            args.sigr_max = None
+            args.envelope_report = report
+            args.flat_indices = None
+            args.flat_index_file = selection
+            args.allow_envelope_revision_mismatch = False
+            args.envelope_revision_compatibility_rationale = None
+            manifest_path = radiative_mode4.prepare(args)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                manifest["stratum_selection"],
+                {
+                    "mode": "flat_index_file",
+                    "flat_indices": [0, 1],
+                    "source": str(selection.resolve()),
+                    "source_sha256": hashlib.sha256(
+                        selection.read_bytes()
+                    ).hexdigest(),
+                    "snapshot": "flat_index_selection.txt",
+                },
+            )
+            snapshot = manifest_path.parent / "flat_index_selection.txt"
+            self.assertEqual(
+                snapshot.read_text(encoding="utf-8"),
+                selection.read_text(encoding="utf-8"),
+            )
+            snapshot.write_text("0\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                radiative_mode4.Mode4Error, "selection snapshot"
+            ):
+                radiative_mode4.run(
+                    argparse.Namespace(
+                        manifest=manifest_path,
+                        flat_index=0,
+                        replica_index=0,
+                        executable=root / "missing-generator",
+                        overwrite=False,
+                    )
+                )
+
     def test_create_and_prepare_refinement_freezes_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

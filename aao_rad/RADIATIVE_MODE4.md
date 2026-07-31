@@ -1,5 +1,11 @@
 # Development radiative mode 4
 
+For deciding which nominal analysis strata should receive bin-conditional
+optimization, see [ACTIVE_STRATUM_WORKFLOW.md](ACTIVE_STRATUM_WORKFLOW.md).
+That workflow separates physical support, measurement/migration relevance,
+and generator readiness; zero Monte Carlo support never silently removes a
+stratum.
+
 Radiative mode 4 calibrates and then generates unweighted events for one
 final-LUND analysis stratum per invocation. It is a development prototype:
 its proposal and normalization are exact, but the current guard recipes and
@@ -441,6 +447,8 @@ python3 radiative_mode4.py prepare \
 `--flat-index` is repeatable and selects disjoint strata without preparing
 the bins between them. It is mutually exclusive with `--bin-start` and
 `--bin-stop`. A contiguous range may still be used with an envelope report.
+An audited active-mask list can instead be supplied with
+`--flat-index-file`; it is snapshotted and hashed by the prepared manifest.
 
 The report must match the selected analysis-config, recipe, refinement,
 guard-candidate, core-fraction, analysis-selection, bounds, and reconstructed

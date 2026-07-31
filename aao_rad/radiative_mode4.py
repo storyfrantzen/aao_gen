@@ -677,13 +677,39 @@ def _selected_strata(
     strata: list[radiative_guards.Stratum], args: argparse.Namespace
 ) -> tuple[list[radiative_guards.Stratum], dict[str, object]]:
     raw_sparse = getattr(args, "flat_indices", None) or []
+    raw_index_file = getattr(args, "flat_index_file", None)
     start = int(getattr(args, "bin_start", 0) or 0)
     stop = getattr(args, "bin_stop", None)
+    source_path: Optional[Path] = None
+    if raw_index_file is not None:
+        if raw_sparse:
+            raise ValueError(
+                "--flat-index-file cannot be combined with --flat-index"
+            )
+        source_path = Path(raw_index_file).expanduser().resolve()
+        if not source_path.is_file():
+            raise FileNotFoundError(source_path)
+        parsed: list[int] = []
+        for line_number, raw_line in enumerate(
+            source_path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                parsed.append(int(line))
+            except ValueError as error:
+                raise ValueError(
+                    f"{source_path}:{line_number}: expected one flat index"
+                ) from error
+        if not parsed:
+            raise ValueError(f"{source_path}: no flat indices")
+        raw_sparse = parsed
     if raw_sparse:
         if start != 0 or stop is not None:
             raise ValueError(
-                "--flat-index cannot be combined with --bin-start or "
-                "--bin-stop"
+                "sparse flat-index selection cannot be combined with "
+                "--bin-start or --bin-stop"
             )
         indices = [int(value) for value in raw_sparse]
         if len(set(indices)) != len(indices):
@@ -693,10 +719,23 @@ def _selected_strata(
                 f"--flat-index values must lie in [0,{len(strata)})"
             )
         ordered = sorted(indices)
-        return (
-            [strata[index] for index in ordered],
-            {"mode": "sparse_flat_indices", "flat_indices": ordered},
-        )
+        metadata: dict[str, object] = {
+            "mode": (
+                "flat_index_file"
+                if source_path is not None
+                else "sparse_flat_indices"
+            ),
+            "flat_indices": ordered,
+        }
+        if source_path is not None:
+            metadata.update(
+                {
+                    "source": str(source_path),
+                    "source_sha256": _sha256(source_path),
+                    "snapshot": "flat_index_selection.txt",
+                }
+            )
+        return [strata[index] for index in ordered], metadata
     resolved_stop = len(strata) if stop is None else int(stop)
     if start < 0 or resolved_stop < start or resolved_stop > len(strata):
         raise ValueError(f"invalid stratum range [{start},{resolved_stop})")
@@ -1285,6 +1324,11 @@ def prepare(args: argparse.Namespace) -> Path:
     input_directory.mkdir(parents=True, exist_ok=True)
     shutil.copy2(config_path, output / "analysis_config.json")
     shutil.copy2(recipes_path, output / "continuous_guard_recipes.json")
+    if stratum_selection.get("mode") == "flat_index_file":
+        shutil.copy2(
+            Path(str(stratum_selection["source"])),
+            output / str(stratum_selection["snapshot"]),
+        )
     if refinements_path is not None:
         shutil.copy2(
             refinements_path, output / "guard_refinements.json"
@@ -1699,6 +1743,20 @@ def run(args: argparse.Namespace) -> Path:
         )
     record = matches[0]
     root = manifest_path.parent
+    stratum_selection = manifest.get("stratum_selection") or {}
+    selection_sha256 = stratum_selection.get("source_sha256")
+    if selection_sha256 is not None:
+        selection_snapshot = root / str(
+            stratum_selection.get("snapshot", "flat_index_selection.txt")
+        )
+        if (
+            not selection_snapshot.is_file()
+            or _sha256(selection_snapshot) != selection_sha256
+        ):
+            raise Mode4Error(
+                "flat-index selection snapshot is missing or differs from "
+                "the manifest"
+            )
     run_sigr_max = (
         _run_sigr_max(manifest, record)
         if manifest["operation"] == "generation"
@@ -4081,6 +4139,15 @@ def _parser() -> argparse.ArgumentParser:
             help=(
                 "select one sparse analysis stratum; repeat as needed and "
                 "do not combine with --bin-start/--bin-stop"
+            ),
+        )
+        target.add_argument(
+            "--flat-index-file",
+            type=Path,
+            help=(
+                "file containing one flat index per line; comments and "
+                "blank lines are ignored, and it cannot be combined with "
+                "other selection options"
             ),
         )
         target.add_argument("--apply-y-max", action="store_true")
