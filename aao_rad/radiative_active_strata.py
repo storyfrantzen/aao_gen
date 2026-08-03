@@ -78,6 +78,28 @@ def _indices(stratum: radiative_guards.Stratum) -> dict[str, int]:
     }
 
 
+def _normalized_indices(value: object) -> tuple[int, int, int, int]:
+    if not isinstance(value, dict):
+        raise ValueError("indices must be an object")
+    formats = (
+        ("Q2", "xB", "minus_t", "phi_deg"),
+        ("iq2", "ixb", "it", "iphi"),
+    )
+    for names in formats:
+        if set(value) != set(names):
+            continue
+        entries = tuple(value[name] for name in names)
+        if any(
+            isinstance(entry, bool) or not isinstance(entry, int)
+            for entry in entries
+        ):
+            raise ValueError("indices must be integers")
+        return entries
+    raise ValueError(
+        "indices must use Q2/xB/minus_t/phi_deg or iq2/ixb/it/iphi"
+    )
+
+
 def _selected_strata(
     config: dict, flat_indices: Iterable[int] | None
 ) -> list[radiative_guards.Stratum]:
@@ -394,7 +416,20 @@ def _validate_catalog_metadata(
                     f"{stratum.identifier}: {label} lacks {name}"
                 )
             continue
-        if record[name] != value:
+        recorded_value = record[name]
+        try:
+            differs = (
+                _normalized_indices(recorded_value)
+                != _normalized_indices(value)
+                if name == "indices"
+                else recorded_value != value
+            )
+        except ValueError as error:
+            raise ActiveStratumError(
+                f"{stratum.identifier}: {label} has malformed indices: "
+                f"{error}"
+            ) from error
+        if differs:
             raise ActiveStratumError(
                 f"{stratum.identifier}: {label} {name} differs from the "
                 "analysis catalog"

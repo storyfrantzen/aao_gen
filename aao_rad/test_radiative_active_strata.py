@@ -83,6 +83,12 @@ class ActiveStratumWorkflowTests(unittest.TestCase):
                 {
                     "stratum_id": "s00000",
                     "flat_index": 0,
+                    "indices": {
+                        "iq2": 0,
+                        "ixb": 0,
+                        "it": 0,
+                        "iphi": 0,
+                    },
                     "integrated_cross_section_microbarn": sigma,
                     "integrated_cross_section_sem_microbarn": 1.0e-9,
                     "inside_guard": {"target_candidates": targets},
