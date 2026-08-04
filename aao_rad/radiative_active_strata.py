@@ -17,10 +17,13 @@ import math
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
+
 import radiative_guards
 import radiative_mode4
 
 
+DATA_OCCUPANCY_SCHEMA = "aao-rad-data-occupancy-v1"
 EVIDENCE_SCHEMA = "aao-rad-stratum-relevance-evidence-v1"
 MASK_SCHEMA = "aao-rad-active-stratum-mask-v1"
 PHYSICAL_STATUSES = {
@@ -188,6 +191,397 @@ def create_template(args: argparse.Namespace) -> Path:
     }
     _write_json(output, payload)
     return output
+
+
+def _one_dimensional_array(
+    sample: np.lib.npyio.NpzFile,
+    name: str,
+    expected_rows: int | None = None,
+) -> np.ndarray:
+    if name not in sample.files:
+        raise ActiveStratumError(f"data event sample lacks {name}")
+    values = np.asarray(sample[name])
+    if values.ndim != 1:
+        raise ActiveStratumError(f"data event sample {name} is not one-dimensional")
+    if expected_rows is not None and values.size != expected_rows:
+        raise ActiveStratumError(
+            f"data event sample {name} has {values.size} rows; "
+            f"expected {expected_rows}"
+        )
+    return values
+
+
+def _array_bin_indices(values: np.ndarray, edges: Iterable[float]) -> np.ndarray:
+    edge_array = np.asarray(tuple(edges), dtype=float)
+    indices = np.searchsorted(edge_array, values, side="right") - 1
+    valid = (
+        np.isfinite(values)
+        & (indices >= 0)
+        & (indices < edge_array.size - 1)
+    )
+    return np.where(valid, indices, -1).astype(np.int64, copy=False)
+
+
+def _event_key_audit(
+    run: np.ndarray | None,
+    event: np.ndarray | None,
+    selected: np.ndarray,
+) -> dict[str, object]:
+    if run is None or event is None:
+        return {
+            "available": False,
+            "selected_rows": int(selected.sum()),
+            "unique_keys": None,
+            "duplicate_rows": None,
+        }
+    if run.shape != selected.shape or event.shape != selected.shape:
+        raise ActiveStratumError(
+            "data event run/event arrays do not match the coordinate rows"
+        )
+    try:
+        run_values = np.asarray(run[selected], dtype=np.int64)
+        event_values = np.asarray(event[selected], dtype=np.int64)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ActiveStratumError(
+            "data event run/event arrays cannot be interpreted as integers"
+        ) from error
+    keys = np.column_stack((run_values, event_values))
+    unique = int(np.unique(keys, axis=0).shape[0])
+    rows = int(keys.shape[0])
+    return {
+        "available": True,
+        "selected_rows": rows,
+        "unique_keys": unique,
+        "duplicate_rows": rows - unique,
+    }
+
+
+def build_data_evidence(args: argparse.Namespace) -> Path:
+    config_path = args.config.expanduser().resolve()
+    config, config_sha256 = radiative_guards.load_analysis_config(config_path)
+    data_path = args.data_events.expanduser().resolve()
+    mask_path = args.selection_mask.expanduser().resolve()
+    output = args.output.expanduser().resolve()
+    if output.exists():
+        raise FileExistsError(f"{output} already exists")
+    if not data_path.is_file():
+        raise FileNotFoundError(data_path)
+    if not mask_path.is_file():
+        raise FileNotFoundError(mask_path)
+
+    if "target_mass" not in config:
+        raise ActiveStratumError("analysis config is missing target_mass")
+    target_mass = float(config["target_mass"])
+    beam_energy = float(config["beam_energy"])
+    if not math.isfinite(target_mass) or target_mass <= 0.0:
+        raise ActiveStratumError("analysis target_mass must be positive")
+    if not math.isfinite(beam_energy) or beam_energy <= 0.0:
+        raise ActiveStratumError("analysis beam_energy must be positive")
+
+    with np.load(data_path, allow_pickle=False) as sample:
+        q2 = np.asarray(_one_dimensional_array(sample, "rec_Q2"), dtype=float)
+        rows = q2.size
+        xb = np.asarray(
+            _one_dimensional_array(sample, "rec_xB", rows), dtype=float
+        )
+        minus_t = np.asarray(
+            _one_dimensional_array(sample, "rec_minus_t", rows), dtype=float
+        )
+        phi_rad = np.asarray(
+            _one_dimensional_array(sample, "rec_trento_phi", rows), dtype=float
+        )
+        run = (
+            _one_dimensional_array(sample, "run", rows)
+            if "run" in sample.files
+            else None
+        )
+        event = (
+            _one_dimensional_array(sample, "event", rows)
+            if "event" in sample.files
+            else None
+        )
+
+    raw_mask = np.asarray(np.load(mask_path, allow_pickle=False))
+    if raw_mask.ndim != 1 or raw_mask.size != rows:
+        raise ActiveStratumError(
+            f"selection mask has shape {raw_mask.shape}; expected ({rows},)"
+        )
+    if raw_mask.dtype != np.bool_:
+        raise ActiveStratumError("selection mask must have boolean dtype")
+    selected = np.ones(rows, dtype=bool)
+
+    cut_flow: list[dict[str, object]] = [
+        {
+            "stage": "input_rows",
+            "applied": True,
+            "rows_before": rows,
+            "rows_removed": 0,
+            "rows_remaining": rows,
+        }
+    ]
+
+    def apply_cut(
+        name: str,
+        condition: np.ndarray,
+        *,
+        applied: bool = True,
+    ) -> None:
+        nonlocal selected
+        before = int(selected.sum())
+        if applied:
+            selected &= condition
+        remaining = int(selected.sum())
+        cut_flow.append(
+            {
+                "stage": name,
+                "applied": applied,
+                "rows_before": before,
+                "rows_removed": before - remaining,
+                "rows_remaining": remaining,
+            }
+        )
+
+    apply_cut("exclusivity_selection_mask", raw_mask)
+    finite_coordinates = (
+        np.isfinite(q2)
+        & np.isfinite(xb)
+        & np.isfinite(minus_t)
+        & np.isfinite(phi_rad)
+    )
+    apply_cut("finite_analysis_coordinates", finite_coordinates)
+    apply_cut("positive_xB", xb > 0.0)
+
+    phase_space = config.get("phase_space", {})
+    q2_minimum = phase_space.get("Q2_min")
+    if q2_minimum is None:
+        apply_cut("Q2_min", np.ones(rows, dtype=bool), applied=False)
+    else:
+        q2_minimum = float(q2_minimum)
+        if not math.isfinite(q2_minimum) or q2_minimum < 0.0:
+            raise ActiveStratumError(
+                "phase_space.Q2_min must be finite and nonnegative"
+            )
+        apply_cut("Q2_min", q2 >= q2_minimum)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        y = q2 / (2.0 * target_mass * beam_energy * xb)
+        w_squared = target_mass * target_mass + q2 * (1.0 / xb - 1.0)
+    w_minimum = float(phase_space["W_min"])
+    if not math.isfinite(w_minimum) or w_minimum <= 0.0:
+        raise ActiveStratumError("phase_space.W_min must be positive")
+    apply_cut(
+        "W_min",
+        np.isfinite(w_squared) & (w_squared >= w_minimum * w_minimum),
+    )
+
+    y_maximum = phase_space.get("y_max")
+    if y_maximum is None:
+        apply_cut("y_max", np.ones(rows, dtype=bool), applied=False)
+    else:
+        y_maximum = float(y_maximum)
+        if not 0.0 < y_maximum <= 1.0:
+            raise ActiveStratumError("phase_space.y_max must lie in (0,1]")
+        apply_cut("y_max", np.isfinite(y) & (y <= y_maximum))
+
+    binning = config["binning"]
+    iq2 = _array_bin_indices(q2, binning["Q2"])
+    ixb = _array_bin_indices(xb, binning["xB"])
+    it = _array_bin_indices(minus_t, binning["minus_t"])
+    phi_edges = tuple(float(value) for value in binning["phi_deg"])
+    phi_origin = phi_edges[0]
+    phi_deg = phi_origin + np.mod(
+        np.degrees(phi_rad) - phi_origin, 360.0
+    )
+    iphi = _array_bin_indices(phi_deg, phi_edges)
+    inside_binning = (iq2 >= 0) & (ixb >= 0) & (it >= 0) & (iphi >= 0)
+    apply_cut("analysis_binning", inside_binning)
+
+    nq2 = len(binning["Q2"]) - 1
+    nt = len(binning["minus_t"]) - 1
+    nphi = len(binning["phi_deg"]) - 1
+    flat = ixb * nq2 * nphi * nt + iq2 * nphi * nt + iphi * nt + it
+    flat = np.where(inside_binning, flat, -1).astype(np.int64, copy=False)
+    catalog = radiative_guards.enumerate_strata(config)
+    counts = np.bincount(flat[selected], minlength=len(catalog)).astype(
+        np.int64, copy=False
+    )
+    if counts.size != len(catalog):
+        raise AssertionError("data occupancy does not match the catalog size")
+    selected_rows = int(selected.sum())
+    if int(counts.sum()) != selected_rows:
+        raise AssertionError("data occupancy does not conserve selected rows")
+
+    key_audit = _event_key_audit(run, event, selected)
+    if (
+        not args.allow_duplicate_event_keys
+        and int(key_audit.get("duplicate_rows") or 0) > 0
+    ):
+        raise ActiveStratumError(
+            "selected data contain duplicate (run,event) keys; pass "
+            "--allow-duplicate-event-keys only after auditing the overlap"
+        )
+
+    strata = []
+    for stratum, count_value in zip(catalog, counts, strict=True):
+        count = int(count_value)
+        strata.append(
+            {
+                "stratum_id": stratum.identifier,
+                "flat_index": stratum.flat_index,
+                "indices": _indices(stratum),
+                "bounds": _bounds(stratum),
+                "data_events": count,
+                "data_event_fraction": (
+                    count / selected_rows if selected_rows else 0.0
+                ),
+            }
+        )
+
+    occupancy_payload = {
+        "schema": DATA_OCCUPANCY_SCHEMA,
+        "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "builder_revision": radiative_mode4._source_revision(),
+        "builder_source_sha256": _sha256(Path(__file__).resolve()),
+        "analysis_config": str(config_path),
+        "analysis_config_sha256": config_sha256,
+        "data_events": {
+            "path": str(data_path),
+            "sha256": _sha256(data_path),
+        },
+        "selection_mask": {
+            "path": str(mask_path),
+            "sha256": _sha256(mask_path),
+        },
+        "coordinate_definition": {
+            "source": "reconstructed selected EPPI0 candidate",
+            "Q2": "rec_Q2",
+            "xB": "rec_xB",
+            "minus_t": "rec_minus_t",
+            "phi": "rec_trento_phi in radians, wrapped periodically",
+            "y_formula": "Q2/(2*target_mass*beam_energy*xB)",
+            "W2_formula": "target_mass^2+Q2*(1/xB-1)",
+        },
+        "selection_policy": {
+            "Q2_min": q2_minimum,
+            "W_min": w_minimum,
+            "y_max": y_maximum,
+            "y_max_applied": y_maximum is not None,
+            "analysis_bin_edges_are_half_open": True,
+        },
+        "cut_flow": cut_flow,
+        "event_key_audit": key_audit,
+        "catalog_summary": {
+            "strata_total": len(catalog),
+            "selected_data_events": selected_rows,
+            "occupied_strata": int(np.count_nonzero(counts)),
+            "strata_with_at_least_5_events": int(np.count_nonzero(counts >= 5)),
+            "strata_with_at_least_10_events": int(
+                np.count_nonzero(counts >= 10)
+            ),
+            "strata_with_at_least_50_events": int(
+                np.count_nonzero(counts >= 50)
+            ),
+        },
+        "zero_data_events_do_not_prove_structural_emptiness": True,
+        "strata": strata,
+    }
+
+    output.mkdir(parents=True)
+    occupancy_path = output / "data_occupancy.json"
+    _write_json(occupancy_path, occupancy_payload)
+    occupancy_sha256 = _sha256(occupancy_path)
+    source_identifier = "selected_data_occupancy"
+    relevance_payload = {
+        "schema": EVIDENCE_SCHEMA,
+        "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "analysis_config": str(config_path),
+        "analysis_config_sha256": config_sha256,
+        "instructions": {
+            "physical_status_values": sorted(PHYSICAL_STATUSES),
+            "fractions_are_relative_to_the_full_analysis_prediction": True,
+            "zero_mc_targets_do_not_prove_structural_emptiness": True,
+            "zero_data_events_do_not_prove_structural_emptiness": True,
+            "data_occupancy_alone_does_not_define_analysis_inclusion": True,
+            "nondefault_claims_require_rationale_and_source_ids": True,
+        },
+        "sources": [
+            {
+                "identifier": source_identifier,
+                "path": str(occupancy_path),
+                "sha256": occupancy_sha256,
+            }
+        ],
+        "strata": [
+            {
+                "stratum_id": record["stratum_id"],
+                "flat_index": record["flat_index"],
+                "indices": record["indices"],
+                "bounds": record["bounds"],
+                "physical_status": "unknown",
+                "analysis_included": None,
+                "data_events": record["data_events"],
+                "model_cross_section_fraction": None,
+                "maximum_feed_in_fraction": None,
+                "global_closure_impact_fraction": None,
+                "force_active": False,
+                "rationale": (
+                    "Observed exclusivity-selected reconstructed data "
+                    "occupancy; a zero count is finite-sample evidence only "
+                    "and does not establish structural emptiness."
+                ),
+                "source_ids": [source_identifier],
+            }
+            for record in strata
+        ],
+    }
+    relevance_path = output / "relevance_evidence.json"
+    _write_json(relevance_path, relevance_payload)
+
+    fields = (
+        "flat_index",
+        "stratum_id",
+        "Q2",
+        "xB",
+        "minus_t",
+        "phi_deg",
+        "data_events",
+        "data_event_fraction",
+    )
+    with (output / "data_occupancy.tsv").open(
+        "w", encoding="utf-8", newline=""
+    ) as destination:
+        writer = csv.DictWriter(destination, fieldnames=fields, delimiter="\t")
+        writer.writeheader()
+        for record in strata:
+            bounds = record["bounds"]
+            writer.writerow(
+                {
+                    "flat_index": record["flat_index"],
+                    "stratum_id": record["stratum_id"],
+                    "Q2": ":".join(str(value) for value in bounds["Q2"]),
+                    "xB": ":".join(str(value) for value in bounds["xB"]),
+                    "minus_t": ":".join(
+                        str(value) for value in bounds["minus_t"]
+                    ),
+                    "phi_deg": ":".join(
+                        str(value) for value in bounds["phi_deg"]
+                    ),
+                    "data_events": record["data_events"],
+                    "data_event_fraction": record["data_event_fraction"],
+                }
+            )
+
+    for threshold in (1, 5, 10, 50):
+        label = "occupied" if threshold == 1 else f"at_least_{threshold}_events"
+        values = [
+            str(record["flat_index"])
+            for record in strata
+            if int(record["data_events"]) >= threshold
+        ]
+        (output / f"{label}_flat_indices.txt").write_text(
+            "".join(f"{value}\n" for value in values), encoding="utf-8"
+        )
+    return relevance_path
 
 
 def _load_relevance(
@@ -816,6 +1210,26 @@ def _parser() -> argparse.ArgumentParser:
         help="external evidence artifact as IDENTIFIER=PATH",
     )
 
+    data = subparsers.add_parser(
+        "build-data-evidence",
+        help=(
+            "build full-catalog reconstructed-data occupancy and compatible "
+            "relevance evidence"
+        ),
+    )
+    data.add_argument("--config", type=Path, required=True)
+    data.add_argument("--data-events", type=Path, required=True)
+    data.add_argument("--selection-mask", type=Path, required=True)
+    data.add_argument("--output", type=Path, required=True)
+    data.add_argument(
+        "--allow-duplicate-event-keys",
+        action="store_true",
+        help=(
+            "permit repeated (run,event) keys after selection; disabled by "
+            "default because overlaps would double-count data"
+        ),
+    )
+
     classifier = subparsers.add_parser(
         "classify",
         help="classify physical support, relevance, and generator readiness",
@@ -856,11 +1270,12 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = _parser().parse_args()
-    result = (
-        create_template(args)
-        if args.command == "create-template"
-        else classify(args)
-    )
+    if args.command == "create-template":
+        result = create_template(args)
+    elif args.command == "build-data-evidence":
+        result = build_data_evidence(args)
+    else:
+        result = classify(args)
     print(result)
     return 0
 

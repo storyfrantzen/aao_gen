@@ -27,6 +27,43 @@ impact all lie below declared analysis thresholds.
 The first three statuses form `active_flat_indices.txt`. Only
 `active_ready` appears in `production_ready_flat_indices.txt`.
 
+## Build reconstructed-data occupancy evidence
+
+Build the full analysis-catalog occupancy table directly from the selected
+data artifact and its exclusivity mask:
+
+```bash
+python3 radiative_active_strata.py build-data-evidence \
+  --config analysis_ymax0p95.json \
+  --data-events data_events.npz \
+  --selection-mask data_exclusivity.npy \
+  --output data_occupancy_iteration000
+```
+
+The command reapplies the configured `Q2_min`, `W_min`, and optional `y_max`
+selection in reconstructed coordinates before assigning the half-open
+analysis bins. It verifies array lengths, requires a boolean selection mask,
+checks selected `(run,event)` keys for accidental duplication, and records
+SHA-256 digests for every input. Duplicate keys fail by default; use
+`--allow-duplicate-event-keys` only after demonstrating that the overlap is
+intentional.
+
+The immutable output directory contains:
+
+- `data_occupancy.json`: cut flow, coordinate definitions, input provenance,
+  catalog summary, and all per-stratum counts;
+- `data_occupancy.tsv`: a compact 12,960-row review table for the RGK binning;
+- `relevance_evidence.json`: a directly compatible input to `classify`;
+- `occupied_flat_indices.txt` plus lists requiring at least 5, 10, or 50 data
+  events.
+
+Positive data occupancy makes a stratum relevant to the analysis, but the
+builder deliberately leaves `physical_status` and `analysis_included`
+unknown. A reconstructed event does not by itself prove generator-level
+physical support, and a zero count never proves structural emptiness or
+negligibility. Model, feed-in, and global-closure evidence must be added
+separately before an unoccupied stratum can become `closure_only`.
+
 ## Create an evidence template
 
 Create the template only after identifying the analysis artifacts that will
