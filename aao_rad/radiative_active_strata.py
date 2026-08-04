@@ -29,6 +29,7 @@ SURVEY_MODEL_SCHEMA = "aao-rad-survey-model-evidence-v1"
 EVIDENCE_SCHEMA = "aao-rad-stratum-relevance-evidence-v1"
 MASK_SCHEMA = "aao-rad-active-stratum-mask-v1"
 CUMULATIVE_QUEUE_SCHEMA = "aao-rad-cumulative-stratum-queue-v1"
+STRATIFIED_BATCH_SCHEMA = "aao-rad-stratified-calibration-batch-v1"
 PHYSICAL_STATUSES = {
     "unknown",
     "nonempty",
@@ -1624,6 +1625,366 @@ def build_cumulative_queue(args: argparse.Namespace) -> Path:
     return json_path
 
 
+def _normalized_stratum_distance_squared(
+    first: tuple[int, int, int, int],
+    second: tuple[int, int, int, int],
+    axis_bins: tuple[int, int, int, int],
+) -> float:
+    """Distance in bin-index space, with periodic phi."""
+
+    _, first_xb, first_t, first_phi = first
+    _, second_xb, second_t, second_phi = second
+    _, xb_bins, t_bins, phi_bins = axis_bins
+    xb_scale = max(1, xb_bins - 1)
+    t_scale = max(1, t_bins - 1)
+    phi_scale = max(1.0, phi_bins / 2.0)
+    phi_difference = abs(first_phi - second_phi)
+    phi_difference = min(phi_difference, phi_bins - phi_difference)
+    return (
+        ((first_xb - second_xb) / xb_scale) ** 2
+        + ((first_t - second_t) / t_scale) ** 2
+        + (phi_difference / phi_scale) ** 2
+    )
+
+
+def select_stratified_batch(args: argparse.Namespace) -> Path:
+    """Select a deterministic maximin calibration-scale batch."""
+
+    queue_path = args.queue.expanduser().resolve()
+    output = args.output.expanduser().resolve()
+    if output.exists():
+        raise FileExistsError(f"{output} already exists")
+    if args.representatives_per_q2_basis < 1:
+        raise ValueError("--representatives-per-q2-basis must be positive")
+    if not queue_path.is_file():
+        raise FileNotFoundError(queue_path)
+    queue_sha256 = _sha256(queue_path)
+    queue = json.loads(queue_path.read_text(encoding="utf-8"))
+    if queue.get("schema") != CUMULATIVE_QUEUE_SCHEMA:
+        raise ActiveStratumError(
+            f"{queue_path}: expected schema {CUMULATIVE_QUEUE_SCHEMA}"
+        )
+
+    config_path = Path(str(queue.get("analysis_config", ""))).expanduser().resolve()
+    if not config_path.is_file():
+        raise FileNotFoundError(config_path)
+    config, config_sha256 = radiative_guards.load_analysis_config(config_path)
+    if queue.get("analysis_config_sha256") != config_sha256:
+        raise ActiveStratumError(
+            "cumulative queue analysis configuration hash differs"
+        )
+    catalog = radiative_guards.enumerate_strata(config)
+    catalog_lookup = {stratum.identifier: stratum for stratum in catalog}
+    raw_records = queue.get("strata")
+    if not isinstance(raw_records, list) or len(raw_records) != len(catalog):
+        raise ActiveStratumError(
+            "cumulative queue does not contain the full analysis catalog"
+        )
+    records: list[dict[str, object]] = []
+    identifiers: set[str] = set()
+    for raw in raw_records:
+        if not isinstance(raw, dict):
+            raise ActiveStratumError("cumulative queue has a malformed record")
+        record = dict(raw)
+        identifier = str(record.get("stratum_id", ""))
+        if identifier not in catalog_lookup or identifier in identifiers:
+            raise ActiveStratumError(
+                "cumulative queue has an unknown or duplicate stratum"
+            )
+        identifiers.add(identifier)
+        _validate_catalog_metadata(
+            catalog_lookup[identifier],
+            record,
+            label="cumulative queue",
+            required=True,
+        )
+        if record.get("selected") not in (True, False):
+            raise ActiveStratumError(
+                f"{identifier}: cumulative queue selected must be boolean"
+            )
+        fraction = record.get("model_cross_section_fraction")
+        data_events = record.get("data_events")
+        if fraction is None or data_events is None:
+            raise ActiveStratumError(
+                f"{identifier}: cumulative queue lacks ranking fields"
+            )
+        fraction = float(fraction)
+        events = float(data_events)
+        if (
+            not math.isfinite(fraction)
+            or fraction < 0.0
+            or not math.isfinite(events)
+            or events < 0.0
+            or not events.is_integer()
+        ):
+            raise ActiveStratumError(
+                f"{identifier}: cumulative queue has invalid ranking fields"
+            )
+        record["model_cross_section_fraction"] = fraction
+        record["data_events"] = int(events)
+        records.append(record)
+    if identifiers != set(catalog_lookup):
+        raise ActiveStratumError(
+            "cumulative queue stratum identifiers differ from the catalog"
+        )
+    recorded_selected = int((queue.get("summary") or {}).get("selected_strata", -1))
+    actual_selected = sum(record["selected"] is True for record in records)
+    if recorded_selected != actual_selected:
+        raise ActiveStratumError(
+            "cumulative queue selected count differs from its summary"
+        )
+
+    default_bases = ("data_occupancy", "cumulative_model_tail")
+    bases = tuple(args.selection_bases or default_bases)
+    if len(set(bases)) != len(bases):
+        raise ValueError("duplicate --selection-basis")
+    unknown_bases = sorted(set(bases) - set(default_bases))
+    if unknown_bases:
+        raise ValueError(
+            "unsupported --selection-basis values: "
+            + ", ".join(unknown_bases)
+        )
+    axis_bins = tuple(
+        len(config["binning"][name]) - 1
+        for name in ("Q2", "xB", "minus_t", "phi_deg")
+    )
+    q2_bins = axis_bins[0]
+    eligible = [
+        record
+        for record in records
+        if record["selected"] is True
+        and record.get("work_category") == args.work_category
+        and record.get("selection_basis") in bases
+    ]
+    groups: dict[tuple[str, int], list[dict[str, object]]] = {
+        (basis, iq2): [] for basis in bases for iq2 in range(q2_bins)
+    }
+    normalized_indices: dict[int, tuple[int, int, int, int]] = {}
+    for record in eligible:
+        indices = _normalized_indices(record["indices"])
+        flat_index = int(record["flat_index"])
+        normalized_indices[flat_index] = indices
+        key = (str(record["selection_basis"]), indices[0])
+        groups[key].append(record)
+
+    chosen: list[dict[str, object]] = []
+    group_summaries: list[dict[str, object]] = []
+    for basis in bases:
+        for iq2 in range(q2_bins):
+            candidates = groups[(basis, iq2)]
+            required = args.representatives_per_q2_basis
+            if len(candidates) < required:
+                raise ActiveStratumError(
+                    f"{basis}, Q2 index {iq2}: only {len(candidates)} "
+                    f"eligible {args.work_category} strata; {required} required"
+                )
+            remaining = list(candidates)
+            group_selected: list[dict[str, object]] = []
+            selection_details: list[dict[str, object]] = []
+            anchor = max(
+                remaining,
+                key=lambda record: (
+                    float(record["model_cross_section_fraction"]),
+                    int(record["data_events"]),
+                    -int(record["flat_index"]),
+                ),
+            )
+            remaining.remove(anchor)
+            group_selected.append(anchor)
+            selection_details.append(
+                {
+                    "record": anchor,
+                    "selection_role": "largest_model_contribution_anchor",
+                    "minimum_normalized_distance_squared": None,
+                }
+            )
+            while len(group_selected) < required:
+                distance_by_flat_index = {
+                    int(candidate["flat_index"]): min(
+                        _normalized_stratum_distance_squared(
+                            normalized_indices[int(candidate["flat_index"])],
+                            normalized_indices[int(selected["flat_index"])],
+                            axis_bins,
+                        )
+                        for selected in group_selected
+                    )
+                    for candidate in remaining
+                }
+                next_record = max(
+                    remaining,
+                    key=lambda record: (
+                        distance_by_flat_index[int(record["flat_index"])],
+                        float(record["model_cross_section_fraction"]),
+                        int(record["data_events"]),
+                        -int(record["flat_index"]),
+                    ),
+                )
+                remaining.remove(next_record)
+                group_selected.append(next_record)
+                selection_details.append(
+                    {
+                        "record": next_record,
+                        "selection_role": "normalized_index_maximin",
+                        "minimum_normalized_distance_squared": (
+                            distance_by_flat_index[
+                                int(next_record["flat_index"])
+                            ]
+                        ),
+                    }
+                )
+
+            selected_indices: list[int] = []
+            for within_group_rank, detail in enumerate(
+                selection_details, start=1
+            ):
+                source = detail.pop("record")
+                flat_index = int(source["flat_index"])
+                selected_indices.append(flat_index)
+                chosen.append(
+                    {
+                        **source,
+                        "batch_rank": len(chosen) + 1,
+                        "within_group_rank": within_group_rank,
+                        "selection_role": detail["selection_role"],
+                        "minimum_normalized_distance_squared": detail[
+                            "minimum_normalized_distance_squared"
+                        ],
+                    }
+                )
+            group_summaries.append(
+                {
+                    "selection_basis": basis,
+                    "q2_index": iq2,
+                    "q2_bounds": list(config["binning"]["Q2"][iq2 : iq2 + 2]),
+                    "eligible_strata": len(candidates),
+                    "selected_flat_indices": selected_indices,
+                }
+            )
+
+    if len({int(record["flat_index"]) for record in chosen}) != len(chosen):
+        raise ActiveStratumError("stratified selection produced duplicates")
+    basis_counts = {
+        basis: sum(record["selection_basis"] == basis for record in chosen)
+        for basis in bases
+    }
+    q2_counts = {
+        str(iq2): sum(
+            _normalized_indices(record["indices"])[0] == iq2
+            for record in chosen
+        )
+        for iq2 in range(q2_bins)
+    }
+    payload = {
+        "schema": STRATIFIED_BATCH_SCHEMA,
+        "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "builder_revision": radiative_mode4._source_revision(),
+        "builder_source_sha256": _sha256(Path(__file__).resolve()),
+        "analysis_config": str(config_path),
+        "analysis_config_sha256": config_sha256,
+        "cumulative_queue": str(queue_path),
+        "cumulative_queue_sha256": queue_sha256,
+        "cumulative_queue_summary": queue.get("summary"),
+        "selection_policy": {
+            "work_category": args.work_category,
+            "selection_bases": list(bases),
+            "representatives_per_q2_basis": (
+                args.representatives_per_q2_basis
+            ),
+            "anchor": (
+                "largest model fraction, then data events, then lowest "
+                "flat index"
+            ),
+            "additional_representatives": (
+                "maximin squared distance in normalized xB/-t/periodic-phi "
+                "bin-index space; ties use model fraction, data events, "
+                "then lowest flat index"
+            ),
+            "no_random_selection": True,
+        },
+        "summary": {
+            "selected_strata": len(chosen),
+            "basis_counts": basis_counts,
+            "q2_index_counts": q2_counts,
+            "selected_model_cross_section_fraction": math.fsum(
+                float(record["model_cross_section_fraction"])
+                for record in chosen
+            ),
+        },
+        "groups": group_summaries,
+        "strata": chosen,
+    }
+
+    output.mkdir(parents=True)
+    json_path = output / "stratified_batch.json"
+    _write_json(json_path, payload)
+    fields = (
+        "batch_rank",
+        "flat_index",
+        "stratum_id",
+        "selection_basis",
+        "work_category",
+        "within_group_rank",
+        "selection_role",
+        "minimum_normalized_distance_squared",
+        "data_events",
+        "model_cross_section_fraction",
+        "pooled_ess",
+        "Q2",
+        "xB",
+        "minus_t",
+        "phi_deg",
+    )
+    with (output / "stratified_batch.tsv").open(
+        "w", encoding="utf-8", newline=""
+    ) as destination:
+        writer = csv.DictWriter(destination, fieldnames=fields, delimiter="\t")
+        writer.writeheader()
+        for record in chosen:
+            bounds = record["bounds"]
+            survey = record.get("survey_model_evidence") or {}
+            writer.writerow(
+                {
+                    "batch_rank": record["batch_rank"],
+                    "flat_index": record["flat_index"],
+                    "stratum_id": record["stratum_id"],
+                    "selection_basis": record["selection_basis"],
+                    "work_category": record["work_category"],
+                    "within_group_rank": record["within_group_rank"],
+                    "selection_role": record["selection_role"],
+                    "minimum_normalized_distance_squared": record[
+                        "minimum_normalized_distance_squared"
+                    ],
+                    "data_events": record["data_events"],
+                    "model_cross_section_fraction": record[
+                        "model_cross_section_fraction"
+                    ],
+                    "pooled_ess": survey.get("pooled_ess"),
+                    "Q2": ":".join(str(value) for value in bounds["Q2"]),
+                    "xB": ":".join(str(value) for value in bounds["xB"]),
+                    "minus_t": ":".join(
+                        str(value) for value in bounds["minus_t"]
+                    ),
+                    "phi_deg": ":".join(
+                        str(value) for value in bounds["phi_deg"]
+                    ),
+                }
+            )
+    (output / "selected_flat_indices.txt").write_text(
+        "".join(f"{int(record['flat_index'])}\n" for record in chosen),
+        encoding="utf-8",
+    )
+    for basis in bases:
+        (output / f"{basis}_flat_indices.txt").write_text(
+            "".join(
+                f"{int(record['flat_index'])}\n"
+                for record in chosen
+                if record["selection_basis"] == basis
+            ),
+            encoding="utf-8",
+        )
+    return json_path
+
+
 def _load_calibrations(
     paths: Iterable[Path], config_sha256: str
 ) -> tuple[dict[str, dict[str, object]], list[dict[str, object]]]:
@@ -2176,6 +2537,25 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
     )
 
+    batch = subparsers.add_parser(
+        "select-stratified-batch",
+        help=(
+            "select a deterministic maximin scale batch from a cumulative "
+            "work queue"
+        ),
+    )
+    batch.add_argument("--queue", type=Path, required=True)
+    batch.add_argument("--output", type=Path, required=True)
+    batch.add_argument(
+        "--work-category", default="supported_calibration"
+    )
+    batch.add_argument(
+        "--selection-basis", dest="selection_bases", action="append"
+    )
+    batch.add_argument(
+        "--representatives-per-q2-basis", type=int, default=2
+    )
+
     classifier = subparsers.add_parser(
         "classify",
         help="classify physical support, relevance, and generator readiness",
@@ -2224,6 +2604,8 @@ def main() -> int:
         result = augment_survey_evidence(args)
     elif args.command == "build-cumulative-queue":
         result = build_cumulative_queue(args)
+    elif args.command == "select-stratified-batch":
+        result = select_stratified_batch(args)
     else:
         result = classify(args)
     print(result)

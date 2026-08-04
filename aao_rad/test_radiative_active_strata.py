@@ -309,6 +309,88 @@ class ActiveStratumWorkflowTests(unittest.TestCase):
         )
         return manifest, validation
 
+    def _write_stratified_queue(self) -> Path:
+        config = self.root / "stratified_config.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "beam_energy": 6.535,
+                    "phase_space": {"W_min": 2.0},
+                    "binning": {
+                        "Q2": [1.0, 2.0, 3.0],
+                        "xB": [0.2, 0.3, 0.4],
+                        "minus_t": [0.1, 0.2, 0.3],
+                        "phi_deg": [0.0, 180.0, 360.0],
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        config_payload, config_sha256 = active.radiative_guards.load_analysis_config(
+            config
+        )
+        catalog = active.radiative_guards.enumerate_strata(config_payload)
+        total_weight = sum(range(1, len(catalog) + 1))
+        records = []
+        for weight, stratum in enumerate(catalog, start=1):
+            basis = (
+                "data_occupancy"
+                if stratum.ixb == 0
+                else "cumulative_model_tail"
+            )
+            records.append(
+                {
+                    "stratum_id": stratum.identifier,
+                    "flat_index": stratum.flat_index,
+                    "indices": active._indices(stratum),
+                    "bounds": active._bounds(stratum),
+                    "data_events": (
+                        100 - stratum.flat_index
+                        if basis == "data_occupancy"
+                        else 0
+                    ),
+                    "model_cross_section_fraction": weight / total_weight,
+                    "survey_model_evidence": {
+                        "support_status": "independent_support",
+                        "parent_coverage_status": "passed",
+                        "pooled_cross_section_microbarn": weight * 1.0e-9,
+                        "pooled_sem_microbarn": 1.0e-10,
+                        "pooled_ess": 25.0 + weight,
+                    },
+                    "selected": True,
+                    "selection_basis": basis,
+                    "calibration_priority_rank": stratum.flat_index + 1,
+                    "zero_data_model_rank": (
+                        stratum.flat_index + 1
+                        if basis == "cumulative_model_tail"
+                        else None
+                    ),
+                    "zero_data_cumulative_selected_model_fraction": None,
+                    "work_category": "supported_calibration",
+                }
+            )
+        path = self.root / "stratified_queue.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": active.CUMULATIVE_QUEUE_SCHEMA,
+                    "analysis_config": str(config.resolve()),
+                    "analysis_config_sha256": config_sha256,
+                    "summary": {
+                        "catalog_strata": len(catalog),
+                        "selected_strata": len(catalog),
+                    },
+                    "strata": records,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return path
+
     def test_template_hashes_external_sources(self) -> None:
         template = self._template()
         payload = json.loads(template.read_text(encoding="utf-8"))
@@ -675,6 +757,82 @@ class ActiveStratumWorkflowTests(unittest.TestCase):
             payload["summary"]["actual_global_model_residual_fraction"],
             0.25,
         )
+
+    def test_stratified_batch_selects_two_bases_across_q2(self) -> None:
+        queue = self._write_stratified_queue()
+        output = self.root / "stratified_batch"
+        result = active.select_stratified_batch(
+            argparse.Namespace(
+                queue=queue,
+                output=output,
+                work_category="supported_calibration",
+                selection_bases=None,
+                representatives_per_q2_basis=2,
+            )
+        )
+        payload = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(payload["schema"], active.STRATIFIED_BATCH_SCHEMA)
+        self.assertEqual(payload["summary"]["selected_strata"], 8)
+        self.assertEqual(
+            payload["summary"]["basis_counts"],
+            {"data_occupancy": 4, "cumulative_model_tail": 4},
+        )
+        self.assertEqual(
+            payload["summary"]["q2_index_counts"], {"0": 4, "1": 4}
+        )
+        self.assertEqual(len(payload["groups"]), 4)
+        self.assertTrue(
+            all(group["eligible_strata"] == 4 for group in payload["groups"])
+        )
+        for group in payload["groups"]:
+            self.assertEqual(len(group["selected_flat_indices"]), 2)
+        roles = [record["selection_role"] for record in payload["strata"]]
+        self.assertEqual(roles.count("largest_model_contribution_anchor"), 4)
+        self.assertEqual(roles.count("normalized_index_maximin"), 4)
+        self.assertTrue(
+            all(
+                record["minimum_normalized_distance_squared"] > 0.0
+                for record in payload["strata"]
+                if record["selection_role"] == "normalized_index_maximin"
+            )
+        )
+        selected_lines = (
+            output / "selected_flat_indices.txt"
+        ).read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(selected_lines), 8)
+        self.assertEqual(len(set(selected_lines)), 8)
+
+        repeat_output = self.root / "stratified_batch_repeat"
+        active.select_stratified_batch(
+            argparse.Namespace(
+                queue=queue,
+                output=repeat_output,
+                work_category="supported_calibration",
+                selection_bases=None,
+                representatives_per_q2_basis=2,
+            )
+        )
+        self.assertEqual(
+            (output / "selected_flat_indices.txt").read_text(encoding="utf-8"),
+            (repeat_output / "selected_flat_indices.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    def test_stratified_batch_requires_enough_strata_in_every_group(self) -> None:
+        queue = self._write_stratified_queue()
+        with self.assertRaisesRegex(
+            active.ActiveStratumError, "only 4 eligible"
+        ):
+            active.select_stratified_batch(
+                argparse.Namespace(
+                    queue=queue,
+                    output=self.root / "oversized_stratified_batch",
+                    work_category="supported_calibration",
+                    selection_bases=None,
+                    representatives_per_q2_basis=5,
+                )
+            )
 
     def test_zero_calibration_never_implies_structural_emptiness(self) -> None:
         template = self._template()

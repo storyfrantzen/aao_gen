@@ -156,6 +156,47 @@ Omitted means only that the current pooled model contribution lies within the
 declared global residual. It does not establish structural emptiness. GEMC
 feed-in evidence can reactivate an omitted stratum in a later queue revision.
 
+## Select a representative calibration-scale batch
+
+Do not use the first entries in the cumulative queue as a scale test: data
+priority would bias that sample toward the most populated low-kinematics
+strata. Build an audited batch with equal representation from the
+data-occupied and cumulative-model-tail selections in every `Q2` interval:
+
+```bash
+python3 radiative_active_strata.py select-stratified-batch \
+  --queue cumulative_queue_iteration000/cumulative_stratum_queue.json \
+  --work-category supported_calibration \
+  --selection-basis data_occupancy \
+  --selection-basis cumulative_model_tail \
+  --representatives-per-q2-basis 2 \
+  --output supported_scale_batch_iteration000
+```
+
+For RGK this policy selects 36 strata: two selection bases, nine `Q2`
+intervals, and two representatives per group. The first representative has
+the largest model fraction in its group. Further representatives maximize
+their minimum distance from those already selected in normalized
+`xB`/`-t`/periodic-phi bin-index space. Deterministic ties prefer model
+fraction, data occupancy, and then the lower flat index. No pseudorandom
+choice is made.
+
+The selector verifies the cumulative-queue schema, full analysis catalog,
+configuration hash, selected count, ranking fields, and requested group
+support. It refuses to silently return a smaller batch when a group lacks the
+requested number of candidates. Its immutable output contains:
+
+- `stratified_batch.json`, including the source queue path and SHA-256, exact
+  maximin policy, group candidate counts, and every selection decision;
+- `stratified_batch.tsv` for review;
+- `selected_flat_indices.txt`, directly accepted by
+  `radiative_mode4.py prepare-calibration --flat-index-file`;
+- one selected list for each requested relevance basis.
+
+This is a representativeness and workflow-scale diagnostic. It does not
+change the cumulative census or imply that any selected guard has a calibrated
+production envelope.
+
 ## Create an evidence template
 
 Create the template only after identifying the analysis artifacts that will
