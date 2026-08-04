@@ -213,6 +213,102 @@ class ActiveStratumWorkflowTests(unittest.TestCase):
         np.save(mask, values)
         return config, data, mask
 
+    def _write_survey_evidence_inputs(
+        self, config: Path
+    ) -> tuple[Path, Path]:
+        config_payload, config_sha256 = active.radiative_guards.load_analysis_config(
+            config
+        )
+        catalog = active.radiative_guards.enumerate_strata(config_payload)
+        proposals = 100
+
+        def metrics(
+            count: int, total: float, square: float, maximum: float
+        ) -> dict:
+            return active.radiative_guards._metrics(
+                active.radiative_guards.Moment(
+                    count=count,
+                    total=total,
+                    square_total=square,
+                    maximum=maximum,
+                ),
+                proposals,
+            )
+
+        training_values = (
+            metrics(1, 3.0, 9.0, 3.0),
+            metrics(1, 2.0, 4.0, 2.0),
+            metrics(0, 0.0, 0.0, 0.0),
+            metrics(0, 0.0, 0.0, 0.0),
+        )
+        manifest = self.root / "migration_manifest.json"
+        manifest_payload = {
+            "schema": active.radiative_migrations.MANIFEST_SCHEMA,
+            "analysis_config_sha256": config_sha256,
+            "analysis_selection": {
+                "q2_minimum": 1.0,
+                "w_minimum": 2.0,
+                "apply_y_max": True,
+                "y_maximum": 0.95,
+            },
+            "generator_revision": "test-generator-revision",
+            "generator_revision_source": "test",
+            "training": {
+                "total_proposals": proposals,
+                "inside_analysis_partition": metrics(2, 5.0, 13.0, 3.0),
+            },
+            "strata": {
+                stratum.identifier: {
+                    "stratum_id": stratum.identifier,
+                    "flat_index": stratum.flat_index,
+                    "indices": active._indices(stratum),
+                    "bounds": active._bounds(stratum),
+                    "status": (
+                        "learned" if index < 2 else "no_training_contribution"
+                    ),
+                    "training_total": training_values[index],
+                }
+                for index, stratum in enumerate(catalog)
+            },
+        }
+        manifest.write_text(
+            json.dumps(manifest_payload, indent=2) + "\n", encoding="utf-8"
+        )
+
+        validation = self.root / "migration_validation.json"
+        validation_payload = {
+            "schema": active.radiative_migrations.VALIDATION_SCHEMA,
+            "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+            "passed": False,
+            "global_training_holdout_difference_z_score": 0.25,
+            "validation": {
+                "total_proposals": proposals,
+                "inside_analysis_partition": metrics(2, 5.0, 17.0, 4.0),
+            },
+            "strata": {
+                catalog[0].identifier: {
+                    "holdout_total": metrics(1, 1.0, 1.0, 1.0),
+                    "coverage_passed": True,
+                    "training_holdout_difference_z_score": 0.5,
+                },
+                catalog[1].identifier: {
+                    "holdout_total": metrics(0, 0.0, 0.0, 0.0),
+                    "coverage_passed": None,
+                    "training_holdout_difference_z_score": None,
+                },
+                catalog[2].identifier: {
+                    "holdout_total": metrics(1, 4.0, 16.0, 4.0),
+                    "coverage_passed": False,
+                    "training_holdout_difference_z_score": None,
+                },
+            },
+        }
+        validation.write_text(
+            json.dumps(validation_payload, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return manifest, validation
+
     def test_template_hashes_external_sources(self) -> None:
         template = self._template()
         payload = json.loads(template.read_text(encoding="utf-8"))
@@ -325,6 +421,155 @@ class ActiveStratumWorkflowTests(unittest.TestCase):
                     selection_mask=mask,
                     output=self.root / "duplicate_census",
                     allow_duplicate_event_keys=False,
+                )
+            )
+
+    def test_survey_augmentation_pools_and_expands_active_set(self) -> None:
+        config, data, mask = self._write_data_census_inputs()
+        selected = np.asarray(np.load(mask), dtype=bool)
+        selected[1:4] = False
+        np.save(mask, selected)
+        data_output = self.root / "data_census_for_survey"
+        base_relevance = active.build_data_evidence(
+            argparse.Namespace(
+                config=config,
+                data_events=data,
+                selection_mask=mask,
+                output=data_output,
+                allow_duplicate_event_keys=False,
+            )
+        )
+        manifest, validation = self._write_survey_evidence_inputs(config)
+        output = self.root / "survey_evidence"
+        augmented_path = active.augment_survey_evidence(
+            argparse.Namespace(
+                config=config,
+                base_relevance=base_relevance,
+                migration_manifest=manifest,
+                migration_validation=validation,
+                output=output,
+            )
+        )
+        survey = json.loads(
+            (output / "survey_model_evidence.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(survey["schema"], active.SURVEY_MODEL_SCHEMA)
+        self.assertEqual(
+            survey["support_counts"],
+            {
+                "independent_support": 1,
+                "training_only": 1,
+                "holdout_only": 1,
+                "no_survey_contribution": 1,
+            },
+        )
+        self.assertEqual(
+            survey["parent_coverage_counts"],
+            {
+                "passed": 1,
+                "failed": 1,
+                "no_holdout_contribution": 1,
+                "not_assessed": 1,
+            },
+        )
+        self.assertAlmostEqual(
+            survey["pooling"]["pooled_inside_analysis"][
+                "cross_section_microbarn"
+            ],
+            0.05,
+        )
+        self.assertEqual(
+            [
+                record["model_cross_section_fraction"]
+                for record in survey["strata"]
+            ],
+            [0.4, 0.2, 0.4, 0.0],
+        )
+        self.assertEqual(
+            (output / "survey_nonzero_flat_indices.txt").read_text(
+                encoding="utf-8"
+            ),
+            "0\n1\n2\n",
+        )
+        self.assertEqual(
+            (output / "independent_survey_support_flat_indices.txt").read_text(
+                encoding="utf-8"
+            ),
+            "0\n",
+        )
+        self.assertEqual(
+            (output / "parent_coverage_failed_flat_indices.txt").read_text(
+                encoding="utf-8"
+            ),
+            "2\n",
+        )
+
+        augmented = json.loads(augmented_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(augmented["sources"]), 2)
+        self.assertEqual(
+            [
+                record["model_cross_section_fraction"]
+                for record in augmented["strata"]
+            ],
+            [0.4, 0.2, 0.4, 0.0],
+        )
+        classification = active.classify(
+            argparse.Namespace(
+                config=config,
+                relevance=augmented_path,
+                calibrations=None,
+                pilot_validations=None,
+                output=self.root / "survey_classification",
+                flat_indices=None,
+                minimum_data_events=1,
+                maximum_model_fraction=0.3,
+                maximum_feed_in_fraction=0.001,
+                maximum_closure_fraction=0.001,
+                reference_cross_section_microbarn=None,
+            )
+        )
+        classified = json.loads(classification.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [record["active"] for record in classified["strata"]],
+            [True, False, True, False],
+        )
+        self.assertEqual(
+            (self.root / "survey_classification/active_flat_indices.txt").read_text(
+                encoding="utf-8"
+            ),
+            "0\n2\n",
+        )
+
+    def test_survey_augmentation_rejects_wrong_validation_manifest(self) -> None:
+        config, data, mask = self._write_data_census_inputs()
+        base_relevance = active.build_data_evidence(
+            argparse.Namespace(
+                config=config,
+                data_events=data,
+                selection_mask=mask,
+                output=self.root / "hash_data_census",
+                allow_duplicate_event_keys=False,
+            )
+        )
+        manifest, validation = self._write_survey_evidence_inputs(config)
+        payload = json.loads(validation.read_text(encoding="utf-8"))
+        payload["manifest_sha256"] = "0" * 64
+        validation.write_text(
+            json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(
+            active.ActiveStratumError,
+            "does not reference the supplied manifest",
+        ):
+            active.augment_survey_evidence(
+                argparse.Namespace(
+                    config=config,
+                    base_relevance=base_relevance,
+                    migration_manifest=manifest,
+                    migration_validation=validation,
+                    output=self.root / "wrong_hash_survey",
                 )
             )
 

@@ -20,10 +20,12 @@ from typing import Iterable
 import numpy as np
 
 import radiative_guards
+import radiative_migrations
 import radiative_mode4
 
 
 DATA_OCCUPANCY_SCHEMA = "aao-rad-data-occupancy-v1"
+SURVEY_MODEL_SCHEMA = "aao-rad-survey-model-evidence-v1"
 EVIDENCE_SCHEMA = "aao-rad-stratum-relevance-evidence-v1"
 MASK_SCHEMA = "aao-rad-active-stratum-mask-v1"
 PHYSICAL_STATUSES = {
@@ -708,6 +710,547 @@ def _load_relevance(
     return records, list(sources.values())
 
 
+def _moment_from_metrics(
+    metrics: dict[str, object] | None,
+    *,
+    label: str,
+) -> radiative_guards.Moment:
+    if metrics is None:
+        return radiative_guards.Moment()
+    fields = {
+        "count": "contributing_rows",
+        "total": "sum_trial_contributions_microbarn",
+        "square_total": "sum_squared_trial_contributions_microbarn2",
+        "maximum": "largest_trial_contribution_microbarn",
+    }
+    values: dict[str, float | int] = {}
+    try:
+        values["count"] = int(metrics[fields["count"]])
+        for name in ("total", "square_total", "maximum"):
+            values[name] = float(metrics[fields[name]])
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise ActiveStratumError(f"{label}: malformed fixed-trial metrics") from error
+    count = int(values["count"])
+    numeric = [float(values[name]) for name in ("total", "square_total", "maximum")]
+    if count < 0 or any(not math.isfinite(value) or value < 0.0 for value in numeric):
+        raise ActiveStratumError(
+            f"{label}: fixed-trial sufficient statistics must be nonnegative"
+        )
+    total, square_total, maximum = numeric
+    if count == 0 and any(value != 0.0 for value in numeric):
+        raise ActiveStratumError(
+            f"{label}: nonzero sufficient statistics have zero contributing rows"
+        )
+    return radiative_guards.Moment(
+        count=count,
+        total=total,
+        square_total=square_total,
+        maximum=maximum,
+    )
+
+
+def _add_moments(
+    first: radiative_guards.Moment,
+    second: radiative_guards.Moment,
+) -> radiative_guards.Moment:
+    return radiative_guards.Moment(
+        count=first.count + second.count,
+        total=first.total + second.total,
+        square_total=first.square_total + second.square_total,
+        maximum=max(first.maximum, second.maximum),
+    )
+
+
+def _selection_matches_config(selection: dict, config: dict) -> None:
+    phase_space = config["phase_space"]
+    expected_q2 = float(
+        phase_space.get("Q2_min", config["binning"]["Q2"][0])
+    )
+    expected_w = float(phase_space["W_min"])
+    expected_y = phase_space.get("y_max")
+    expected_apply_y = expected_y is not None
+    checks = (
+        ("q2_minimum", expected_q2),
+        ("w_minimum", expected_w),
+    )
+    for name, expected in checks:
+        try:
+            recorded = float(selection[name])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ActiveStratumError(
+                f"migration manifest has malformed analysis_selection.{name}"
+            ) from error
+        if not math.isclose(recorded, expected, rel_tol=0.0, abs_tol=1.0e-12):
+            raise ActiveStratumError(
+                f"migration analysis_selection.{name} differs from the "
+                "analysis configuration"
+            )
+    if bool(selection.get("apply_y_max")) != expected_apply_y:
+        raise ActiveStratumError(
+            "migration y_max policy differs from the analysis configuration"
+        )
+    recorded_y = selection.get("y_maximum")
+    if expected_apply_y and (
+        recorded_y is None
+        or not math.isclose(
+            float(recorded_y), float(expected_y), rel_tol=0.0, abs_tol=1.0e-12
+        )
+    ):
+        raise ActiveStratumError(
+            "migration analysis_selection.y_maximum differs from the "
+            "analysis configuration"
+        )
+    if not expected_apply_y and recorded_y is not None:
+        raise ActiveStratumError(
+            "migration unexpectedly records an active y_maximum"
+        )
+
+
+def augment_survey_evidence(args: argparse.Namespace) -> Path:
+    config_path = args.config.expanduser().resolve()
+    config, config_sha256 = radiative_guards.load_analysis_config(config_path)
+    base_path = args.base_relevance.expanduser().resolve()
+    manifest_path = args.migration_manifest.expanduser().resolve()
+    validation_path = args.migration_validation.expanduser().resolve()
+    output = args.output.expanduser().resolve()
+    if output.exists():
+        raise FileExistsError(f"{output} already exists")
+    for path in (base_path, manifest_path, validation_path):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+
+    base_records, base_sources = _load_relevance(base_path, config_sha256)
+    base_payload = json.loads(base_path.read_text(encoding="utf-8"))
+    if any(
+        record.get("model_cross_section_fraction") is not None
+        for record in base_records.values()
+    ):
+        raise ActiveStratumError(
+            "base relevance already contains model_cross_section_fraction; "
+            "refusing to overwrite existing model evidence"
+        )
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    validation = json.loads(validation_path.read_text(encoding="utf-8"))
+    if manifest.get("schema") != radiative_migrations.MANIFEST_SCHEMA:
+        raise ActiveStratumError(
+            f"{manifest_path}: expected {radiative_migrations.MANIFEST_SCHEMA}"
+        )
+    if validation.get("schema") != radiative_migrations.VALIDATION_SCHEMA:
+        raise ActiveStratumError(
+            f"{validation_path}: expected {radiative_migrations.VALIDATION_SCHEMA}"
+        )
+    if manifest.get("analysis_config_sha256") != config_sha256:
+        raise ActiveStratumError(
+            "migration manifest analysis configuration hash differs"
+        )
+    manifest_sha256 = _sha256(manifest_path)
+    if validation.get("manifest_sha256") != manifest_sha256:
+        raise ActiveStratumError(
+            "migration validation does not reference the supplied manifest"
+        )
+    _selection_matches_config(manifest.get("analysis_selection") or {}, config)
+
+    catalog = radiative_guards.enumerate_strata(config)
+    catalog_ids = {stratum.identifier for stratum in catalog}
+    for label, identifiers in (
+        ("base relevance", set(base_records)),
+        ("migration manifest", set(manifest.get("strata", {}))),
+    ):
+        if identifiers != catalog_ids:
+            missing = len(catalog_ids - identifiers)
+            extra = len(identifiers - catalog_ids)
+            raise ActiveStratumError(
+                f"{label} is not the full analysis catalog "
+                f"(missing={missing}, extra={extra})"
+            )
+    validation_records = validation.get("strata", {})
+    if not isinstance(validation_records, dict) or not set(
+        validation_records
+    ).issubset(catalog_ids):
+        raise ActiveStratumError(
+            "migration validation contains unknown or malformed strata"
+        )
+
+    try:
+        training_proposals = int(manifest["training"]["total_proposals"])
+        holdout_proposals = int(validation["validation"]["total_proposals"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ActiveStratumError(
+            "migration artifacts lack fixed-trial proposal totals"
+        ) from error
+    if training_proposals <= 0 or holdout_proposals <= 0:
+        raise ActiveStratumError(
+            "migration fixed-trial proposal totals must be positive"
+        )
+    pooled_proposals = training_proposals + holdout_proposals
+    training_inside = _moment_from_metrics(
+        manifest["training"].get("inside_analysis_partition"),
+        label="training inside-analysis partition",
+    )
+    holdout_inside = _moment_from_metrics(
+        validation["validation"].get("inside_analysis_partition"),
+        label="holdout inside-analysis partition",
+    )
+    pooled_inside = _add_moments(training_inside, holdout_inside)
+    if pooled_inside.total <= 0.0:
+        raise ActiveStratumError(
+            "pooled surveys have zero inside-analysis cross section"
+        )
+
+    support_counts = {
+        "independent_support": 0,
+        "training_only": 0,
+        "holdout_only": 0,
+        "no_survey_contribution": 0,
+    }
+    coverage_counts = {
+        "passed": 0,
+        "failed": 0,
+        "no_holdout_contribution": 0,
+        "not_assessed": 0,
+    }
+    survey_records: list[dict[str, object]] = []
+    pooled_strata_moment = radiative_guards.Moment()
+    for stratum in catalog:
+        training_record = manifest["strata"][stratum.identifier]
+        _validate_catalog_metadata(
+            stratum,
+            training_record,
+            label="migration training",
+            required=True,
+        )
+        validation_record = validation_records.get(stratum.identifier)
+        training_moment = _moment_from_metrics(
+            training_record.get("training_total"),
+            label=f"{stratum.identifier} training",
+        )
+        holdout_moment = _moment_from_metrics(
+            (validation_record or {}).get("holdout_total"),
+            label=f"{stratum.identifier} holdout",
+        )
+        pooled_moment = _add_moments(training_moment, holdout_moment)
+        pooled_strata_moment = _add_moments(
+            pooled_strata_moment, pooled_moment
+        )
+        training_nonzero = training_moment.total > 0.0
+        holdout_nonzero = holdout_moment.total > 0.0
+        if training_nonzero and holdout_nonzero:
+            support = "independent_support"
+        elif training_nonzero:
+            support = "training_only"
+        elif holdout_nonzero:
+            support = "holdout_only"
+        else:
+            support = "no_survey_contribution"
+        support_counts[support] += 1
+
+        coverage_value = (
+            validation_record.get("coverage_passed")
+            if validation_record is not None
+            else None
+        )
+        if coverage_value is True:
+            coverage = "passed"
+        elif coverage_value is False:
+            coverage = "failed"
+        elif validation_record is not None:
+            coverage = "no_holdout_contribution"
+        else:
+            coverage = "not_assessed"
+        coverage_counts[coverage] += 1
+
+        pooled_metrics = radiative_guards._metrics(
+            pooled_moment, pooled_proposals
+        )
+        model_fraction = pooled_moment.total / pooled_inside.total
+        survey_records.append(
+            {
+                "stratum_id": stratum.identifier,
+                "flat_index": stratum.flat_index,
+                "indices": _indices(stratum),
+                "bounds": _bounds(stratum),
+                "data_events": base_records[stratum.identifier].get(
+                    "data_events"
+                ),
+                "training_status": training_record.get("status"),
+                "training": radiative_guards._metrics(
+                    training_moment, training_proposals
+                ),
+                "holdout": radiative_guards._metrics(
+                    holdout_moment, holdout_proposals
+                ),
+                "pooled": pooled_metrics,
+                "model_cross_section_fraction": model_fraction,
+                "support_status": support,
+                "parent_coverage_status": coverage,
+                "training_holdout_difference_z_score": (
+                    validation_record.get(
+                        "training_holdout_difference_z_score"
+                    )
+                    if validation_record is not None
+                    else None
+                ),
+            }
+        )
+
+    if not math.isclose(
+        pooled_strata_moment.total,
+        pooled_inside.total,
+        rel_tol=5.0e-12,
+        abs_tol=1.0e-12,
+    ):
+        raise ActiveStratumError(
+            "pooled per-stratum contributions do not close to the "
+            "inside-analysis partition"
+        )
+    fraction_sum = sum(
+        float(record["model_cross_section_fraction"])
+        for record in survey_records
+    )
+    if not math.isclose(fraction_sum, 1.0, rel_tol=5.0e-12, abs_tol=1.0e-12):
+        raise ActiveStratumError(
+            "pooled model cross-section fractions do not sum to one"
+        )
+
+    source_identifier = "pooled_radiative_survey_model"
+    if source_identifier in {source["identifier"] for source in base_sources}:
+        raise ActiveStratumError(
+            f"base relevance already defines source {source_identifier}"
+        )
+
+    survey_payload = {
+        "schema": SURVEY_MODEL_SCHEMA,
+        "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "builder_revision": radiative_mode4._source_revision(),
+        "builder_source_sha256": _sha256(Path(__file__).resolve()),
+        "analysis_config": str(config_path),
+        "analysis_config_sha256": config_sha256,
+        "base_relevance": {
+            "path": str(base_path),
+            "sha256": _sha256(base_path),
+        },
+        "migration_manifest": {
+            "path": str(manifest_path),
+            "sha256": manifest_sha256,
+            "generator_revision": manifest.get("generator_revision"),
+            "generator_revision_source": manifest.get(
+                "generator_revision_source"
+            ),
+        },
+        "migration_validation": {
+            "path": str(validation_path),
+            "sha256": _sha256(validation_path),
+            "passed": validation.get("passed"),
+            "global_training_holdout_difference_z_score": validation.get(
+                "global_training_holdout_difference_z_score"
+            ),
+        },
+        "analysis_selection": manifest["analysis_selection"],
+        "pooling": {
+            "estimator": (
+                "sum of fixed-trial contribution sums divided by the sum "
+                "of fixed-trial proposal counts"
+            ),
+            "training_proposals": training_proposals,
+            "holdout_proposals": holdout_proposals,
+            "pooled_proposals": pooled_proposals,
+            "training_inside_analysis": radiative_guards._metrics(
+                training_inside, training_proposals
+            ),
+            "holdout_inside_analysis": radiative_guards._metrics(
+                holdout_inside, holdout_proposals
+            ),
+            "pooled_inside_analysis": radiative_guards._metrics(
+                pooled_inside, pooled_proposals
+            ),
+            "model_fraction_sum": fraction_sum,
+        },
+        "support_counts": support_counts,
+        "parent_coverage_counts": coverage_counts,
+        "zero_survey_contribution_does_not_prove_structural_emptiness": True,
+        "parent_coverage_failure_does_not_make_a_stratum_irrelevant": True,
+        "detector_feed_in_is_not_measured_by_this_artifact": True,
+        "strata": survey_records,
+    }
+
+    output.mkdir(parents=True)
+    survey_path = output / "survey_model_evidence.json"
+    _write_json(survey_path, survey_payload)
+    survey_sha256 = _sha256(survey_path)
+
+    survey_lookup = {
+        str(record["stratum_id"]): record for record in survey_records
+    }
+    augmented_records = []
+    survey_rationale = (
+        "Pooled independent fixed-trial radiative surveys provide the model "
+        "cross-section fraction; zero survey contribution does not establish "
+        "structural emptiness, and parent-coverage failure does not remove "
+        "analysis relevance."
+    )
+    for stratum in catalog:
+        base = dict(base_records[stratum.identifier])
+        survey = survey_lookup[stratum.identifier]
+        rationale = str(base.get("rationale") or "").strip()
+        base["rationale"] = (
+            f"{rationale} {survey_rationale}".strip()
+        )
+        base["source_ids"] = list(base.get("source_ids", [])) + [
+            source_identifier
+        ]
+        base["model_cross_section_fraction"] = survey[
+            "model_cross_section_fraction"
+        ]
+        base["survey_model_evidence"] = {
+            "support_status": survey["support_status"],
+            "parent_coverage_status": survey["parent_coverage_status"],
+            "pooled_cross_section_microbarn": survey["pooled"][
+                "cross_section_microbarn"
+            ],
+            "pooled_sem_microbarn": survey["pooled"][
+                "cross_section_sem_microbarn"
+            ],
+            "pooled_ess": survey["pooled"][
+                "importance_effective_sample_size"
+            ],
+            "training_holdout_difference_z_score": survey[
+                "training_holdout_difference_z_score"
+            ],
+        }
+        augmented_records.append(base)
+
+    instructions = dict(base_payload.get("instructions") or {})
+    instructions.update(
+        {
+            "zero_survey_contribution_does_not_prove_structural_emptiness": True,
+            "parent_coverage_failure_does_not_make_a_stratum_irrelevant": True,
+            "detector_feed_in_requires_separate_GEMC_evidence": True,
+        }
+    )
+    relevance_payload = {
+        **base_payload,
+        "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "instructions": instructions,
+        "sources": base_sources
+        + [
+            {
+                "identifier": source_identifier,
+                "path": str(survey_path),
+                "sha256": survey_sha256,
+            }
+        ],
+        "augmentation": {
+            "base_relevance": str(base_path),
+            "base_relevance_sha256": _sha256(base_path),
+            "survey_model_evidence": str(survey_path),
+            "survey_model_evidence_sha256": survey_sha256,
+        },
+        "strata": augmented_records,
+    }
+    relevance_path = output / "relevance_evidence.json"
+    _write_json(relevance_path, relevance_payload)
+
+    fields = (
+        "flat_index",
+        "stratum_id",
+        "data_events",
+        "training_status",
+        "training_cross_section_microbarn",
+        "training_sem_microbarn",
+        "training_ess",
+        "holdout_cross_section_microbarn",
+        "holdout_sem_microbarn",
+        "holdout_ess",
+        "pooled_cross_section_microbarn",
+        "pooled_sem_microbarn",
+        "pooled_ess",
+        "model_cross_section_fraction",
+        "support_status",
+        "parent_coverage_status",
+        "training_holdout_difference_z_score",
+    )
+    with (output / "survey_model_evidence.tsv").open(
+        "w", encoding="utf-8", newline=""
+    ) as destination:
+        writer = csv.DictWriter(destination, fieldnames=fields, delimiter="\t")
+        writer.writeheader()
+        for record in survey_records:
+            training = record["training"]
+            holdout = record["holdout"]
+            pooled = record["pooled"]
+            writer.writerow(
+                {
+                    "flat_index": record["flat_index"],
+                    "stratum_id": record["stratum_id"],
+                    "data_events": record["data_events"],
+                    "training_status": record["training_status"],
+                    "training_cross_section_microbarn": training[
+                        "cross_section_microbarn"
+                    ],
+                    "training_sem_microbarn": training[
+                        "cross_section_sem_microbarn"
+                    ],
+                    "training_ess": training[
+                        "importance_effective_sample_size"
+                    ],
+                    "holdout_cross_section_microbarn": holdout[
+                        "cross_section_microbarn"
+                    ],
+                    "holdout_sem_microbarn": holdout[
+                        "cross_section_sem_microbarn"
+                    ],
+                    "holdout_ess": holdout[
+                        "importance_effective_sample_size"
+                    ],
+                    "pooled_cross_section_microbarn": pooled[
+                        "cross_section_microbarn"
+                    ],
+                    "pooled_sem_microbarn": pooled[
+                        "cross_section_sem_microbarn"
+                    ],
+                    "pooled_ess": pooled[
+                        "importance_effective_sample_size"
+                    ],
+                    "model_cross_section_fraction": record[
+                        "model_cross_section_fraction"
+                    ],
+                    "support_status": record["support_status"],
+                    "parent_coverage_status": record[
+                        "parent_coverage_status"
+                    ],
+                    "training_holdout_difference_z_score": record[
+                        "training_holdout_difference_z_score"
+                    ],
+                }
+            )
+
+    list_specs = {
+        "survey_nonzero_flat_indices.txt": lambda record: float(
+            record["model_cross_section_fraction"]
+        )
+        > 0.0,
+        "independent_survey_support_flat_indices.txt": lambda record: record[
+            "support_status"
+        ]
+        == "independent_support",
+        "parent_coverage_failed_flat_indices.txt": lambda record: record[
+            "parent_coverage_status"
+        ]
+        == "failed",
+    }
+    for filename, predicate in list_specs.items():
+        values = [
+            str(record["flat_index"])
+            for record in survey_records
+            if predicate(record)
+        ]
+        (output / filename).write_text(
+            "".join(f"{value}\n" for value in values), encoding="utf-8"
+        )
+    return relevance_path
+
+
 def _load_calibrations(
     paths: Iterable[Path], config_sha256: str
 ) -> tuple[dict[str, dict[str, object]], list[dict[str, object]]]:
@@ -1230,6 +1773,19 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
 
+    survey = subparsers.add_parser(
+        "augment-survey-evidence",
+        help=(
+            "pool migration training/holdout surveys and add full-catalog "
+            "model relevance to existing evidence"
+        ),
+    )
+    survey.add_argument("--config", type=Path, required=True)
+    survey.add_argument("--base-relevance", type=Path, required=True)
+    survey.add_argument("--migration-manifest", type=Path, required=True)
+    survey.add_argument("--migration-validation", type=Path, required=True)
+    survey.add_argument("--output", type=Path, required=True)
+
     classifier = subparsers.add_parser(
         "classify",
         help="classify physical support, relevance, and generator readiness",
@@ -1274,6 +1830,8 @@ def main() -> int:
         result = create_template(args)
     elif args.command == "build-data-evidence":
         result = build_data_evidence(args)
+    elif args.command == "augment-survey-evidence":
+        result = augment_survey_evidence(args)
     else:
         result = classify(args)
     print(result)

@@ -64,6 +64,52 @@ physical support, and a zero count never proves structural emptiness or
 negligibility. Model, feed-in, and global-closure evidence must be added
 separately before an unoccupied stratum can become `closure_only`.
 
+## Add pooled survey-model evidence
+
+After freezing a migration training manifest and its independent holdout
+validation, augment the data relevance without overwriting it:
+
+```bash
+python3 radiative_active_strata.py augment-survey-evidence \
+  --config analysis_ymax0p95.json \
+  --base-relevance data_occupancy_iteration000/relevance_evidence.json \
+  --migration-manifest migration_iteration000/migration_manifest.json \
+  --migration-validation \
+    migration_iteration000_validation/migration_validation.json \
+  --output survey_relevance_iteration000
+```
+
+The command requires a full-catalog base relevance artifact. It verifies all
+configuration and manifest hashes and requires the migration `Q2`, `W`, and
+optional `y` policy to match the analysis configuration exactly. Training and
+holdout sufficient statistics are pooled as one fixed-trial estimator:
+
+```text
+pooled cross section = (training contribution sum + holdout contribution sum)
+                       / (training proposals + holdout proposals)
+```
+
+The sum-of-squares and proposal counts are pooled at the same time, so the
+reported SEM and importance ESS are not averages of the two replica metrics.
+Each stratum's `model_cross_section_fraction` uses the pooled inside-analysis
+cross section as its denominator, and the builder verifies that all 12,960
+fractions close to one.
+
+The immutable output contains:
+
+- `survey_model_evidence.json`: full provenance, pooling closure, support and
+  parent-coverage counts, and per-stratum training/holdout/pooled metrics;
+- `survey_model_evidence.tsv`: the compact full-catalog review table;
+- `relevance_evidence.json`: the data evidence augmented with model fractions;
+- lists for nonzero survey support, independent support, and failed frozen
+  parent coverage.
+
+No survey contribution is interpreted as zero physical cross section.
+Likewise, failed hard-parent coverage means that a guard needs work; it never
+removes an otherwise relevant stratum. This artifact does not populate
+`maximum_feed_in_fraction`, because detector feed-in requires a separately
+audited GEMC response.
+
 ## Create an evidence template
 
 Create the template only after identifying the analysis artifacts that will
