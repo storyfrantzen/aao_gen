@@ -28,6 +28,7 @@ DATA_OCCUPANCY_SCHEMA = "aao-rad-data-occupancy-v1"
 SURVEY_MODEL_SCHEMA = "aao-rad-survey-model-evidence-v1"
 EVIDENCE_SCHEMA = "aao-rad-stratum-relevance-evidence-v1"
 MASK_SCHEMA = "aao-rad-active-stratum-mask-v1"
+CUMULATIVE_QUEUE_SCHEMA = "aao-rad-cumulative-stratum-queue-v1"
 PHYSICAL_STATUSES = {
     "unknown",
     "nonempty",
@@ -1251,6 +1252,378 @@ def augment_survey_evidence(args: argparse.Namespace) -> Path:
     return relevance_path
 
 
+def _queue_work_category(record: dict[str, object]) -> str:
+    survey = record["survey_model_evidence"]
+    support = str(survey["support_status"])
+    coverage = str(survey["parent_coverage_status"])
+    if support == "no_survey_contribution":
+        return "targeted_discovery"
+    if support == "independent_support" and coverage == "passed":
+        return "supported_calibration"
+    return "guard_refinement"
+
+
+def build_cumulative_queue(args: argparse.Namespace) -> Path:
+    """Select data bins plus the model tail needed for global closure."""
+
+    config_path = args.config.expanduser().resolve()
+    config, config_sha256 = radiative_guards.load_analysis_config(config_path)
+    relevance_path = args.relevance.expanduser().resolve()
+    output = args.output.expanduser().resolve()
+    if output.exists():
+        raise FileExistsError(f"{output} already exists")
+    if args.minimum_data_events < 1:
+        raise ValueError("--minimum-data-events must be positive")
+    if not 0.0 <= args.maximum_global_model_residual_fraction < 1.0:
+        raise ValueError(
+            "--maximum-global-model-residual-fraction must lie in [0,1)"
+        )
+
+    relevance, relevance_sources = _load_relevance(
+        relevance_path, config_sha256
+    )
+    catalog = radiative_guards.enumerate_strata(config)
+    catalog_ids = {stratum.identifier for stratum in catalog}
+    if set(relevance) != catalog_ids:
+        missing = len(catalog_ids - set(relevance))
+        extra = len(set(relevance) - catalog_ids)
+        raise ActiveStratumError(
+            "cumulative selection requires full-catalog relevance evidence "
+            f"(missing={missing}, extra={extra})"
+        )
+
+    records: list[dict[str, object]] = []
+    model_fraction_sum = 0.0
+    allowed_support = {
+        "independent_support",
+        "training_only",
+        "holdout_only",
+        "no_survey_contribution",
+    }
+    allowed_coverage = {
+        "passed",
+        "failed",
+        "no_holdout_contribution",
+        "not_assessed",
+    }
+    for stratum in catalog:
+        evidence = relevance[stratum.identifier]
+        _validate_catalog_metadata(
+            stratum,
+            evidence,
+            label="relevance evidence",
+            required=True,
+        )
+        data_events = evidence.get("data_events")
+        model_fraction = evidence.get("model_cross_section_fraction")
+        survey = evidence.get("survey_model_evidence")
+        if data_events is None or model_fraction is None:
+            raise ActiveStratumError(
+                f"{stratum.identifier}: cumulative selection requires "
+                "data_events and model_cross_section_fraction"
+            )
+        if not isinstance(survey, dict):
+            raise ActiveStratumError(
+                f"{stratum.identifier}: cumulative selection requires "
+                "survey_model_evidence"
+            )
+        support = str(survey.get("support_status", ""))
+        coverage = str(survey.get("parent_coverage_status", ""))
+        if support not in allowed_support or coverage not in allowed_coverage:
+            raise ActiveStratumError(
+                f"{stratum.identifier}: malformed survey support metadata"
+            )
+        fraction = float(model_fraction)
+        model_fraction_sum += fraction
+        records.append(
+            {
+                "stratum_id": stratum.identifier,
+                "flat_index": stratum.flat_index,
+                "indices": _indices(stratum),
+                "bounds": _bounds(stratum),
+                "data_events": int(data_events),
+                "model_cross_section_fraction": fraction,
+                "survey_model_evidence": dict(survey),
+            }
+        )
+    if not math.isclose(
+        model_fraction_sum, 1.0, rel_tol=5.0e-12, abs_tol=1.0e-12
+    ):
+        raise ActiveStratumError(
+            "full-catalog model_cross_section_fraction values do not sum "
+            f"to one (sum={model_fraction_sum})"
+        )
+
+    data_selected = [
+        record
+        for record in records
+        if int(record["data_events"]) >= args.minimum_data_events
+    ]
+    zero_data_ranked = sorted(
+        (
+            record
+            for record in records
+            if int(record["data_events"]) < args.minimum_data_events
+        ),
+        key=lambda record: (
+            -float(record["model_cross_section_fraction"]),
+            int(record["flat_index"]),
+        ),
+    )
+    initial_residual = math.fsum(
+        float(record["model_cross_section_fraction"])
+        for record in zero_data_ranked
+    )
+    residual = initial_residual
+    model_selected: list[dict[str, object]] = []
+    model_rank: dict[int, int] = {}
+    cumulative_selected = 0.0
+    cumulative_by_flat_index: dict[int, float] = {}
+    tolerance = 5.0e-15
+    for rank, record in enumerate(zero_data_ranked, start=1):
+        flat_index = int(record["flat_index"])
+        model_rank[flat_index] = rank
+        if residual <= args.maximum_global_model_residual_fraction + tolerance:
+            continue
+        model_selected.append(record)
+        fraction = float(record["model_cross_section_fraction"])
+        cumulative_selected = math.fsum((cumulative_selected, fraction))
+        cumulative_by_flat_index[flat_index] = cumulative_selected
+        residual = math.fsum(
+            float(item["model_cross_section_fraction"])
+            for item in zero_data_ranked[rank:]
+        )
+
+    data_selected = sorted(
+        data_selected,
+        key=lambda record: (
+            -int(record["data_events"]),
+            -float(record["model_cross_section_fraction"]),
+            int(record["flat_index"]),
+        ),
+    )
+    selected = data_selected + model_selected
+    selected_flat_indices = {
+        int(record["flat_index"]) for record in selected
+    }
+    omitted = [
+        record
+        for record in zero_data_ranked
+        if int(record["flat_index"]) not in selected_flat_indices
+    ]
+    actual_residual = math.fsum(
+        float(record["model_cross_section_fraction"])
+        for record in omitted
+    )
+    if actual_residual > (
+        args.maximum_global_model_residual_fraction + tolerance
+    ):
+        raise ActiveStratumError(
+            "cumulative selection failed to meet the requested residual"
+        )
+
+    queue_records: list[dict[str, object]] = []
+    priority_rank = {
+        int(record["flat_index"]): rank
+        for rank, record in enumerate(selected, start=1)
+    }
+    model_selected_indices = {
+        int(record["flat_index"]) for record in model_selected
+    }
+    for record in records:
+        flat_index = int(record["flat_index"])
+        is_selected = flat_index in selected_flat_indices
+        if int(record["data_events"]) >= args.minimum_data_events:
+            basis = "data_occupancy"
+        elif flat_index in model_selected_indices:
+            basis = "cumulative_model_tail"
+        else:
+            basis = "omitted_global_residual"
+        queue_records.append(
+            {
+                **record,
+                "selected": is_selected,
+                "selection_basis": basis,
+                "calibration_priority_rank": priority_rank.get(flat_index),
+                "zero_data_model_rank": model_rank.get(flat_index),
+                "zero_data_cumulative_selected_model_fraction": (
+                    cumulative_by_flat_index.get(flat_index)
+                ),
+                "work_category": (
+                    _queue_work_category(record) if is_selected else "omitted"
+                ),
+            }
+        )
+
+    category_counts = {
+        category: sum(
+            record["work_category"] == category for record in queue_records
+        )
+        for category in (
+            "supported_calibration",
+            "guard_refinement",
+            "targeted_discovery",
+            "omitted",
+        )
+    }
+    selected_model_fraction = math.fsum(
+        float(record["model_cross_section_fraction"])
+        for record in selected
+    )
+    payload = {
+        "schema": CUMULATIVE_QUEUE_SCHEMA,
+        "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "builder_revision": radiative_mode4._source_revision(),
+        "builder_source_sha256": _sha256(Path(__file__).resolve()),
+        "analysis_config": str(config_path),
+        "analysis_config_sha256": config_sha256,
+        "relevance_evidence": str(relevance_path),
+        "relevance_evidence_sha256": _sha256(relevance_path),
+        "evidence_sources": relevance_sources,
+        "selection_policy": {
+            "minimum_data_events": args.minimum_data_events,
+            "maximum_global_model_residual_fraction": (
+                args.maximum_global_model_residual_fraction
+            ),
+            "data_occupied_strata_are_always_selected": True,
+            "zero_data_order": (
+                "descending pooled model cross-section fraction, then "
+                "ascending flat index"
+            ),
+            "detector_feed_in_not_yet_included": True,
+            "omitted_does_not_mean_structurally_empty": True,
+        },
+        "summary": {
+            "catalog_strata": len(records),
+            "data_occupied_strata": len(data_selected),
+            "model_required_zero_data_strata": len(model_selected),
+            "selected_strata": len(selected),
+            "omitted_strata": len(omitted),
+            "data_occupied_model_fraction": math.fsum(
+                float(record["model_cross_section_fraction"])
+                for record in data_selected
+            ),
+            "initial_zero_data_model_fraction": initial_residual,
+            "selected_zero_data_model_fraction": math.fsum(
+                float(record["model_cross_section_fraction"])
+                for record in model_selected
+            ),
+            "selected_total_model_fraction": selected_model_fraction,
+            "actual_global_model_residual_fraction": actual_residual,
+            "work_category_counts": category_counts,
+        },
+        "strata": queue_records,
+    }
+
+    output.mkdir(parents=True)
+    json_path = output / "cumulative_stratum_queue.json"
+    _write_json(json_path, payload)
+    fields = (
+        "calibration_priority_rank",
+        "flat_index",
+        "stratum_id",
+        "selected",
+        "selection_basis",
+        "work_category",
+        "data_events",
+        "model_cross_section_fraction",
+        "zero_data_model_rank",
+        "zero_data_cumulative_selected_model_fraction",
+        "support_status",
+        "parent_coverage_status",
+        "pooled_cross_section_microbarn",
+        "pooled_sem_microbarn",
+        "pooled_ess",
+        "Q2",
+        "xB",
+        "minus_t",
+        "phi_deg",
+    )
+    with (output / "cumulative_stratum_queue.tsv").open(
+        "w", encoding="utf-8", newline=""
+    ) as destination:
+        writer = csv.DictWriter(destination, fieldnames=fields, delimiter="\t")
+        writer.writeheader()
+        ordered_records = sorted(
+            queue_records,
+            key=lambda record: (
+                not bool(record["selected"]),
+                record["calibration_priority_rank"]
+                if record["calibration_priority_rank"] is not None
+                else int(record["zero_data_model_rank"] or len(records) + 1),
+                int(record["flat_index"]),
+            ),
+        )
+        for record in ordered_records:
+            survey = record["survey_model_evidence"]
+            bounds = record["bounds"]
+            writer.writerow(
+                {
+                    "calibration_priority_rank": record[
+                        "calibration_priority_rank"
+                    ],
+                    "flat_index": record["flat_index"],
+                    "stratum_id": record["stratum_id"],
+                    "selected": record["selected"],
+                    "selection_basis": record["selection_basis"],
+                    "work_category": record["work_category"],
+                    "data_events": record["data_events"],
+                    "model_cross_section_fraction": record[
+                        "model_cross_section_fraction"
+                    ],
+                    "zero_data_model_rank": record["zero_data_model_rank"],
+                    "zero_data_cumulative_selected_model_fraction": record[
+                        "zero_data_cumulative_selected_model_fraction"
+                    ],
+                    "support_status": survey["support_status"],
+                    "parent_coverage_status": survey[
+                        "parent_coverage_status"
+                    ],
+                    "pooled_cross_section_microbarn": survey.get(
+                        "pooled_cross_section_microbarn"
+                    ),
+                    "pooled_sem_microbarn": survey.get(
+                        "pooled_sem_microbarn"
+                    ),
+                    "pooled_ess": survey.get("pooled_ess"),
+                    "Q2": ":".join(str(value) for value in bounds["Q2"]),
+                    "xB": ":".join(str(value) for value in bounds["xB"]),
+                    "minus_t": ":".join(
+                        str(value) for value in bounds["minus_t"]
+                    ),
+                    "phi_deg": ":".join(
+                        str(value) for value in bounds["phi_deg"]
+                    ),
+                }
+            )
+
+    list_specs = {
+        "selected_flat_indices.txt": selected,
+        "data_occupied_flat_indices.txt": data_selected,
+        "model_required_zero_data_flat_indices.txt": model_selected,
+        "omitted_flat_indices.txt": omitted,
+    }
+    for category in (
+        "supported_calibration",
+        "guard_refinement",
+        "targeted_discovery",
+    ):
+        list_specs[f"{category}_flat_indices.txt"] = [
+            record
+            for record in selected
+            if _queue_work_category(record) == category
+        ]
+    for filename, selected_records in list_specs.items():
+        (output / filename).write_text(
+            "".join(
+                f"{int(record['flat_index'])}\n"
+                for record in selected_records
+            ),
+            encoding="utf-8",
+        )
+    return json_path
+
+
 def _load_calibrations(
     paths: Iterable[Path], config_sha256: str
 ) -> tuple[dict[str, dict[str, object]], list[dict[str, object]]]:
@@ -1786,6 +2159,23 @@ def _parser() -> argparse.ArgumentParser:
     survey.add_argument("--migration-validation", type=Path, required=True)
     survey.add_argument("--output", type=Path, required=True)
 
+    queue = subparsers.add_parser(
+        "build-cumulative-queue",
+        help=(
+            "select all data-occupied strata plus the ranked zero-data "
+            "model tail required by a global residual budget"
+        ),
+    )
+    queue.add_argument("--config", type=Path, required=True)
+    queue.add_argument("--relevance", type=Path, required=True)
+    queue.add_argument("--output", type=Path, required=True)
+    queue.add_argument("--minimum-data-events", type=int, default=1)
+    queue.add_argument(
+        "--maximum-global-model-residual-fraction",
+        type=float,
+        required=True,
+    )
+
     classifier = subparsers.add_parser(
         "classify",
         help="classify physical support, relevance, and generator readiness",
@@ -1832,6 +2222,8 @@ def main() -> int:
         result = build_data_evidence(args)
     elif args.command == "augment-survey-evidence":
         result = augment_survey_evidence(args)
+    elif args.command == "build-cumulative-queue":
+        result = build_cumulative_queue(args)
     else:
         result = classify(args)
     print(result)

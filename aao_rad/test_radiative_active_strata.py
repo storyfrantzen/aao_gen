@@ -573,6 +573,109 @@ class ActiveStratumWorkflowTests(unittest.TestCase):
                 )
             )
 
+    def test_cumulative_queue_selects_data_and_global_model_tail(self) -> None:
+        config, data, mask = self._write_data_census_inputs()
+        selected = np.asarray(np.load(mask), dtype=bool)
+        selected[1:4] = False
+        np.save(mask, selected)
+        base_relevance = active.build_data_evidence(
+            argparse.Namespace(
+                config=config,
+                data_events=data,
+                selection_mask=mask,
+                output=self.root / "queue_data_census",
+                allow_duplicate_event_keys=False,
+            )
+        )
+        manifest, validation = self._write_survey_evidence_inputs(config)
+        augmented = active.augment_survey_evidence(
+            argparse.Namespace(
+                config=config,
+                base_relevance=base_relevance,
+                migration_manifest=manifest,
+                migration_validation=validation,
+                output=self.root / "queue_survey_evidence",
+            )
+        )
+        output = self.root / "cumulative_queue"
+        result = active.build_cumulative_queue(
+            argparse.Namespace(
+                config=config,
+                relevance=augmented,
+                output=output,
+                minimum_data_events=1,
+                maximum_global_model_residual_fraction=0.25,
+            )
+        )
+        payload = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(payload["schema"], active.CUMULATIVE_QUEUE_SCHEMA)
+        self.assertEqual(
+            payload["summary"],
+            {
+                "catalog_strata": 4,
+                "data_occupied_strata": 1,
+                "model_required_zero_data_strata": 1,
+                "selected_strata": 2,
+                "omitted_strata": 2,
+                "data_occupied_model_fraction": 0.4,
+                "initial_zero_data_model_fraction": 0.6000000000000001,
+                "selected_zero_data_model_fraction": 0.4,
+                "selected_total_model_fraction": 0.8,
+                "actual_global_model_residual_fraction": 0.2,
+                "work_category_counts": {
+                    "supported_calibration": 1,
+                    "guard_refinement": 1,
+                    "targeted_discovery": 0,
+                    "omitted": 2,
+                },
+            },
+        )
+        self.assertEqual(
+            (output / "selected_flat_indices.txt").read_text(
+                encoding="utf-8"
+            ),
+            "0\n2\n",
+        )
+        self.assertEqual(
+            (output / "data_occupied_flat_indices.txt").read_text(
+                encoding="utf-8"
+            ),
+            "0\n",
+        )
+        self.assertEqual(
+            (output / "model_required_zero_data_flat_indices.txt").read_text(
+                encoding="utf-8"
+            ),
+            "2\n",
+        )
+        self.assertEqual(
+            (output / "supported_calibration_flat_indices.txt").read_text(
+                encoding="utf-8"
+            ),
+            "0\n",
+        )
+        self.assertEqual(
+            (output / "guard_refinement_flat_indices.txt").read_text(
+                encoding="utf-8"
+            ),
+            "2\n",
+        )
+        records = {
+            record["flat_index"]: record for record in payload["strata"]
+        }
+        self.assertEqual(records[0]["selection_basis"], "data_occupancy")
+        self.assertEqual(
+            records[2]["selection_basis"], "cumulative_model_tail"
+        )
+        self.assertEqual(
+            records[1]["selection_basis"], "omitted_global_residual"
+        )
+        self.assertEqual(records[2]["zero_data_model_rank"], 1)
+        self.assertLessEqual(
+            payload["summary"]["actual_global_model_residual_fraction"],
+            0.25,
+        )
+
     def test_zero_calibration_never_implies_structural_emptiness(self) -> None:
         template = self._template()
         calibration = self._calibration(positive=False, ready=False)

@@ -110,6 +110,52 @@ removes an otherwise relevant stratum. This artifact does not populate
 `maximum_feed_in_fraction`, because detector feed-in requires a separately
 audited GEMC response.
 
+## Build a cumulative calibration queue
+
+A per-stratum model threshold can discard a collectively important diffuse
+tail. Select every data-occupied stratum and then add zero-data strata in
+descending pooled-model order until the remaining global model fraction is
+below an explicit residual budget:
+
+```bash
+python3 radiative_active_strata.py build-cumulative-queue \
+  --config analysis_ymax0p95.json \
+  --relevance survey_relevance_iteration000/relevance_evidence.json \
+  --minimum-data-events 1 \
+  --maximum-global-model-residual-fraction 0.001 \
+  --output cumulative_queue_iteration000
+```
+
+Ties in model fraction are resolved by ascending flat index. Data strata are
+ordered first by descending event count, then model fraction, so the output is
+both deterministic and useful as a calibration priority list. The builder
+requires complete data counts, complete pooled model fractions that close to
+one, and the survey support metadata written by `augment-survey-evidence`.
+
+Selected strata are routed without changing their relevance decision:
+
+| Work category | Meaning |
+|---|---|
+| `supported_calibration` | Independent survey support and passed frozen-parent coverage; start calibration directly. |
+| `guard_refinement` | Some survey support exists, but it is one-sided or parent coverage failed; improve the guard evidence first. |
+| `targeted_discovery` | No pooled survey contribution was observed; run targeted discovery rather than declaring the stratum empty. |
+
+The immutable output contains:
+
+- `cumulative_stratum_queue.json` with configuration/evidence hashes, exact
+  policy, achieved residual, work-category counts, and all catalog records;
+- `cumulative_stratum_queue.tsv`, ordered with selected work first;
+- `selected_flat_indices.txt`, directly usable as a mode-4 campaign selector;
+- separate data-occupied and model-required-zero-data lists;
+- separate supported-calibration, guard-refinement, and targeted-discovery
+  work lists;
+- `omitted_flat_indices.txt`, retained for global mode-3 and later feed-in
+  closure checks.
+
+Omitted means only that the current pooled model contribution lies within the
+declared global residual. It does not establish structural emptiness. GEMC
+feed-in evidence can reactivate an omitted stratum in a later queue revision.
+
 ## Create an evidence template
 
 Create the template only after identifying the analysis artifacts that will
