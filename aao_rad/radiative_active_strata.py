@@ -426,7 +426,10 @@ def build_data_evidence(args: argparse.Namespace) -> Path:
         )
 
     strata = []
-    for stratum, count_value in zip(catalog, counts, strict=True):
+    # Python 3.9 on the JLab farm predates zip(..., strict=True).  The size
+    # equality is already asserted above, so ordinary zip has the same
+    # fail-closed behavior here while retaining farm compatibility.
+    for stratum, count_value in zip(catalog, counts):
         count = int(count_value)
         strata.append(
             {
