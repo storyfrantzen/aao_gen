@@ -834,6 +834,72 @@ class ActiveStratumWorkflowTests(unittest.TestCase):
                 )
             )
 
+    def test_stratified_batch_audits_same_q2_basis_fallback(self) -> None:
+        queue = self._write_stratified_queue()
+        payload = json.loads(queue.read_text(encoding="utf-8"))
+        for record in payload["strata"]:
+            indices = active._normalized_indices(record["indices"])
+            if indices[0] == 1 and record["selection_basis"] == "data_occupancy":
+                record["work_category"] = "guard_refinement"
+        queue.write_text(
+            json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(
+            active.ActiveStratumError,
+            "data_occupancy, Q2 index 1: only 0 eligible",
+        ):
+            active.select_stratified_batch(
+                argparse.Namespace(
+                    queue=queue,
+                    output=self.root / "strict_sparse_basis_batch",
+                    work_category="supported_calibration",
+                    selection_bases=None,
+                    representatives_per_q2_basis=2,
+                    allow_basis_fallback=False,
+                )
+            )
+
+        output = self.root / "fallback_sparse_basis_batch"
+        result = active.select_stratified_batch(
+            argparse.Namespace(
+                queue=queue,
+                output=output,
+                work_category="supported_calibration",
+                selection_bases=None,
+                representatives_per_q2_basis=2,
+                allow_basis_fallback=True,
+            )
+        )
+        batch = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(batch["summary"]["selected_strata"], 8)
+        self.assertEqual(batch["summary"]["basis_fallback_strata"], 2)
+        self.assertEqual(
+            batch["summary"]["basis_counts"],
+            {"data_occupancy": 2, "cumulative_model_tail": 6},
+        )
+        self.assertEqual(
+            batch["summary"]["q2_index_counts"], {"0": 4, "1": 4}
+        )
+        sparse_data = next(
+            group
+            for group in batch["groups"]
+            if group["selection_basis"] == "data_occupancy"
+            and group["q2_index"] == 1
+        )
+        expanded_model = next(
+            group
+            for group in batch["groups"]
+            if group["selection_basis"] == "cumulative_model_tail"
+            and group["q2_index"] == 1
+        )
+        self.assertEqual(sparse_data["unfilled_primary_quota"], 2)
+        self.assertEqual(sparse_data["selected_flat_indices"], [])
+        self.assertEqual(len(expanded_model["primary_selected_flat_indices"]), 2)
+        self.assertEqual(
+            len(expanded_model["basis_fallback_selected_flat_indices"]), 2
+        )
+
     def test_zero_calibration_never_implies_structural_emptiness(self) -> None:
         template = self._template()
         calibration = self._calibration(positive=False, ready=False)

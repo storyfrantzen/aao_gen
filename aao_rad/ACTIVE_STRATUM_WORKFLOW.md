@@ -170,6 +170,7 @@ python3 radiative_active_strata.py select-stratified-batch \
   --selection-basis data_occupancy \
   --selection-basis cumulative_model_tail \
   --representatives-per-q2-basis 2 \
+  --allow-basis-fallback \
   --output supported_scale_batch_iteration000
 ```
 
@@ -180,6 +181,13 @@ their minimum distance from those already selected in normalized
 `xB`/`-t`/periodic-phi bin-index space. Deterministic ties prefer model
 fraction, data occupancy, and then the lower flat index. No pseudorandom
 choice is made.
+
+Some physically sparse RGK intervals have no supported data-occupied guard.
+`--allow-basis-fallback` preserves four representatives in each `Q2`
+interval by filling an unavailable basis quota from another requested basis
+in that same interval. The JSON records every unfilled primary quota, every
+fallback flat index, and the resulting basis totals. Without this explicit
+option, any deficient `(selection basis, Q2)` group remains a hard error.
 
 The selector verifies the cumulative-queue schema, full analysis catalog,
 configuration hash, selected count, ranking fields, and requested group

@@ -1770,46 +1770,44 @@ def select_stratified_batch(args: argparse.Namespace) -> Path:
         key = (str(record["selection_basis"]), indices[0])
         groups[key].append(record)
 
-    chosen: list[dict[str, object]] = []
-    group_summaries: list[dict[str, object]] = []
-    for basis in bases:
-        for iq2 in range(q2_bins):
-            candidates = groups[(basis, iq2)]
-            required = args.representatives_per_q2_basis
-            if len(candidates) < required:
-                raise ActiveStratumError(
-                    f"{basis}, Q2 index {iq2}: only {len(candidates)} "
-                    f"eligible {args.work_category} strata; {required} required"
+    allow_basis_fallback = bool(
+        getattr(args, "allow_basis_fallback", False)
+    )
+
+    def choose_maximin(
+        candidates: list[dict[str, object]],
+        count: int,
+        context: list[dict[str, object]],
+        *,
+        anchor_role: str,
+        additional_role: str,
+        basis_fallback: bool,
+    ) -> list[dict[str, object]]:
+        remaining = list(candidates)
+        local_selected: list[dict[str, object]] = []
+        details: list[dict[str, object]] = []
+        while len(local_selected) < count:
+            references = context + local_selected
+            if not references:
+                next_record = max(
+                    remaining,
+                    key=lambda record: (
+                        float(record["model_cross_section_fraction"]),
+                        int(record["data_events"]),
+                        -int(record["flat_index"]),
+                    ),
                 )
-            remaining = list(candidates)
-            group_selected: list[dict[str, object]] = []
-            selection_details: list[dict[str, object]] = []
-            anchor = max(
-                remaining,
-                key=lambda record: (
-                    float(record["model_cross_section_fraction"]),
-                    int(record["data_events"]),
-                    -int(record["flat_index"]),
-                ),
-            )
-            remaining.remove(anchor)
-            group_selected.append(anchor)
-            selection_details.append(
-                {
-                    "record": anchor,
-                    "selection_role": "largest_model_contribution_anchor",
-                    "minimum_normalized_distance_squared": None,
-                }
-            )
-            while len(group_selected) < required:
+                role = anchor_role
+                distance = None
+            else:
                 distance_by_flat_index = {
                     int(candidate["flat_index"]): min(
                         _normalized_stratum_distance_squared(
                             normalized_indices[int(candidate["flat_index"])],
-                            normalized_indices[int(selected["flat_index"])],
+                            normalized_indices[int(reference["flat_index"])],
                             axis_bins,
                         )
-                        for selected in group_selected
+                        for reference in references
                     )
                     for candidate in remaining
                 }
@@ -1822,45 +1820,123 @@ def select_stratified_batch(args: argparse.Namespace) -> Path:
                         -int(record["flat_index"]),
                     ),
                 )
-                remaining.remove(next_record)
-                group_selected.append(next_record)
-                selection_details.append(
-                    {
-                        "record": next_record,
-                        "selection_role": "normalized_index_maximin",
-                        "minimum_normalized_distance_squared": (
-                            distance_by_flat_index[
-                                int(next_record["flat_index"])
-                            ]
-                        ),
-                    }
-                )
+                role = additional_role
+                distance = distance_by_flat_index[int(next_record["flat_index"])]
+            remaining.remove(next_record)
+            local_selected.append(next_record)
+            details.append(
+                {
+                    "record": next_record,
+                    "selection_role": role,
+                    "minimum_normalized_distance_squared": distance,
+                    "basis_fallback": basis_fallback,
+                }
+            )
+        return details
 
-            selected_indices: list[int] = []
-            for within_group_rank, detail in enumerate(
-                selection_details, start=1
-            ):
-                source = detail.pop("record")
-                flat_index = int(source["flat_index"])
-                selected_indices.append(flat_index)
-                chosen.append(
-                    {
-                        **source,
-                        "batch_rank": len(chosen) + 1,
-                        "within_group_rank": within_group_rank,
-                        "selection_role": detail["selection_role"],
-                        "minimum_normalized_distance_squared": detail[
-                            "minimum_normalized_distance_squared"
-                        ],
-                    }
+    chosen: list[dict[str, object]] = []
+    group_summaries: list[dict[str, object]] = []
+    required_per_basis = args.representatives_per_q2_basis
+    required_per_q2 = required_per_basis * len(bases)
+    for iq2 in range(q2_bins):
+        q2_details: list[dict[str, object]] = []
+        primary_details: dict[str, list[dict[str, object]]] = {}
+        for basis in bases:
+            candidates = groups[(basis, iq2)]
+            if len(candidates) < required_per_basis and not allow_basis_fallback:
+                raise ActiveStratumError(
+                    f"{basis}, Q2 index {iq2}: only {len(candidates)} "
+                    f"eligible {args.work_category} strata; "
+                    f"{required_per_basis} required"
                 )
+            count = min(len(candidates), required_per_basis)
+            details = choose_maximin(
+                candidates,
+                count,
+                [],
+                anchor_role="largest_model_contribution_anchor",
+                additional_role="normalized_index_maximin",
+                basis_fallback=False,
+            )
+            primary_details[basis] = details
+            q2_details.extend(details)
+
+        fallback_needed = required_per_q2 - len(q2_details)
+        if fallback_needed:
+            selected_indices = {
+                int(detail["record"]["flat_index"]) for detail in q2_details
+            }
+            fallback_candidates = [
+                record
+                for basis in bases
+                for record in groups[(basis, iq2)]
+                if int(record["flat_index"]) not in selected_indices
+            ]
+            if len(fallback_candidates) < fallback_needed:
+                raise ActiveStratumError(
+                    f"Q2 index {iq2}: basis fallback needs {fallback_needed} "
+                    f"additional {args.work_category} strata but only "
+                    f"{len(fallback_candidates)} remain"
+                )
+            q2_details.extend(
+                choose_maximin(
+                    fallback_candidates,
+                    fallback_needed,
+                    [detail["record"] for detail in q2_details],
+                    anchor_role="basis_fallback_model_anchor",
+                    additional_role="basis_fallback_normalized_index_maximin",
+                    basis_fallback=True,
+                )
+            )
+
+        within_basis_counts = {basis: 0 for basis in bases}
+        for detail in q2_details:
+            source = detail["record"]
+            actual_basis = str(source["selection_basis"])
+            within_basis_counts[actual_basis] += 1
+            chosen.append(
+                {
+                    **source,
+                    "batch_rank": len(chosen) + 1,
+                    "within_group_rank": within_basis_counts[actual_basis],
+                    "selection_role": detail["selection_role"],
+                    "minimum_normalized_distance_squared": detail[
+                        "minimum_normalized_distance_squared"
+                    ],
+                    "basis_fallback": detail["basis_fallback"],
+                }
+            )
+
+        for basis in bases:
+            primary = primary_details[basis]
+            fallback = [
+                detail
+                for detail in q2_details
+                if detail["basis_fallback"]
+                and detail["record"]["selection_basis"] == basis
+            ]
             group_summaries.append(
                 {
                     "selection_basis": basis,
                     "q2_index": iq2,
                     "q2_bounds": list(config["binning"]["Q2"][iq2 : iq2 + 2]),
-                    "eligible_strata": len(candidates),
-                    "selected_flat_indices": selected_indices,
+                    "eligible_strata": len(groups[(basis, iq2)]),
+                    "requested_representatives": required_per_basis,
+                    "unfilled_primary_quota": max(
+                        0, required_per_basis - len(primary)
+                    ),
+                    "primary_selected_flat_indices": [
+                        int(detail["record"]["flat_index"])
+                        for detail in primary
+                    ],
+                    "basis_fallback_selected_flat_indices": [
+                        int(detail["record"]["flat_index"])
+                        for detail in fallback
+                    ],
+                    "selected_flat_indices": [
+                        int(detail["record"]["flat_index"])
+                        for detail in primary + fallback
+                    ],
                 }
             )
 
@@ -1893,6 +1969,13 @@ def select_stratified_batch(args: argparse.Namespace) -> Path:
             "representatives_per_q2_basis": (
                 args.representatives_per_q2_basis
             ),
+            "allow_basis_fallback": allow_basis_fallback,
+            "basis_fallback": (
+                "preserve the requested total per Q2 by maximin selection "
+                "from another requested basis in the same Q2 interval"
+                if allow_basis_fallback
+                else None
+            ),
             "anchor": (
                 "largest model fraction, then data events, then lowest "
                 "flat index"
@@ -1906,6 +1989,9 @@ def select_stratified_batch(args: argparse.Namespace) -> Path:
         },
         "summary": {
             "selected_strata": len(chosen),
+            "basis_fallback_strata": sum(
+                bool(record["basis_fallback"]) for record in chosen
+            ),
             "basis_counts": basis_counts,
             "q2_index_counts": q2_counts,
             "selected_model_cross_section_fraction": math.fsum(
@@ -1928,6 +2014,7 @@ def select_stratified_batch(args: argparse.Namespace) -> Path:
         "work_category",
         "within_group_rank",
         "selection_role",
+        "basis_fallback",
         "minimum_normalized_distance_squared",
         "data_events",
         "model_cross_section_fraction",
@@ -1954,6 +2041,7 @@ def select_stratified_batch(args: argparse.Namespace) -> Path:
                     "work_category": record["work_category"],
                     "within_group_rank": record["within_group_rank"],
                     "selection_role": record["selection_role"],
+                    "basis_fallback": record["basis_fallback"],
                     "minimum_normalized_distance_squared": record[
                         "minimum_normalized_distance_squared"
                     ],
@@ -2557,6 +2645,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     batch.add_argument(
         "--representatives-per-q2-basis", type=int, default=2
+    )
+    batch.add_argument(
+        "--allow-basis-fallback",
+        action="store_true",
+        help=(
+            "when one requested basis is sparse, preserve the total per Q2 "
+            "with maximin representatives from another requested basis"
+        ),
     )
 
     classifier = subparsers.add_parser(
