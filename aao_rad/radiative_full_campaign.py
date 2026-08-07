@@ -190,11 +190,19 @@ def _prepare_namespace(
         heartbeat_interval=heartbeat_interval,
         generator_revision=generator_revision,
         overwrite=False,
-        trials=trials,
-        calibration_inside_guard_fraction=inside_fraction,
+        # radiative_mode4.prepare() converts both values with int() even when
+        # the inactive operation does not use them.  Keep the synthetic
+        # namespace equivalent to the command-line parser, which supplies
+        # numeric defaults rather than None.
+        trials=0 if trials is None else trials,
+        calibration_inside_guard_fraction=(
+            core_fraction if inside_fraction is None else inside_fraction
+        ),
         sigr_max=None,
         envelope_report=envelope_report,
-        events_per_stratum=events_per_stratum,
+        events_per_stratum=(
+            0 if events_per_stratum is None else events_per_stratum
+        ),
         allow_envelope_revision_mismatch=False,
         envelope_revision_compatibility_rationale=None,
     )

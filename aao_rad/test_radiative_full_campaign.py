@@ -69,6 +69,12 @@ class FullCampaignTests(unittest.TestCase):
 
     @staticmethod
     def _fake_prepare(args: argparse.Namespace) -> Path:
+        # Match the eager numeric conversions performed by the real
+        # radiative_mode4.prepare().  This guards against constructing an
+        # internal Namespace with None where argparse supplies zero/defaults.
+        int(args.events_per_stratum)
+        int(args.trials)
+        float(args.calibration_inside_guard_fraction)
         args.output.mkdir(parents=True)
         (args.output / "analysis_config.json").write_bytes(args.config.read_bytes())
         (args.output / "continuous_guard_recipes.json").write_bytes(
