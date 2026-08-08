@@ -20,6 +20,7 @@ import math
 import os
 import shutil
 import statistics
+import struct
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -150,6 +151,39 @@ class GuardBox:
             "normalized_volume": self.volume,
             "u_gamma_soft_endpoint_anchored": True,
         }
+
+
+def _fortran_real32(value: float) -> float:
+    """Round one value exactly as the generator's default REAL does."""
+    return struct.unpack("=f", struct.pack("=f", float(value)))[0]
+
+
+def _fortran_guard_contains(
+    box: GuardBox, coordinates: dict[str, float]
+) -> bool:
+    """Reproduce mode4_proposal_ratio's single-precision guard test.
+
+    Guard bounds are serialized from Python doubles but read by AAO into
+    default Fortran REAL variables.  Diagnostic coordinates are also default
+    REAL values.  Replaying the comparison in Python double precision can
+    disagree on the one-float shell at a rounded face, so artifact validation
+    must use the generator's actual numerical guard.
+    """
+    for name in AXES[:-1]:
+        value = _fortran_real32(coordinates[name])
+        lower = _fortran_real32(box.nonperiodic[name][0])
+        upper = _fortran_real32(box.nonperiodic[name][1])
+        if value < lower or value > upper:
+            return False
+    phi = _fortran_real32(coordinates["hadron_phi_base"])
+    origin = _fortran_real32(box.phi_origin)
+    relative = _fortran_real32(phi - origin)
+    relative = _fortran_real32(relative + _fortran_real32(0.5))
+    relative = _fortran_real32(relative % _fortran_real32(1.0))
+    relative = _fortran_real32(relative - _fortran_real32(0.5))
+    lower = _fortran_real32(box.phi_relative[0])
+    upper = _fortran_real32(box.phi_relative[1])
+    return lower <= relative <= upper
 
 
 def _sha256(path: Path) -> str:
@@ -422,11 +456,22 @@ def proposal_density_ratio(
     core_fraction: float,
 ) -> float:
     """Return q_legacy/q_mix for the core-plus-legacy proposal."""
+    return _proposal_density_ratio_for_membership(
+        box, core_fraction, box.contains(coordinates)
+    )
+
+
+def _proposal_density_ratio_for_membership(
+    box: GuardBox,
+    core_fraction: float,
+    inside: bool,
+) -> float:
+    """Return the proposal correction for an established guard class."""
     if not 0.0 < core_fraction < 1.0:
         raise ValueError("core fraction must lie strictly between zero and one")
     tail_fraction = 1.0 - core_fraction
     denominator = tail_fraction
-    if box.contains(coordinates):
+    if inside:
         denominator += core_fraction / box.volume
     return 1.0 / denominator
 
@@ -1517,10 +1562,14 @@ def _validate_event_diagnostics(
         proposal_coordinates = {
             name: values[name] for name in AXES
         }
-        expected_ratio = proposal_density_ratio(
+        generator_inside = _fortran_guard_contains(
+            guard_box,
             proposal_coordinates,
+        )
+        expected_ratio = _proposal_density_ratio_for_membership(
             guard_box,
             float(manifest["core_fraction"]),
+            generator_inside,
         )
         if not math.isclose(
             values["proposal_density_ratio"],
@@ -1630,14 +1679,16 @@ def _validate_calibration_diagnostics(
         if values["integrand_corrected"] <= 0.0:
             raise Mode4Error(f"{path}: nonpositive target integrand")
         coordinates = {name: values[name] for name in AXES}
-        expected_inside = int(box.contains(coordinates))
+        expected_inside = int(_fortran_guard_contains(box, coordinates))
         if (
             inside != expected_inside
             or (component == 1 and inside != 1)
             or (component == 0 and inside != 0)
         ):
             raise Mode4Error(f"{path}: inconsistent learned-core membership")
-        expected_ratio = proposal_density_ratio(coordinates, box, alpha)
+        expected_ratio = _proposal_density_ratio_for_membership(
+            box, alpha, bool(expected_inside)
+        )
         if not math.isclose(
             values["proposal_density_ratio"],
             expected_ratio,
@@ -3275,7 +3326,7 @@ def _load_pilot_run(path: Path) -> dict[str, object]:
         integrand = float(raw["integrand_corrected"])
         if not math.isfinite(integrand) or integrand <= 0.0:
             raise Mode4Error(f"{event_path}: invalid corrected integrand")
-        inside_guard = box.contains(coordinates)
+        inside_guard = _fortran_guard_contains(box, coordinates)
         if component == 1 and not inside_guard:
             raise Mode4Error(
                 f"{event_path}: guard-focused component escaped guard"

@@ -550,6 +550,36 @@ class ProposalTests(unittest.TestCase):
         )
         self.assertAlmostEqual(outside_ratio, 1.0 / tail_fraction)
 
+    def test_fortran_single_precision_guard_boundary_is_reproduced(self) -> None:
+        box = radiative_mode4.GuardBox(
+            nonperiodic={
+                "r_u": (0.7, 0.9),
+                "r_ep": (0.2, 0.8),
+                "u_gamma": (0.2, 1.0),
+                "hadron_cosine_base": (0.2, 0.8),
+            },
+            phi_origin=0.5,
+            phi_relative=(-0.2, 0.2),
+        )
+        coordinates = {
+            "r_u": radiative_mode4._fortran_real32(0.7),
+            "r_ep": 0.5,
+            "u_gamma": 0.5,
+            "hadron_cosine_base": 0.5,
+            "hadron_phi_base": 0.5,
+        }
+        self.assertFalse(box.contains(coordinates))
+        self.assertTrue(
+            radiative_mode4._fortran_guard_contains(box, coordinates)
+        )
+        expected = radiative_mode4._proposal_density_ratio_for_membership(
+            box, 0.9, True
+        )
+        self.assertNotAlmostEqual(
+            radiative_mode4.proposal_density_ratio(coordinates, box, 0.9),
+            expected,
+        )
+
     def test_recipe_padding_is_clipped_to_native_domain(self) -> None:
         recipe = {
             "padding_scale": 2.0,
