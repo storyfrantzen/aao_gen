@@ -10,6 +10,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import radiative_mode4
 import radiative_survey
@@ -1224,6 +1225,95 @@ class WorkflowTests(unittest.TestCase):
                 .read_text(encoding="utf-8")
                 .splitlines()[0],
             )
+
+    def test_calibration_subset_skips_untouched_run_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "manifest.json"
+            records = []
+            for flat_index in (0, 1):
+                identifier = f"s{flat_index:05d}"
+                records.append(
+                    {
+                        "flat_index": flat_index,
+                        "stratum_id": identifier,
+                        "replica_index": 0,
+                        "seed": flat_index + 1,
+                        "indices": {
+                            "iq2": 0,
+                            "ixb": 0,
+                            "it": 0,
+                            "iphi": flat_index,
+                        },
+                        "bounds": {"phi_deg": [0.0, 18.0]},
+                        "guard": {"test_guard": True},
+                        "output_stem": (
+                            f"runs/{identifier}/{identifier}__g0000"
+                        ),
+                    }
+                )
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "schema": radiative_mode4.MANIFEST_SCHEMA,
+                        "operation": "calibration",
+                        "runs": records,
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            manifest_hash = hashlib.sha256(
+                manifest_path.read_bytes()
+            ).hexdigest()
+            selected_path = root / (
+                records[1]["output_stem"] + ".json"
+            )
+            selected_path.parent.mkdir(parents=True)
+            selected_path.write_text(
+                json.dumps(
+                    {
+                        "schema": radiative_mode4.RUN_SCHEMA,
+                        "source_manifest_sha256": manifest_hash,
+                        "operation": "calibration",
+                        "stratum_id": "s00001",
+                        "flat_index": 1,
+                        "replica_index": 0,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            output = root / "subset.json"
+
+            def fake_finalize(
+                args: argparse.Namespace,
+                sources: list[tuple[Path, dict]],
+                grouped: dict,
+            ) -> Path:
+                self.assertEqual(len(sources), 1)
+                self.assertEqual(set(grouped), {"s00001"})
+                output.write_text("{}\n", encoding="utf-8")
+                return output
+
+            with mock.patch.object(
+                radiative_mode4,
+                "_finalize_calibration",
+                side_effect=fake_finalize,
+            ):
+                result = radiative_mode4.finalize(
+                    argparse.Namespace(
+                        manifests=[manifest_path],
+                        output=output,
+                        stratum_ids={"s00001"},
+                    )
+                )
+            self.assertEqual(result, output)
+            untouched_path = root / (
+                records[0]["output_stem"] + ".json"
+            )
+            self.assertFalse(untouched_path.exists())
 
     @unittest.skipUnless(
         Path(__file__).with_name("build").joinpath("aao_rad").is_file(),

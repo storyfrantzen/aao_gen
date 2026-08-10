@@ -817,6 +817,159 @@ def _merge_refinement_calibrations(
     return output
 
 
+def _current_campaign_stratum_ids(campaign: dict) -> set[str]:
+    """Return and verify the strata newly sampled by this campaign."""
+    identifiers: set[str] = set()
+    for manifest_record in campaign.get("manifests") or []:
+        manifest_path = _require_file(Path(str(manifest_record["path"])))
+        if _sha256(manifest_path) != str(manifest_record["sha256"]):
+            raise CampaignError(f"{manifest_path}: campaign hash changed")
+        manifest = _load_json(manifest_path)
+        if manifest.get("operation") != "calibration":
+            raise CampaignError(
+                f"{manifest_path}: incremental finalization requires "
+                "calibration manifests"
+            )
+        identifiers.update(
+            str(record["stratum_id"])
+            for record in manifest.get("runs") or []
+        )
+    task_identifiers = {
+        str(task["stratum_id"]) for task in _read_tasks(campaign)
+    }
+    if identifiers != task_identifiers:
+        raise CampaignError(
+            "current manifest strata differ from the campaign task table"
+        )
+    if not identifiers:
+        raise CampaignError(
+            "incremental finalization requires at least one touched stratum"
+        )
+    return identifiers
+
+
+def _merge_incremental_followup_calibration(
+    *,
+    campaign_path: Path,
+    campaign: dict,
+    subset_path: Path,
+    output: Path,
+    touched_ids: set[str],
+) -> Path:
+    """Replace exactly the touched strata in a frozen parent calibration."""
+    base_path = _require_file(Path(str(campaign["calibration_report"])))
+    if _sha256(base_path) != str(campaign["calibration_report_sha256"]):
+        raise CampaignError("base calibration report changed")
+    base = _load_json(base_path)
+    subset = _load_json(subset_path)
+    if base.get("schema") != CALIBRATION_SCHEMA or subset.get(
+        "schema"
+    ) != CALIBRATION_SCHEMA:
+        raise CampaignError(
+            "incremental merge requires calibration reports"
+        )
+    compatibility = (
+        "analysis_config_sha256",
+        "guard_recipes_sha256",
+        "guard_refinements_sha256",
+        "guard_candidate",
+        "core_fraction",
+        "analysis_selection",
+        "calibration_proposal",
+        "envelope_safety_factor",
+        "maximum_duplicate_fraction",
+        "minimum_component_targets",
+        "minimum_provisional_inside_targets",
+        "zero_complement_policy",
+    )
+    for name in compatibility:
+        if base.get(name) != subset.get(name):
+            raise CampaignError(
+                f"incremental calibration {name} differs from the parent "
+                "report; use --full-recompute to change finalization policy"
+            )
+    base_strata = _calibration_strata_by_id(base)
+    subset_strata = _calibration_strata_by_id(subset)
+    if set(subset_strata) != touched_ids:
+        raise CampaignError(
+            "incrementally recomputed strata differ from current campaign"
+        )
+    missing = sorted(touched_ids - set(base_strata))
+    if missing:
+        raise CampaignError(
+            "follow-up strata are absent from the parent report: "
+            + ", ".join(missing)
+        )
+    for identifier in sorted(touched_ids):
+        old = base_strata[identifier]
+        new = subset_strata[identifier]
+        for name in ("flat_index", "indices", "bounds"):
+            if old.get(name) != new.get(name):
+                raise CampaignError(
+                    f"{identifier}: incrementally recomputed {name} differs "
+                    "from the parent report"
+                )
+        if not _guards_equal(old["guard"], new["guard"]):
+            raise CampaignError(
+                f"{identifier}: incrementally recomputed guard differs from "
+                "the parent report"
+            )
+    expected_sources = {
+        (str(item["path"]), str(item["sha256"]))
+        for item in campaign.get("pool_manifests") or []
+    }
+    actual_sources = {
+        (str(item["path"]), str(item["sha256"]))
+        for item in subset.get("source_manifests") or []
+    }
+    if actual_sources != expected_sources:
+        raise CampaignError(
+            "incremental subset provenance differs from the campaign pool"
+        )
+    merged = copy.deepcopy(base)
+    merged_by_id = _calibration_strata_by_id(merged)
+    for identifier, record in subset_strata.items():
+        merged_by_id[identifier] = copy.deepcopy(record)
+    merged["strata"] = sorted(
+        merged_by_id.values(), key=lambda item: int(item["flat_index"])
+    )
+    merged["stratum_count"] = len(merged["strata"])
+    merged["created_utc"] = _now()
+    merged["finalizer_revision"] = _source_revision()
+    merged["finalizer_source_sha256"] = _sha256(
+        Path(radiative_mode4.__file__).resolve()
+    )
+    for name in (
+        "source_manifests",
+        "generator_revision",
+        "generator_revisions",
+        "revision_compatibility_override",
+    ):
+        if name in subset:
+            merged[name] = copy.deepcopy(subset[name])
+    merged["incremental_calibration"] = {
+        "schema": "aao-rad-incremental-calibration-v1",
+        "campaign": str(campaign_path),
+        "campaign_sha256": _sha256(campaign_path),
+        "parent_report": str(base_path),
+        "parent_report_sha256": _sha256(base_path),
+        "recomputed_subset_report": str(subset_path),
+        "recomputed_subset_report_sha256": _sha256(subset_path),
+        "pool_manifests": len(expected_sources),
+        "current_manifests": len(campaign.get("manifests") or []),
+        "unchanged_strata_copied_from_parent": (
+            len(base_strata) - len(touched_ids)
+        ),
+        "recomputed_strata": len(touched_ids),
+        "recomputed_stratum_ids": sorted(touched_ids),
+        "historical_and_new_runs_pooled_for_recomputed_strata": True,
+        "untouched_raw_run_artifacts_not_reopened": True,
+        "statistically_equivalent_to_full_recomputation": True,
+    }
+    radiative_mode4._write_calibration_report(output, merged)
+    return output
+
+
 def finalize(args: argparse.Namespace) -> Path:
     campaign_path, campaign = _load_campaign(args.campaign)
     _assert_complete(campaign_path, campaign)
@@ -838,15 +991,32 @@ def finalize(args: argparse.Namespace) -> Path:
             else "campaign_weights.json"
         )
     )
-    mode4_output = (
-        Path(str(campaign["root"])) / "refined_envelope_calibration.json"
-        if campaign["kind"] == "calibration_refinement"
-        else output
+    incremental_followup = (
+        campaign["kind"] == "calibration_followup"
+        and not bool(getattr(args, "full_recompute", False))
+    )
+    if campaign["kind"] == "calibration_refinement":
+        mode4_output = (
+            Path(str(campaign["root"]))
+            / "refined_envelope_calibration.json"
+        )
+    elif incremental_followup:
+        mode4_output = (
+            Path(str(campaign["root"]))
+            / "incremental_recomputed_strata.json"
+        )
+    else:
+        mode4_output = output
+    touched_ids = (
+        _current_campaign_stratum_ids(campaign)
+        if incremental_followup
+        else None
     )
     result = radiative_mode4.finalize(
         argparse.Namespace(
             manifests=manifests,
             output=mode4_output,
+            stratum_ids=touched_ids,
             envelope_safety_factor=args.envelope_safety_factor,
             maximum_duplicate_fraction=args.maximum_duplicate_fraction,
             minimum_component_targets=args.minimum_component_targets,
@@ -869,6 +1039,14 @@ def finalize(args: argparse.Namespace) -> Path:
             campaign=campaign,
             refined_path=result,
             output=output,
+        )
+    if incremental_followup:
+        return _merge_incremental_followup_calibration(
+            campaign_path=campaign_path,
+            campaign=campaign,
+            subset_path=result,
+            output=output,
+            touched_ids=touched_ids,
         )
     return result
 
@@ -2085,6 +2263,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     finalize_parser.add_argument("--campaign", type=Path, required=True)
     _add_finalize_arguments(finalize_parser)
+    finalize_parser.add_argument(
+        "--full-recompute",
+        action="store_true",
+        help=(
+            "reopen every pooled run instead of incrementally recomputing "
+            "only strata touched by a calibration follow-up"
+        ),
+    )
 
     followup = subparsers.add_parser(
         "plan-followup",

@@ -29,6 +29,11 @@ default because it includes bins with no demonstrated support.
 - Follow-up calibration manifests remain compatible with the initial
   manifest and are pooled component by component by the existing mode-4
   finalizer.
+- Follow-up finalization is incremental by default.  It recomputes every
+  touched stratum from its complete historical-plus-new run pool, copies
+  untouched strata from the frozen parent report, and records the operation
+  in `incremental_calibration`.  `--full-recompute` retains the slower audit
+  path that reopens every pooled run artifact.
 - Production planning fails closed unless every selected queue stratum has
   a usable envelope.  `--allow-incomplete` is available only as an explicit
   development override.
@@ -201,14 +206,22 @@ less "$followup/submit_swif.sh"
 ```
 
 After completion, finalize the follow-up campaign.  Its campaign metadata
-already includes both the initial and follow-up manifests, so the new report
-is pooled automatically:
+already includes both the initial and follow-up manifests.  By default the
+driver now recomputes only the strata sampled by this follow-up, using their
+complete historical-plus-new pools, and copies all untouched records from
+the hashed parent report:
 
 ```tcsh
 python3 radiative_full_campaign.py finalize \
   --campaign "$followup/campaign.json" \
   --allow-zero-complement
 ```
+
+The intermediate `incremental_recomputed_strata.json` contains only the
+recomputed subset.  The production-facing `envelope_calibration.json`
+contains the complete catalog and an `incremental_calibration` provenance
+record.  To perform the original all-stratum audit instead, add
+`--full-recompute`; this can be much slower on a shared filesystem.
 
 Repeat `plan-followup` only if the pooled report still contains non-ready
 strata.  No manual list construction is required.
@@ -239,8 +252,9 @@ python3 radiative_full_campaign.py plan-followup \
 The TSV retains the capped decisions with
 `selected_by_capped_policy=False`, while the immutable campaign contains only
 the uncapped tasks.  `--capped-policy only` is also available for an explicit
-diagnostic campaign.  Finalize the uncapped campaign normally; its report
-still pools the complete parent history.
+diagnostic campaign.  Finalize the uncapped campaign normally; the touched
+strata still pool their complete parent history without reopening raw files
+for thousands of unchanged strata.
 
 ### Batch-refine capped complement strata
 

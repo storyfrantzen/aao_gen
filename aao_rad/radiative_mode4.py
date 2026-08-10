@@ -2827,6 +2827,19 @@ def finalize(args: argparse.Namespace) -> Path:
         sources.append((manifest_path, manifest))
     manifest_path, manifest = sources[0]
     operation = manifest["operation"]
+    raw_stratum_ids = getattr(args, "stratum_ids", None)
+    selected_stratum_ids = (
+        {str(identifier) for identifier in raw_stratum_ids}
+        if raw_stratum_ids is not None
+        else None
+    )
+    if selected_stratum_ids is not None:
+        if operation != "calibration":
+            raise ValueError(
+                "stratum-subset finalization is valid only for calibration"
+            )
+        if not selected_stratum_ids:
+            raise ValueError("stratum-subset finalization cannot be empty")
     allow_revision_mismatch = bool(
         getattr(args, "allow_calibration_revision_mismatch", False)
     )
@@ -2881,8 +2894,14 @@ def finalize(args: argparse.Namespace) -> Path:
         for source_path, source in sources:
             source_root = source_path.parent
             for record in source["runs"]:
+                stratum_id = str(record["stratum_id"])
+                if (
+                    selected_stratum_ids is not None
+                    and stratum_id not in selected_stratum_ids
+                ):
+                    continue
                 stratum_seed = (
-                    str(record["stratum_id"]),
+                    stratum_id,
                     int(record["seed"]),
                 )
                 if stratum_seed in seen_stratum_seeds:
@@ -2927,8 +2946,17 @@ def finalize(args: argparse.Namespace) -> Path:
                         f"{run_path}: operation differs from manifest"
                     )
                 grouped_calibration.setdefault(
-                    record["stratum_id"], []
+                    stratum_id, []
                 ).append((source_root, record, completed, source_path))
+        if selected_stratum_ids is not None:
+            missing = sorted(
+                selected_stratum_ids - set(grouped_calibration)
+            )
+            if missing:
+                raise Mode4Error(
+                    "requested calibration strata have no pooled runs: "
+                    + ", ".join(missing)
+                )
         return _finalize_calibration(args, sources, grouped_calibration)
 
     root = manifest_path.parent

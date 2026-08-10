@@ -666,6 +666,164 @@ class FullCampaignTests(unittest.TestCase):
             ]
         )
 
+    def test_followup_finalize_recomputes_only_touched_strata(self) -> None:
+        guard = self._guard()
+        first = self._complete_calibration_stratum(
+            guard=guard, refined=True
+        )
+        second = json.loads(json.dumps(first))
+        second["flat_index"] = 1
+        second["stratum_id"] = "s00001"
+        second["indices"]["iphi"] = 1
+        common = {
+            "schema": radiative_mode4.CALIBRATION_SCHEMA,
+            "analysis_config_sha256": _sha256(self.config),
+            "guard_recipes_sha256": _sha256(self.recipes),
+            "guard_refinements_sha256": None,
+            "guard_candidate": "padding_0p035",
+            "core_fraction": 0.9,
+            "analysis_selection": {"apply_y_max": True},
+            "calibration_proposal": "guard_partition",
+            "envelope_safety_factor": 1.2,
+            "maximum_duplicate_fraction": 0.05,
+            "minimum_component_targets": 20,
+            "minimum_provisional_inside_targets": 1000,
+            "zero_complement_policy": {
+                "enabled": True,
+                "confidence_level": 0.95,
+                "maximum_target_rate": 1.0e-6,
+            },
+            "generator_revision": "physics-revision",
+            "generator_revisions": ["physics-revision"],
+            "revision_compatibility_override": {"enabled": False},
+        }
+        parent_manifest = self.root / "parent_stage/manifest.json"
+        followup_manifest = self.root / "followup_stage/manifest.json"
+        parent_run = {
+            "flat_index": 0,
+            "stratum_id": "s00000",
+            "replica_index": 0,
+            "seed": 1,
+            "output_stem": "runs/s00000/s00000__g0000",
+        }
+        followup_run = {
+            "flat_index": 1,
+            "stratum_id": "s00001",
+            "replica_index": 0,
+            "seed": 2,
+            "output_stem": "runs/s00001/s00001__g0000",
+        }
+        _write_json(
+            parent_manifest,
+            {"operation": "calibration", "runs": [parent_run]},
+        )
+        _write_json(
+            followup_manifest,
+            {"operation": "calibration", "runs": [followup_run]},
+        )
+        sources = [
+            {"path": str(path), "sha256": _sha256(path)}
+            for path in (parent_manifest, followup_manifest)
+        ]
+        base_path = self.root / "parent_calibration.json"
+        _write_json(
+            base_path,
+            {
+                **common,
+                "stratum_count": 2,
+                "source_manifests": [sources[0]],
+                "strata": [first, second],
+            },
+        )
+        campaign_root = self.root / "incremental_followup"
+        campaign_root.mkdir()
+        task = {
+            "task_id": 1,
+            "stage": "followup",
+            "operation": "calibration",
+            "manifest": str(followup_manifest),
+            "manifest_sha256": _sha256(followup_manifest),
+            "flat_index": 1,
+            "stratum_id": "s00001",
+            "replica_index": 0,
+            "seed": 2,
+            "requested_trials": 1_000_000,
+            "requested_events": 0,
+            "expected_run": str(self.root / "unused_run.json"),
+        }
+        payload = full._campaign_payload(
+            kind="calibration_followup",
+            root=campaign_root,
+            tasks=[task],
+            manifests=[followup_manifest],
+            pool_manifests=[parent_manifest, followup_manifest],
+            frozen_inputs={
+                "config": str(self.config),
+                "config_sha256": _sha256(self.config),
+                "recipes": str(self.recipes),
+                "recipes_sha256": _sha256(self.recipes),
+                "legacy_input": str(self.legacy),
+                "legacy_input_sha256": _sha256(self.legacy),
+                "refinements": None,
+                "refinements_sha256": None,
+            },
+            selection={"selected_strata": 2},
+            calibration_report=base_path,
+        )
+        campaign_path = full._finish_campaign(
+            campaign_root, payload, [task]
+        )
+        updated = json.loads(json.dumps(second))
+        updated["inside_guard"]["target_candidates"] = 2500
+
+        def fake_finalize(args: argparse.Namespace) -> Path:
+            self.assertEqual(args.stratum_ids, {"s00001"})
+            self.assertEqual(
+                args.manifests, [parent_manifest, followup_manifest]
+            )
+            _write_json(
+                args.output,
+                {
+                    **common,
+                    "stratum_count": 1,
+                    "source_manifests": sources,
+                    "strata": [updated],
+                },
+            )
+            return args.output
+
+        output = campaign_root / "envelope_calibration.json"
+        args = argparse.Namespace(
+            campaign=campaign_path,
+            output=output,
+            envelope_safety_factor=1.2,
+            maximum_duplicate_fraction=0.05,
+            minimum_component_targets=20,
+            minimum_provisional_inside_targets=1000,
+            allow_zero_complement=True,
+            zero_complement_confidence=0.95,
+            maximum_zero_complement_target_rate=1.0e-6,
+            full_recompute=False,
+        )
+        with mock.patch.object(full, "_assert_complete"), mock.patch.object(
+            radiative_mode4, "finalize", side_effect=fake_finalize
+        ):
+            result = full.finalize(args)
+        merged = json.loads(result.read_text(encoding="utf-8"))
+        by_id = {item["stratum_id"]: item for item in merged["strata"]}
+        self.assertEqual(
+            by_id["s00000"]["inside_guard"]["target_candidates"], 2000
+        )
+        self.assertEqual(
+            by_id["s00001"]["inside_guard"]["target_candidates"], 2500
+        )
+        audit = merged["incremental_calibration"]
+        self.assertEqual(audit["recomputed_strata"], 1)
+        self.assertEqual(audit["unchanged_strata_copied_from_parent"], 1)
+        self.assertTrue(
+            audit["statistically_equivalent_to_full_recomputation"]
+        )
+
     def test_production_plan_and_swif_script_cover_every_replica(self) -> None:
         campaign_path = self._plan()
         calibration_path = self.root / "ready.json"
