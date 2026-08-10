@@ -14,6 +14,7 @@ auditable submission script which the user may inspect before submitting it.
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import datetime as dt
 import hashlib
@@ -40,6 +41,8 @@ SELECTABLE_WORK_CATEGORIES = {
     "guard_refinement",
     "targeted_discovery",
 }
+REFINEMENT_SCHEMA = radiative_mode4.REFINEMENT_SCHEMA
+REFINEMENT_COORDINATE_SPACE = radiative_mode4.REFINEMENT_COORDINATE_SPACE
 
 
 class CampaignError(RuntimeError):
@@ -282,6 +285,7 @@ def _campaign_payload(
     parent: Optional[Path] = None,
     calibration_report: Optional[Path] = None,
     followup: Optional[dict[str, object]] = None,
+    refinement: Optional[dict[str, object]] = None,
 ) -> dict[str, object]:
     return {
         "schema": CAMPAIGN_SCHEMA,
@@ -320,6 +324,7 @@ def _campaign_payload(
         "task_ids": str(root / "task_ids.txt"),
         "task_ids_sha256": None,
         "followup": followup,
+        "refinement": refinement,
     }
 
 
@@ -625,6 +630,193 @@ def _assert_complete(campaign_path: Path, campaign: dict) -> None:
         )
 
 
+def _guards_equal(left: dict, right: dict) -> bool:
+    first = radiative_mode4._guard_box_from_manifest({"guard": left})
+    second = radiative_mode4._guard_box_from_manifest({"guard": right})
+    for axis in radiative_mode4.AXES[:-1]:
+        if any(
+            not radiative_mode4._close(a, b)
+            for a, b in zip(
+                first.nonperiodic[axis], second.nonperiodic[axis]
+            )
+        ):
+            return False
+    return (
+        radiative_mode4._close(first.phi_origin, second.phi_origin)
+        and all(
+            radiative_mode4._close(a, b)
+            for a, b in zip(first.phi_relative, second.phi_relative)
+        )
+    )
+
+
+def _merge_refinement_calibrations(
+    *,
+    campaign_path: Path,
+    campaign: dict,
+    refined_path: Path,
+    output: Path,
+) -> Path:
+    base_path = _require_file(Path(str(campaign["calibration_report"])))
+    if _sha256(base_path) != str(campaign["calibration_report_sha256"]):
+        raise CampaignError("base calibration report changed")
+    base = _load_json(base_path)
+    refined = _load_json(refined_path)
+    if base.get("schema") != CALIBRATION_SCHEMA or refined.get(
+        "schema"
+    ) != CALIBRATION_SCHEMA:
+        raise CampaignError("refinement merge requires calibration reports")
+    compatibility = (
+        "analysis_config_sha256",
+        "guard_recipes_sha256",
+        "guard_candidate",
+        "core_fraction",
+        "analysis_selection",
+        "calibration_proposal",
+        "envelope_safety_factor",
+        "maximum_duplicate_fraction",
+        "minimum_component_targets",
+        "minimum_provisional_inside_targets",
+        "zero_complement_policy",
+    )
+    for name in compatibility:
+        if base.get(name) != refined.get(name):
+            raise CampaignError(
+                f"refined calibration {name} differs from the base report"
+            )
+    refinement_path = _require_file(
+        Path(str(campaign["refinement"]["artifact"]))
+    )
+    refinement_hash = _sha256(refinement_path)
+    if refinement_hash != str(campaign["refinement"]["artifact_sha256"]):
+        raise CampaignError("guard-refinement artifact changed")
+    if refined.get("guard_refinements_sha256") != refinement_hash:
+        raise CampaignError(
+            "refined calibration does not use the campaign refinement"
+        )
+    artifact = _load_json(refinement_path)
+    if artifact.get("schema") != REFINEMENT_SCHEMA:
+        raise CampaignError("unsupported guard-refinement artifact")
+    expected_ids = {
+        str(record["stratum_id"])
+        for manifest_record in campaign.get("pool_manifests") or []
+        for record in _load_json(
+            _require_file(Path(str(manifest_record["path"])))
+        ).get("runs")
+        or []
+    }
+    refined_strata = _calibration_strata_by_id(refined)
+    if set(refined_strata) != expected_ids:
+        raise CampaignError(
+            "refined report strata differ from the campaign selection"
+        )
+    base_strata = _calibration_strata_by_id(base)
+    missing = sorted(expected_ids - set(base_strata))
+    if missing:
+        raise CampaignError(
+            "refined strata are absent from the base report: "
+            + ", ".join(missing)
+        )
+    previews = artifact.get("preview") or {}
+    base_already_uses_refinement = (
+        base.get("guard_refinements_sha256") == refinement_hash
+    )
+    for identifier in sorted(expected_ids):
+        preview = previews.get(identifier) or {}
+        old_guard = preview.get("pre_refinement_guard")
+        new_guard = preview.get("refined_guard")
+        if old_guard is None or new_guard is None:
+            raise CampaignError(
+                f"{identifier}: refinement preview lacks old/new guards"
+            )
+        expected_base_guard = (
+            new_guard if base_already_uses_refinement else old_guard
+        )
+        if not _guards_equal(
+            base_strata[identifier]["guard"], expected_base_guard
+        ):
+            raise CampaignError(
+                f"{identifier}: base guard differs from refinement evidence"
+            )
+        if not _guards_equal(refined_strata[identifier]["guard"], new_guard):
+            raise CampaignError(
+                f"{identifier}: recalibrated guard differs from refinement"
+            )
+    unchanged_refined_ids = set(artifact.get("strata") or {}) - expected_ids
+    unknown_refinements = sorted(unchanged_refined_ids - set(base_strata))
+    if unknown_refinements:
+        raise CampaignError(
+            "refinement artifact contains strata absent from the base report: "
+            + ", ".join(unknown_refinements)
+        )
+    for identifier in sorted(unchanged_refined_ids):
+        preview = previews.get(identifier) or {}
+        new_guard = preview.get("refined_guard")
+        if new_guard is None or not _guards_equal(
+            base_strata[identifier]["guard"], new_guard
+        ):
+            raise CampaignError(
+                f"{identifier}: unchanged refined guard differs from base"
+            )
+    merged = copy.deepcopy(base)
+    merged_by_id = _calibration_strata_by_id(merged)
+    for identifier, record in refined_strata.items():
+        merged_by_id[identifier] = copy.deepcopy(record)
+    merged["strata"] = sorted(
+        merged_by_id.values(), key=lambda item: int(item["flat_index"])
+    )
+    merged["stratum_count"] = len(merged["strata"])
+    merged["created_utc"] = _now()
+    merged["finalizer_revision"] = _source_revision()
+    merged["finalizer_source_sha256"] = _sha256(
+        Path(radiative_mode4.__file__).resolve()
+    )
+    merged["guard_refinements_sha256"] = refinement_hash
+    revisions = sorted(
+        {
+            str(value)
+            for report in (base, refined)
+            for value in (
+                report.get("generator_revisions")
+                or (
+                    [report["generator_revision"]]
+                    if report.get("generator_revision") is not None
+                    else []
+                )
+            )
+        }
+    )
+    merged["generator_revisions"] = revisions
+    merged["generator_revision"] = revisions[0] if len(revisions) == 1 else None
+    source_manifests: dict[tuple[str, str], dict] = {}
+    for report in (base, refined):
+        for record in report.get("source_manifests") or []:
+            key = (str(record["path"]), str(record["sha256"]))
+            source_manifests[key] = copy.deepcopy(record)
+    merged["source_manifests"] = [
+        source_manifests[key] for key in sorted(source_manifests)
+    ]
+    merged["composite_calibration"] = {
+        "schema": "aao-rad-composite-refinement-calibration-v1",
+        "campaign": str(campaign_path),
+        "campaign_sha256": _sha256(campaign_path),
+        "base_report": str(base_path),
+        "base_report_sha256": _sha256(base_path),
+        "refined_report": str(refined_path),
+        "refined_report_sha256": _sha256(refined_path),
+        "guard_refinements": str(refinement_path),
+        "guard_refinements_sha256": refinement_hash,
+        "unchanged_strata": len(base_strata) - len(expected_ids),
+        "replaced_refined_strata": len(expected_ids),
+        "replaced_stratum_ids": sorted(expected_ids),
+        "old_and_new_guards_verified": True,
+        "unchanged_refined_guards_verified": len(unchanged_refined_ids),
+        "pre_refinement_trials_excluded_for_changed_guards": True,
+    }
+    radiative_mode4._write_calibration_report(output, merged)
+    return output
+
+
 def finalize(args: argparse.Namespace) -> Path:
     campaign_path, campaign = _load_campaign(args.campaign)
     _assert_complete(campaign_path, campaign)
@@ -637,14 +829,24 @@ def finalize(args: argparse.Namespace) -> Path:
         else Path(str(campaign["root"]))
         / (
             "envelope_calibration.json"
-            if campaign["kind"] in ("calibration", "calibration_followup")
+            if campaign["kind"]
+            in (
+                "calibration",
+                "calibration_followup",
+                "calibration_refinement",
+            )
             else "campaign_weights.json"
         )
+    )
+    mode4_output = (
+        Path(str(campaign["root"])) / "refined_envelope_calibration.json"
+        if campaign["kind"] == "calibration_refinement"
+        else output
     )
     result = radiative_mode4.finalize(
         argparse.Namespace(
             manifests=manifests,
-            output=output,
+            output=mode4_output,
             envelope_safety_factor=args.envelope_safety_factor,
             maximum_duplicate_fraction=args.maximum_duplicate_fraction,
             minimum_component_targets=args.minimum_component_targets,
@@ -661,6 +863,13 @@ def finalize(args: argparse.Namespace) -> Path:
             revision_compatibility_rationale=None,
         )
     )
+    if campaign["kind"] == "calibration_refinement":
+        return _merge_refinement_calibrations(
+            campaign_path=campaign_path,
+            campaign=campaign,
+            refined_path=result,
+            output=output,
+        )
     return result
 
 
@@ -779,7 +988,11 @@ def _support_followup(
 
 def plan_followup(args: argparse.Namespace) -> Path:
     parent_path, parent = _load_campaign(args.campaign)
-    if parent["kind"] not in ("calibration", "calibration_followup"):
+    if parent["kind"] not in (
+        "calibration",
+        "calibration_followup",
+        "calibration_refinement",
+    ):
         raise CampaignError("follow-ups require a calibration campaign")
     calibration_path = _require_file(args.calibration)
     calibration = _load_json(calibration_path)
@@ -803,6 +1016,9 @@ def plan_followup(args: argparse.Namespace) -> Path:
     source_manifest = _load_json(
         Path(str(parent["pool_manifests"][0]["path"]))
     )
+    capped_policy = str(getattr(args, "capped_policy", "include"))
+    if capped_policy not in ("include", "exclude", "only"):
+        raise ValueError(f"unsupported capped policy {capped_policy!r}")
     groups: dict[tuple[str, int, float], list[dict[str, object]]] = {}
     decisions: list[dict[str, object]] = []
     for stratum in calibration.get("strata") or []:
@@ -834,8 +1050,15 @@ def plan_followup(args: argparse.Namespace) -> Path:
             "source_status": stratum["recommendation_status"],
             **decision,
         }
+        capped = bool(record.get("capped_at_maximum", False))
+        selected_by_capped_policy = (
+            capped_policy == "include"
+            or (capped_policy == "exclude" and not capped)
+            or (capped_policy == "only" and capped)
+        )
+        record["selected_by_capped_policy"] = selected_by_capped_policy
         decisions.append(record)
-        if decision["schedulable"]:
+        if decision["schedulable"] and selected_by_capped_policy:
             key = (
                 str(decision["kind"]),
                 int(decision["trials"]),
@@ -907,6 +1130,7 @@ def plan_followup(args: argparse.Namespace) -> Path:
         "trials",
         "required_trials_estimate",
         "capped_at_maximum",
+        "selected_by_capped_policy",
     )
     with (output / "followup_plan.tsv").open(
         "w", encoding="utf-8", newline=""
@@ -922,7 +1146,11 @@ def plan_followup(args: argparse.Namespace) -> Path:
         if item.get("schedulable") is False
     ]
     payload = _campaign_payload(
-        kind="calibration_followup",
+        kind=(
+            "calibration_refinement"
+            if parent["kind"] == "calibration_refinement"
+            else "calibration_followup"
+        ),
         root=output,
         tasks=tasks,
         manifests=manifests,
@@ -932,8 +1160,14 @@ def plan_followup(args: argparse.Namespace) -> Path:
         parent=parent_path,
         calibration_report=calibration_path,
         followup={
+            "capped_policy": capped_policy,
             "groups": len(groups),
             "scheduled_strata": sum(len(items) for items in groups.values()),
+            "deferred_by_capped_policy": sum(
+                item.get("schedulable") is True
+                and item.get("selected_by_capped_policy") is False
+                for item in decisions
+            ),
             "ready_strata": sum(
                 item["action"] == "none_ready" for item in decisions
             ),
@@ -941,6 +1175,595 @@ def plan_followup(args: argparse.Namespace) -> Path:
             "manual_review": manual,
             "plan_tsv": str(output / "followup_plan.tsv"),
             "plan_tsv_sha256": _sha256(output / "followup_plan.tsv"),
+        },
+        refinement=parent.get("refinement"),
+    )
+    return _finish_campaign(output, payload, tasks)
+
+
+def _calibration_strata_by_id(calibration: dict) -> dict[str, dict]:
+    records: dict[str, dict] = {}
+    for item in calibration.get("strata") or []:
+        identifier = str(item.get("stratum_id", ""))
+        if not identifier or identifier in records:
+            raise CampaignError(
+                "calibration contains an empty or duplicate stratum id"
+            )
+        records[identifier] = item
+    if not records:
+        raise CampaignError("calibration contains no strata")
+    return records
+
+
+def _capped_refinement_strata(
+    calibration: dict, args: argparse.Namespace
+) -> list[dict]:
+    selected: list[dict] = []
+    for stratum in calibration.get("strata") or []:
+        decision = _support_followup(
+            stratum,
+            minimum_targets=args.minimum_component_targets,
+            minimum_inside_targets=args.minimum_provisional_inside_targets,
+            confidence=args.zero_complement_confidence,
+            maximum_zero_rate=args.maximum_zero_complement_target_rate,
+            safety=args.followup_target_safety_factor,
+            quantum=args.trial_quantum,
+            maximum_trials=args.maximum_followup_trials,
+            discovery_trials=args.discovery_trials,
+        )
+        if decision is not None and bool(
+            decision.get("capped_at_maximum", False)
+        ):
+            if decision.get("kind") != "complement_support":
+                raise CampaignError(
+                    f"{stratum['stratum_id']}: capped refinement is only "
+                    "defined for observed guard-complement support"
+                )
+            selected.append(stratum)
+    if not selected:
+        raise CampaignError("calibration contains no capped complement strata")
+    return sorted(selected, key=lambda item: int(item["flat_index"]))
+
+
+def _fortran_guard_face_violations(
+    box: radiative_mode4.GuardBox, coordinates: dict[str, float]
+) -> list[dict[str, object]]:
+    """Classify escaped faces with the generator's REAL*4 comparisons."""
+    violations: list[dict[str, object]] = []
+    round32 = radiative_mode4._fortran_real32
+    for axis in radiative_mode4.AXES[:-1]:
+        value = round32(coordinates[axis])
+        lower = round32(box.nonperiodic[axis][0])
+        upper = round32(box.nonperiodic[axis][1])
+        if value < lower:
+            violations.append(
+                {
+                    "axis": axis,
+                    "face": "lower",
+                    "value": float(value),
+                    "boundary": float(lower),
+                    "excursion": float(lower - value),
+                }
+            )
+        elif value > upper:
+            violations.append(
+                {
+                    "axis": axis,
+                    "face": "upper",
+                    "value": float(value),
+                    "boundary": float(upper),
+                    "excursion": float(value - upper),
+                }
+            )
+    phi = round32(coordinates["hadron_phi_base"])
+    origin = round32(box.phi_origin)
+    relative = round32(phi - origin)
+    relative = round32(relative + round32(0.5))
+    relative = round32(relative % round32(1.0))
+    relative = round32(relative - round32(0.5))
+    lower = round32(box.phi_relative[0])
+    upper = round32(box.phi_relative[1])
+    if relative < lower:
+        violations.append(
+            {
+                "axis": "hadron_phi_base",
+                "face": "lower",
+                "value": float(phi),
+                "relative_value": float(relative),
+                "boundary": float(lower),
+                "excursion": float(lower - relative),
+            }
+        )
+    elif relative > upper:
+        violations.append(
+            {
+                "axis": "hadron_phi_base",
+                "face": "upper",
+                "value": float(phi),
+                "relative_value": float(relative),
+                "boundary": float(upper),
+                "excursion": float(relative - upper),
+            }
+        )
+    return violations
+
+
+def _read_complement_coordinates(
+    campaign: dict,
+    calibration: dict,
+    selected: list[dict],
+) -> tuple[
+    dict[str, list[dict[str, float]]],
+    dict[str, set[Path]],
+]:
+    selected_ids = {str(item["stratum_id"]) for item in selected}
+    strata = _calibration_strata_by_id(calibration)
+    expected_sources = {
+        Path(str(item["path"])).expanduser().resolve(): str(item["sha256"])
+        for item in calibration.get("source_manifests") or []
+    }
+    coordinates: dict[str, list[dict[str, float]]] = {
+        identifier: [] for identifier in selected_ids
+    }
+    evidence: dict[str, set[Path]] = {
+        identifier: set() for identifier in selected_ids
+    }
+    for source_record in campaign.get("pool_manifests") or []:
+        manifest_path = _require_file(Path(str(source_record["path"])))
+        manifest_hash = _sha256(manifest_path)
+        if manifest_hash != str(source_record["sha256"]):
+            raise CampaignError(f"{manifest_path}: campaign hash changed")
+        if expected_sources.get(manifest_path) != manifest_hash:
+            raise CampaignError(
+                f"{manifest_path}: absent from or changed since calibration"
+            )
+        manifest = _load_json(manifest_path)
+        if manifest.get("operation") != "calibration":
+            raise CampaignError(f"{manifest_path}: expected calibration")
+        for record in manifest.get("runs") or []:
+            identifier = str(record["stratum_id"])
+            if identifier not in selected_ids:
+                continue
+            if record["guard"] != strata[identifier].get("guard"):
+                raise CampaignError(
+                    f"{manifest_path}: {identifier} guard differs from report"
+                )
+            path = manifest_path.parent / (
+                str(record["output_stem"]) + ".calibration.csv"
+            )
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            found = 0
+            with path.open(encoding="utf-8", newline="") as source:
+                schema = source.readline().strip()
+                if schema != (
+                    f"# schema={radiative_mode4.MODE4_CALIBRATION_EVENT_SCHEMA}"
+                ):
+                    raise CampaignError(
+                        f"{path}: unexpected calibration-event schema"
+                    )
+                reader = csv.DictReader(source)
+                if tuple(reader.fieldnames or ()) != (
+                    radiative_mode4.MODE4_CALIBRATION_COLUMNS
+                ):
+                    raise CampaignError(
+                        f"{path}: unexpected calibration-event columns"
+                    )
+                for row in reader:
+                    component = int(row["proposal_component"])
+                    inside = int(row["inside_core"])
+                    if component == 0:
+                        if inside != 0:
+                            raise CampaignError(
+                                f"{path}: complement row lies inside guard"
+                            )
+                        point = {
+                            axis: float(row[axis])
+                            for axis in radiative_mode4.AXES
+                        }
+                        if any(
+                            not math.isfinite(value)
+                            for value in point.values()
+                        ):
+                            raise CampaignError(
+                                f"{path}: nonfinite complement coordinate"
+                            )
+                        coordinates[identifier].append(point)
+                        found += 1
+                    elif component != 1:
+                        raise CampaignError(
+                            f"{path}: invalid proposal component"
+                        )
+            if found:
+                evidence[identifier].add(path.resolve())
+    for item in selected:
+        identifier = str(item["stratum_id"])
+        expected = int(item["guard_complement"]["target_candidates"])
+        actual = len(coordinates[identifier])
+        if actual != expected:
+            raise CampaignError(
+                f"{identifier}: found {actual} complement rows, expected "
+                f"{expected} from the calibration report"
+            )
+        if actual == 0:
+            raise CampaignError(
+                f"{identifier}: capped refinement lacks complement evidence"
+            )
+    return coordinates, evidence
+
+
+def _refined_face_value(
+    *,
+    face: str,
+    extreme: float,
+    maximum_excursion: float,
+    minimum_margin: float,
+    excursion_margin_fraction: float,
+    domain: tuple[float, float],
+) -> float:
+    margin = max(
+        minimum_margin, excursion_margin_fraction * maximum_excursion
+    )
+    if face == "lower":
+        return max(domain[0], extreme - margin)
+    return min(domain[1], extreme + margin)
+
+
+def plan_refinement(args: argparse.Namespace) -> Path:
+    """Prepare an independently recalibrated campaign for capped guards."""
+    if args.minimum_face_margin <= 0.0:
+        raise ValueError("--minimum-face-margin must be positive")
+    if args.excursion_margin_fraction < 0.0:
+        raise ValueError(
+            "--excursion-margin-fraction must be nonnegative"
+        )
+    if args.maximum_volume_ratio <= 1.0:
+        raise ValueError("--maximum-volume-ratio must exceed one")
+    parent_path, parent = _load_campaign(args.campaign)
+    if parent["kind"] not in (
+        "calibration",
+        "calibration_followup",
+        "calibration_refinement",
+    ):
+        raise CampaignError("guard refinement requires a calibration campaign")
+    calibration_path = _require_file(args.calibration)
+    calibration = _load_json(calibration_path)
+    if calibration.get("schema") != CALIBRATION_SCHEMA:
+        raise CampaignError(
+            f"{calibration_path}: expected schema {CALIBRATION_SCHEMA}"
+        )
+    if parent.get("calibration_report") is not None and (
+        parent.get("calibration_report_sha256") is not None
+        and Path(str(parent["calibration_report"])).resolve()
+        == calibration_path
+        and str(parent["calibration_report_sha256"])
+        != _sha256(calibration_path)
+    ):
+        raise CampaignError("parent calibration report changed")
+    selected = _capped_refinement_strata(calibration, args)
+    coordinates, evidence_paths = _read_complement_coordinates(
+        parent, calibration, selected
+    )
+    output = args.output.expanduser().resolve()
+    if output.exists():
+        raise FileExistsError(output)
+    output.mkdir(parents=True)
+    frozen = parent["frozen_inputs"]
+    config = _require_file(Path(str(frozen["config"])))
+    recipes_path = _require_file(Path(str(frozen["recipes"])))
+    legacy_input = _require_file(Path(str(frozen["legacy_input"])))
+    (
+        _config,
+        recipes,
+        config_sha256,
+        recipes_sha256,
+    ) = radiative_mode4._load_config_and_recipes(config, recipes_path)
+    if calibration.get("analysis_config_sha256") != config_sha256:
+        raise CampaignError("calibration analysis configuration changed")
+    if calibration.get("guard_recipes_sha256") != recipes_sha256:
+        raise CampaignError("calibration guard recipes changed")
+    candidate = str(calibration["guard_candidate"])
+    base_padding = radiative_mode4._candidate_padding(recipes, candidate)
+    old_refinements: Optional[dict] = None
+    old_refinement_path = (
+        _require_file(Path(str(frozen["refinements"])))
+        if frozen.get("refinements")
+        else None
+    )
+    if old_refinement_path is not None:
+        old_refinements, old_hash = radiative_mode4._load_guard_refinements(
+            old_refinement_path,
+            config_sha256=config_sha256,
+            recipes_sha256=recipes_sha256,
+            candidate=candidate,
+            recipes=recipes,
+            base_padding=base_padding,
+        )
+        if calibration.get("guard_refinements_sha256") != old_hash:
+            raise CampaignError(
+                "calibration and parent refinement provenance differ"
+            )
+    elif calibration.get("guard_refinements_sha256") is not None:
+        raise CampaignError(
+            "calibration uses refinements absent from the parent campaign"
+        )
+    specifications = copy.deepcopy(
+        (old_refinements or {}).get("strata", {})
+    )
+    preview: dict[str, dict[str, object]] = {}
+    plan_rows: list[dict[str, object]] = []
+    calibration_strata = _calibration_strata_by_id(calibration)
+    for item in selected:
+        identifier = str(item["stratum_id"])
+        current = radiative_mode4._guard_box_from_manifest(
+            {"guard": item["guard"]}
+        )
+        face_observations: dict[
+            tuple[str, str], list[dict[str, object]]
+        ] = {}
+        for point in coordinates[identifier]:
+            violations = _fortran_guard_face_violations(current, point)
+            if not violations:
+                raise CampaignError(
+                    f"{identifier}: complement point crosses no guard face"
+                )
+            for violation in violations:
+                key = (str(violation["axis"]), str(violation["face"]))
+                face_observations.setdefault(key, []).append(violation)
+        old_specification = specifications.get(identifier, {})
+        original = radiative_mode4.reconstruct_guard_box(
+            recipes["strata"][identifier], base_padding
+        )
+        if old_specification:
+            prior_refined, _prior_applied = (
+                radiative_mode4.apply_guard_refinement(
+                    original, old_specification, stratum_id=identifier
+                )
+            )
+        else:
+            prior_refined = original
+        if not _guards_equal(
+            current.manifest_record(), prior_refined.manifest_record()
+        ):
+            raise CampaignError(
+                f"{identifier}: calibration guard differs from frozen inputs"
+            )
+        faces = copy.deepcopy(old_specification.get("faces", {}))
+        face_summary: list[dict[str, object]] = []
+        for (axis, face), observations in sorted(face_observations.items()):
+            values = [
+                float(
+                    observation.get(
+                        "relative_value", observation["value"]
+                    )
+                )
+                for observation in observations
+            ]
+            excursions = [
+                float(observation["excursion"])
+                for observation in observations
+            ]
+            extreme = min(values) if face == "lower" else max(values)
+            domain = (
+                (-0.5, 0.5)
+                if axis == "hadron_phi_base"
+                else (0.0, 1.0)
+            )
+            refined_value = _refined_face_value(
+                face=face,
+                extreme=extreme,
+                maximum_excursion=max(excursions),
+                minimum_margin=args.minimum_face_margin,
+                excursion_margin_fraction=args.excursion_margin_fraction,
+                domain=domain,
+            )
+            faces.setdefault(axis, {})[face] = refined_value
+            face_summary.append(
+                {
+                    "axis": axis,
+                    "face": face,
+                    "observed_candidates": len(observations),
+                    "most_extreme_coordinate": extreme,
+                    "maximum_excursion": max(excursions),
+                    "refined_value": refined_value,
+                }
+            )
+        evidence = list(old_specification.get("evidence", []))
+        known_evidence = {
+            (str(record["path"]), str(record["sha256"]))
+            for record in evidence
+        }
+        for path in sorted(evidence_paths[identifier]):
+            record = {
+                "path": str(path),
+                "sha256": _sha256(path),
+                "bytes": path.stat().st_size,
+            }
+            key = (record["path"], record["sha256"])
+            if key not in known_evidence:
+                evidence.append(record)
+                known_evidence.add(key)
+        specification = {
+            "rationale": (
+                "Batch refinement encloses all independently observed "
+                f"guard-complement targets for {identifier}, with an "
+                f"absolute margin of at least {args.minimum_face_margin} "
+                "and an excursion-scaled margin fraction of "
+                f"{args.excursion_margin_fraction}."
+            ),
+            "evidence": evidence,
+            "faces": faces,
+        }
+        refined, applied = radiative_mode4.apply_guard_refinement(
+            original, specification, stratum_id=identifier
+        )
+        if not math.isclose(
+            current.volume,
+            float(item["guard"]["normalized_volume"]),
+            rel_tol=1.0e-10,
+        ):
+            raise CampaignError(f"{identifier}: current guard is malformed")
+        if refined.volume <= current.volume:
+            raise CampaignError(
+                f"{identifier}: batch refinement did not expand current guard"
+            )
+        if radiative_mode4._close(refined.volume, 1.0):
+            raise CampaignError(
+                f"{identifier}: refinement fills the complete native proposal "
+                "domain, leaving no complement component to calibrate"
+            )
+        incremental_ratio = refined.volume / current.volume
+        review_required = incremental_ratio > args.maximum_volume_ratio
+        specifications[identifier] = specification
+        preview[identifier] = {
+            "original_guard": original.manifest_record(),
+            "pre_refinement_guard": current.manifest_record(),
+            "refined_guard": refined.manifest_record(),
+            "incremental_volume_ratio": incremental_ratio,
+            "large_volume_review_required": review_required,
+            "observed_complement_targets": len(coordinates[identifier]),
+            "crossed_faces": face_summary,
+            **applied,
+        }
+        plan_rows.append(
+            {
+                "flat_index": int(item["flat_index"]),
+                "stratum_id": identifier,
+                "observed_complement_targets": len(coordinates[identifier]),
+                "crossed_faces": len(face_summary),
+                "old_guard_volume": current.volume,
+                "refined_guard_volume": refined.volume,
+                "incremental_volume_ratio": incremental_ratio,
+                "large_volume_review_required": review_required,
+            }
+        )
+    # Preserve previews for earlier refinements which were not changed in
+    # this iteration.  Reconstructing them makes the new artifact standalone.
+    for identifier, specification in specifications.items():
+        if identifier in preview:
+            continue
+        original = radiative_mode4.reconstruct_guard_box(
+            recipes["strata"][identifier], base_padding
+        )
+        refined, applied = radiative_mode4.apply_guard_refinement(
+            original, specification, stratum_id=identifier
+        )
+        preview[identifier] = {
+            "original_guard": original.manifest_record(),
+            "refined_guard": refined.manifest_record(),
+            **applied,
+        }
+    refinement_path = output / "guard_refinements.json"
+    refinement_payload = {
+        "schema": REFINEMENT_SCHEMA,
+        "created_utc": _now(),
+        "coordinate_space": REFINEMENT_COORDINATE_SPACE,
+        "analysis_config_source": str(config),
+        "analysis_config_sha256": config_sha256,
+        "guard_recipes_source": str(recipes_path),
+        "guard_recipes_sha256": recipes_sha256,
+        "guard_candidate": candidate,
+        "batch_refinement": {
+            "parent_campaign": str(parent_path),
+            "parent_campaign_sha256": _sha256(parent_path),
+            "source_calibration": str(calibration_path),
+            "source_calibration_sha256": _sha256(calibration_path),
+            "selected_capped_strata": len(selected),
+            "minimum_face_margin": args.minimum_face_margin,
+            "excursion_margin_fraction": args.excursion_margin_fraction,
+            "maximum_volume_ratio_review_threshold": (
+                args.maximum_volume_ratio
+            ),
+            "large_volume_review_strata": [
+                row["stratum_id"]
+                for row in plan_rows
+                if row["large_volume_review_required"]
+            ],
+        },
+        "strata": specifications,
+        "preview": preview,
+    }
+    _write_json(refinement_path, refinement_payload)
+    selection = output / "selection" / "refined_flat_indices.txt"
+    _write_flat_indices(selection, selected)
+    with (output / "refinement_plan.tsv").open(
+        "w", encoding="utf-8", newline=""
+    ) as destination:
+        writer = csv.DictWriter(
+            destination,
+            fieldnames=(
+                "flat_index",
+                "stratum_id",
+                "observed_complement_targets",
+                "crossed_faces",
+                "old_guard_volume",
+                "refined_guard_volume",
+                "incremental_volume_ratio",
+                "large_volume_review_required",
+            ),
+            delimiter="\t",
+        )
+        writer.writeheader()
+        writer.writerows(plan_rows)
+    source_manifest = _load_json(
+        Path(str(parent["pool_manifests"][0]["path"]))
+    )
+    stage = output / "stages" / "refined_calibration"
+    manifest = radiative_mode4.prepare(
+        _prepare_namespace(
+            command="prepare-calibration",
+            config=config,
+            recipes=recipes_path,
+            legacy_input=legacy_input,
+            refinements=refinement_path,
+            output=stage,
+            candidate=candidate,
+            core_fraction=float(source_manifest["core_fraction"]),
+            replicas=args.replicas,
+            seed_base=args.seed_base,
+            flat_index_file=selection,
+            apply_y_max=bool(
+                source_manifest["analysis_selection"].get(
+                    "apply_y_max", False
+                )
+            ),
+            heartbeat_interval=args.heartbeat_interval,
+            generator_revision=str(source_manifest["generator_revision"]),
+            trials=args.trials,
+            inside_fraction=args.inside_guard_trial_fraction,
+        )
+    ).resolve()
+    tasks = _manifest_tasks(manifest, stage="refined_calibration")
+    new_frozen = {
+        **frozen,
+        "refinements": str(refinement_path),
+        "refinements_sha256": _sha256(refinement_path),
+    }
+    payload = _campaign_payload(
+        kind="calibration_refinement",
+        root=output,
+        tasks=tasks,
+        manifests=[manifest],
+        pool_manifests=[manifest],
+        frozen_inputs=new_frozen,
+        selection={
+            **parent["selection"],
+            "refinement_selected_strata": len(selected),
+            "refinement_flat_indices": str(selection),
+            "refinement_flat_indices_sha256": _sha256(selection),
+        },
+        parent=parent_path,
+        calibration_report=calibration_path,
+        refinement={
+            "artifact": str(refinement_path),
+            "artifact_sha256": _sha256(refinement_path),
+            "plan": str(output / "refinement_plan.tsv"),
+            "plan_sha256": _sha256(output / "refinement_plan.tsv"),
+            "selected_strata": len(selected),
+            "large_volume_review_strata": sum(
+                bool(row["large_volume_review_required"])
+                for row in plan_rows
+            ),
         },
     )
     return _finish_campaign(output, payload, tasks)
@@ -1287,9 +2110,64 @@ def _parser() -> argparse.ArgumentParser:
     followup.add_argument(
         "--maximum-followup-trials", type=int, default=100_000_000
     )
+    followup.add_argument(
+        "--capped-policy",
+        choices=("include", "exclude", "only"),
+        default="include",
+        help=(
+            "include all schedulable strata, exclude capped estimates, or "
+            "select only capped estimates"
+        ),
+    )
     followup.add_argument("--discovery-trials", type=int, default=20_000_000)
     followup.add_argument("--heartbeat-interval", type=int, default=100_000)
     followup.add_argument("--seed-base", type=int, default=107_000_001)
+
+    refinement = subparsers.add_parser(
+        "plan-refinement",
+        help=(
+            "derive evidence-hashed guard expansions and independently "
+            "recalibrate capped complement strata"
+        ),
+    )
+    refinement.add_argument("--campaign", type=Path, required=True)
+    refinement.add_argument("--calibration", type=Path, required=True)
+    refinement.add_argument("--output", type=Path, required=True)
+    refinement.add_argument("--minimum-component-targets", type=int, default=20)
+    refinement.add_argument(
+        "--minimum-provisional-inside-targets", type=int, default=1000
+    )
+    refinement.add_argument(
+        "--zero-complement-confidence", type=float, default=0.95
+    )
+    refinement.add_argument(
+        "--maximum-zero-complement-target-rate", type=float, default=1.0e-6
+    )
+    refinement.add_argument(
+        "--followup-target-safety-factor", type=float, default=1.5
+    )
+    refinement.add_argument("--trial-quantum", type=int, default=1_000_000)
+    refinement.add_argument(
+        "--maximum-followup-trials", type=int, default=100_000_000
+    )
+    refinement.add_argument("--discovery-trials", type=int, default=20_000_000)
+    refinement.add_argument("--minimum-face-margin", type=float, default=0.005)
+    refinement.add_argument(
+        "--excursion-margin-fraction", type=float, default=0.25
+    )
+    refinement.add_argument(
+        "--maximum-volume-ratio",
+        type=float,
+        default=4.0,
+        help="flag, but do not discard, unusually large incremental expansions",
+    )
+    refinement.add_argument("--trials", type=int, default=7_000_000)
+    refinement.add_argument(
+        "--inside-guard-trial-fraction", type=float, default=0.50
+    )
+    refinement.add_argument("--replicas", type=int, default=1)
+    refinement.add_argument("--seed-base", type=int, default=507_000_001)
+    refinement.add_argument("--heartbeat-interval", type=int, default=100_000)
 
     production = subparsers.add_parser(
         "plan-production",
@@ -1350,6 +2228,8 @@ def main() -> int:
         result = finalize(args)
     elif args.command == "plan-followup":
         result = plan_followup(args)
+    elif args.command == "plan-refinement":
+        result = plan_refinement(args)
     elif args.command == "plan-production":
         result = plan_production(args)
     elif args.command == "validate-pilots":

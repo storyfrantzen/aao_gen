@@ -213,6 +213,95 @@ python3 radiative_full_campaign.py finalize \
 Repeat `plan-followup` only if the pooled report still contains non-ready
 strata.  No manual list construction is required.
 
+### Separate bounded follow-ups from capped guard failures
+
+When a follow-up report contains both tractable estimates and strata capped
+at `--maximum-followup-trials`, prepare only the uncapped work with:
+
+```tcsh
+set uncapped = "$census/campaigns/rgk_full_calibration_followup_uncapped_iteration002"
+
+python3 radiative_full_campaign.py plan-followup \
+  --campaign "$followup/campaign.json" \
+  --calibration "$followup/envelope_calibration.json" \
+  --output "$uncapped" \
+  --minimum-component-targets 20 \
+  --minimum-provisional-inside-targets 1000 \
+  --zero-complement-confidence 0.95 \
+  --maximum-zero-complement-target-rate 1e-6 \
+  --followup-target-safety-factor 1.5 \
+  --trial-quantum 1000000 \
+  --maximum-followup-trials 100000000 \
+  --discovery-trials 20000000 \
+  --capped-policy exclude
+```
+
+The TSV retains the capped decisions with
+`selected_by_capped_policy=False`, while the immutable campaign contains only
+the uncapped tasks.  `--capped-policy only` is also available for an explicit
+diagnostic campaign.  Finalize the uncapped campaign normally; its report
+still pools the complete parent history.
+
+### Batch-refine capped complement strata
+
+Do not repeatedly submit strata whose required complement exposure is capped.
+After finalizing the uncapped campaign, derive evidence-hashed face expansions
+for the remaining capped strata:
+
+```tcsh
+set refined = "$census/campaigns/rgk_full_guard_refinement_iteration001"
+
+python3 radiative_full_campaign.py plan-refinement \
+  --campaign "$uncapped/campaign.json" \
+  --calibration "$uncapped/envelope_calibration.json" \
+  --output "$refined" \
+  --minimum-component-targets 20 \
+  --minimum-provisional-inside-targets 1000 \
+  --maximum-followup-trials 100000000 \
+  --minimum-face-margin 0.005 \
+  --excursion-margin-fraction 0.25 \
+  --maximum-volume-ratio 4.0 \
+  --trials 7000000 \
+  --inside-guard-trial-fraction 0.50 \
+  --replicas 1 \
+  --seed-base 507000001
+```
+
+The planner:
+
+- finds capped complement-support decisions using the same stopping policy;
+- verifies every parent manifest against the pooled calibration report;
+- reads every target coordinate from the hashed calibration CSVs;
+- expands only crossed guard faces to the observed extreme plus the requested
+  absolute and excursion-scaled margins;
+- writes one standalone `guard_refinements.json` and a
+  `refinement_plan.tsv` volume audit;
+- independently recalibrates only the changed strata.
+
+An incremental guard-volume ratio above `--maximum-volume-ratio` is retained
+but marked `large_volume_review_required=True`; the threshold is an audit, not
+a silent exclusion.  Inspect those entries before submitting the emitted
+workflow.
+
+After all refinement jobs finish, ordinary campaign finalization writes two
+reports:
+
+```tcsh
+python3 radiative_full_campaign.py finalize \
+  --campaign "$refined/campaign.json" \
+  --allow-zero-complement
+```
+
+- `refined_envelope_calibration.json` contains only the independently
+  recalibrated guards;
+- `envelope_calibration.json` is the production-facing composite report.
+
+The composite report preserves unchanged parent strata, replaces only the
+refined strata, verifies both sides of every guard transition, and explicitly
+records that pre-refinement trials were excluded for changed guards.  Its
+global refinement hash matches the snapshot used by subsequent production
+manifests.
+
 ## 5. Plan generated LUND pilots or production
 
 Once every selected stratum is ready, prepare two independent 200-event

@@ -2734,6 +2734,12 @@ def _finalize_calibration(
         if args.output is not None
         else root / "envelope_calibration.json"
     )
+    _write_calibration_report(output, payload)
+    return output
+
+
+def _write_calibration_report(output: Path, payload: dict) -> None:
+    """Write one calibration JSON and its stable tabular readiness view."""
     _write_json(output, payload)
     with output.with_suffix(".tsv").open(
         "w", encoding="utf-8", newline=""
@@ -2758,7 +2764,7 @@ def _finalize_calibration(
                 "estimated_guard_complement_cross_section_fraction",
             ]
         )
-        for stratum in strata:
+        for stratum in payload["strata"]:
             recommendation = stratum["recommended_envelope"]
             writer.writerow(
                 [
@@ -2801,7 +2807,6 @@ def _finalize_calibration(
                     ],
                 ]
             )
-    return output
 
 
 def finalize(args: argparse.Namespace) -> Path:
