@@ -6,6 +6,10 @@ That workflow separates physical support, measurement/migration relevance,
 and generator readiness; zero Monte Carlo support never silently removes a
 stratum.
 
+To quantify how an already calibrated loose campaign survives a stricter
+final-electron momentum cut, see
+[RADIATIVE_MOMENTUM_AUDIT.md](RADIATIVE_MOMENTUM_AUDIT.md).
+
 Radiative mode 4 calibrates and then generates unweighted events for one
 final-LUND analysis stratum per invocation. It is a development prototype:
 its proposal and normalization are exact, but the current guard recipes and

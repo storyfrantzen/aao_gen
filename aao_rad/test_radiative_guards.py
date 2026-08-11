@@ -39,10 +39,11 @@ def _row(
     final_valid: int = 1,
     w_observed: float = 2.5,
     y_observed: float = 0.3,
+    electron_momentum: float = 3.0,
+    electron_theta_deg: float = 15.0,
 ) -> dict[str, str | int | float]:
     beam_energy = 6.535
-    electron_momentum = 3.0
-    electron_theta = math.radians(15.0)
+    electron_theta = math.radians(electron_theta_deg)
     electron = (
         electron_momentum * math.sin(electron_theta),
         0.0,
