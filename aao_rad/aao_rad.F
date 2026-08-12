@@ -165,6 +165,15 @@ c     and make a new version.
       real proposal_xb,proposal_minus_t,proposal_t_jacobian
       real proposal_t_at_cosine_zero
       real proposal_balanced_to_legacy
+      real mode3_direct_fraction,mode3_legacy_fraction
+      real mode3_xb_low,mode3_xb_high
+      real mode3_t_low,mode3_t_high
+      real mode3_phi_low,mode3_phi_high
+      real mode3_q2_low,mode3_q2_high
+      real mode3_target_xb_low,mode3_target_xb_high
+      real mode3_target_t_low,mode3_target_t_high
+      real mode3_target_phi_low,mode3_target_phi_high
+      real mode3_w_minimum,mode3_y_maximum
       real mode4_core_fraction,mode4_legacy_fraction
       real mode4_base_padding,mode4_core_volume
       real mode4_q2_low,mode4_q2_high
@@ -200,6 +209,9 @@ c      integer iext
       integer proposal_component,proposal_q2_bin,proposal_xb_bin
       integer proposal_t_bin,proposal_phi_bin,proposal_mapping_status
       integer candidate_status,coordinate_status,final_valid
+      integer mode3_apply_y_max,mode3_target_status
+      integer mode3_operation,mode3_inside_direct
+      integer mode3_remaining_events
       integer mode4_apply_y_max,mode4_stratum_status
       integer mode4_operation,mode4_inside_core
       integer mode4_calibration_proposal
@@ -216,6 +228,13 @@ cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
       integer*8 survey_ntrials,survey_seed,survey_replica
       integer*8 survey_rows,survey_final_valid
       integer*8 survey_legacy_trials,survey_balanced_trials
+      integer*8 mode3_seed,mode3_replica,mode3_trial_limit
+      integer*8 mode3_heartbeat_interval,mode3_last_heartbeat
+      integer*8 mode3_direct_trials,mode3_legacy_trials
+      integer*8 mode3_internal_rows,mode3_final_candidates
+      integer*8 mode3_target_candidates
+      integer*8 mode3_direct_events,mode3_legacy_events
+      integer*8 mode3_emitting_candidates,mode3_duplicate_events
       integer*8 mode4_seed,mode4_replica
       integer*8 mode4_core_trials,mode4_legacy_trials
       integer*8 mode4_internal_rows,mode4_final_candidates
@@ -251,6 +270,8 @@ c     character*1 ich1
       character*13 file_bos
       character*18 file_survey
       character*18 file_mode4
+      character*18 file_mode3_calibration
+      character*32 file_mode3_heartbeat
       character*32 file_mode4_heartbeat
       character*32 file_mode4_calibration
       character*8 recname
@@ -281,6 +302,8 @@ c     character*1 ich1
       data file_bos /'aao_rad.bos'/
       data file_survey /'aao_rad.survey.csv'/
       data file_mode4 /'aao_rad.mode4.csv'/
+      data file_mode3_calibration /'aao_rad.mode3.csv'/
+      data file_mode3_heartbeat /'aao_rad.mode3.heartbeat.csv'/
       data file_mode4_heartbeat /'aao_rad.mode4.heartbeat.csv'/
       data file_mode4_calibration /'aao_rad.mode4.calibration.csv'/
       data ctime    /'                            '/
@@ -497,6 +520,10 @@ c
 c     Optional backward-compatible sampling trailer.  Legacy input files end
 c     above and therefore retain sampling_mode=0.  Fixed-trial survey mode 1
 c     requires an exact proposal count, explicit nonzero seed, and replica ID.
+c     Mode 3 is a global unweighted mixture.  Its direct component retains
+c     uniform 1/Q_l**2 while replacing E' and cos(theta*) by x_l and -t_h.
+c     The unrestricted legacy component preserves support.  The generated
+c     target is one padded box in final-LUND analysis coordinates.
 c     Mode 4 generates one final-LUND analysis stratum from an exact mixture
 c     of a learned continuous core and the unrestricted legacy proposal.
 
@@ -511,6 +538,15 @@ c     of a learned continuous core and the unrestricted legacy proposal.
       survey_nxb_bins=0
       survey_nt_bins=0
       survey_nphi_bins=0
+      mode3_seed=0
+      mode3_replica=0
+      mode3_direct_fraction=0.
+      mode3_legacy_fraction=0.
+      mode3_apply_y_max=0
+      mode3_y_maximum=1.
+      mode3_operation=0
+      mode3_trial_limit=0
+      mode3_heartbeat_interval=100000
       mode4_seed=0
       mode4_replica=0
       mode4_core_fraction=0.
@@ -536,9 +572,9 @@ c     of a learned continuous core and the unrestricted legacy proposal.
          stop 2
       endif
       if (sampling_mode .ne. 0 .and. sampling_mode .ne. 1 .and.
-     *    sampling_mode .ne. 4) then
+     *    sampling_mode .ne. 3 .and. sampling_mode .ne. 4) then
          write(6,*)'sampling_mode must be 0 (legacy), 1 (survey),'
-     *      //' or 4 (bin conditional)'
+     *      //' 3 (global direct mixture), or 4 (bin conditional)'
          stop 2
       endif
       if (sampling_mode .eq. 1) then
@@ -682,6 +718,125 @@ c     of a learned continuous core and the unrestricted legacy proposal.
          write(6,*)'Survey replica ID:',survey_replica
          write(6,*)'Survey proposal mode:',survey_proposal_mode
          write(6,*)'Survey legacy fraction:',survey_legacy_fraction
+      endif
+      if (sampling_mode .eq. 3) then
+         read(5,*,iostat=input_status)mode3_seed
+         if (input_status .ne. 0 .or. mode3_seed .eq. 0) then
+            write(6,*)'Mode 3 requires an explicit nonzero seed'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)mode3_replica
+         if (input_status .ne. 0 .or. mode3_replica .lt. 0) then
+            write(6,*)'Mode 3 requires a nonnegative replica ID'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)mode3_direct_fraction
+         if (input_status .ne. 0 .or. mode3_direct_fraction .lt. 0.
+     *       .or. mode3_direct_fraction .ge. 1.) then
+            write(6,*)'Mode 3 direct fraction must lie in [0,1)'
+            stop 2
+         endif
+         mode3_legacy_fraction=1.-mode3_direct_fraction
+         read(5,*,iostat=input_status)mode3_xb_low,mode3_xb_high
+         if (input_status .ne. 0 .or. mode3_xb_low .le. 0. .or.
+     *       mode3_xb_high .le. mode3_xb_low) then
+            write(6,*)'Invalid mode-3 direct xB bounds'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)mode3_t_low,mode3_t_high
+         if (input_status .ne. 0 .or. mode3_t_low .lt. 0. .or.
+     *       mode3_t_high .le. mode3_t_low) then
+            write(6,*)'Invalid mode-3 direct -t bounds'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)mode3_phi_low,mode3_phi_high
+         if (input_status .ne. 0 .or. mode3_phi_low .lt. 0. .or.
+     *       mode3_phi_high .gt. 360. .or.
+     *       mode3_phi_high .le. mode3_phi_low) then
+            write(6,*)'Invalid mode-3 direct phi bounds'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)mode3_q2_low,mode3_q2_high
+         if (input_status .ne. 0 .or. mode3_q2_low .lt. q2_min .or.
+     *       mode3_q2_high .gt. q2_max .or.
+     *       mode3_q2_high .le. mode3_q2_low) then
+            write(6,*)'Invalid mode-3 target Q2 bounds'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)mode3_target_xb_low,
+     *      mode3_target_xb_high
+         if (input_status .ne. 0 .or. mode3_target_xb_low .le. 0.
+     *       .or. mode3_target_xb_high .le. mode3_target_xb_low) then
+            write(6,*)'Invalid mode-3 target xB bounds'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)mode3_target_t_low,
+     *      mode3_target_t_high
+         if (input_status .ne. 0 .or. mode3_target_t_low .lt. 0.
+     *       .or. mode3_target_t_high .le. mode3_target_t_low) then
+            write(6,*)'Invalid mode-3 target -t bounds'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)mode3_target_phi_low,
+     *      mode3_target_phi_high
+         if (input_status .ne. 0 .or. mode3_target_phi_low .lt. 0.
+     *       .or. mode3_target_phi_high .gt. 360. .or.
+     *       mode3_target_phi_high .le. mode3_target_phi_low) then
+            write(6,*)'Invalid mode-3 target phi bounds'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)mode3_w_minimum
+         if (input_status .ne. 0 .or. mode3_w_minimum .le. 0.) then
+            write(6,*)'Mode 3 requires a positive W minimum'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)mode3_apply_y_max,
+     *      mode3_y_maximum
+         if (input_status .ne. 0 .or.
+     *       (mode3_apply_y_max .ne. 0 .and.
+     *        mode3_apply_y_max .ne. 1) .or.
+     *       mode3_y_maximum .le. 0. .or.
+     *       mode3_y_maximum .gt. 1.) then
+            write(6,*)'Invalid optional mode-3 y selection'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)mode3_operation
+         if (input_status .ne. 0 .or.
+     *       (mode3_operation .ne. 0 .and.
+     *        mode3_operation .ne. 1)) then
+            write(6,*)'Mode 3 operation must be 0 or 1'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)mode3_trial_limit
+         if (input_status .ne. 0 .or. mode3_trial_limit .lt. 0) then
+            write(6,*)'Invalid mode-3 fixed trial limit'
+            stop 2
+         endif
+         read(5,*,iostat=input_status)mode3_heartbeat_interval
+         if (input_status .ne. 0 .or.
+     *       mode3_heartbeat_interval .le. 0) then
+            write(6,*)'Mode-3 heartbeat interval must be positive'
+            stop 2
+         endif
+         if (mode3_operation .eq. 1 .and.
+     *       mode3_trial_limit .le. 0) then
+            write(6,*)'Mode-3 calibration requires positive trials'
+            stop 2
+         endif
+         if (fmcall .ne. 0. .or. sigr_max .le. 0.) then
+            write(6,*)'Mode 3 requires fmcall=0 and positive sigr_max'
+            stop 2
+         endif
+         if (epirea .ne. 1 .or. npart .ne. 4) then
+            write(6,*)'Mode 3 currently requires pi0 and npart=4'
+            stop 2
+         endif
+         write(6,*)'Radiative global direct-mixture mode 3'
+         write(6,*)'Mode 3 seed/replica:',mode3_seed,mode3_replica
+         write(6,*)'Mode 3 direct/legacy fractions:',
+     *      mode3_direct_fraction,mode3_legacy_fraction
+         write(6,*)'Mode 3 operation/trial limit:',
+     *      mode3_operation,mode3_trial_limit
       endif
       if (sampling_mode .eq. 4) then
          read(5,*,iostat=input_status)mode4_seed
@@ -887,6 +1042,16 @@ c
       survey_sig_internal_tot=0.
       survey_legacy_trials=0
       survey_balanced_trials=0
+      mode3_direct_trials=0
+      mode3_legacy_trials=0
+      mode3_internal_rows=0
+      mode3_final_candidates=0
+      mode3_target_candidates=0
+      mode3_direct_events=0
+      mode3_legacy_events=0
+      mode3_emitting_candidates=0
+      mode3_duplicate_events=0
+      mode3_last_heartbeat=-1
       mode4_core_trials=0
       mode4_legacy_trials=0
       mode4_internal_rows=0
@@ -936,6 +1101,8 @@ c     Use the internal clock to initialize the random number generator
       do i=1,ssize
          if (sampling_mode .eq. 1) then
             seed_value = abs(survey_seed) + 7919_8*i
+         elseif (sampling_mode .eq. 3) then
+            seed_value = abs(mode3_seed) + 7919_8*i
          elseif (sampling_mode .eq. 4) then
             seed_value = abs(mode4_seed) + 7919_8*i
          else
@@ -995,6 +1162,30 @@ c     filerz=aaoradgen-pi0-1.6-0811.rz.0, for example.
      *   //'trial_xsec_internal_microbarn,'
      *   //'trial_xsec_observed_microbarn,rotation_deg,'
      *   //'incoming_loss_fraction,outgoing_loss_fraction'
+      endif
+      if (sampling_mode .eq. 3 .and. mode3_operation .eq. 1) then
+         open(unit=20,file=file_mode3_calibration,status='replace')
+         write(20,'(A)')'# schema=aao-rad-mode3-calibration-v1'
+         write(20,'(A)')'trial,proposal_component,inside_direct,'
+     *      //'proposal_density_ratio,integrand_corrected,xb_leptonic,'
+     *      //'minus_t_hard,phi_cm_deg,q2_observed,xb_observed,'
+     *      //'minus_t_observed,phi_observed_deg,w_observed,y_observed'
+         flush(20)
+      endif
+      if (sampling_mode .eq. 3) then
+         open(unit=21,file=file_mode3_heartbeat,status='replace')
+         write(21,'(A)')'# schema=aao-rad-mode3-heartbeat-v1'
+         write(21,'(A)')'proposals,events,direct_trials,legacy_trials,'
+     *      //'internal_rows,final_candidates,target_candidates,'
+     *      //'direct_events,legacy_events,emitting_candidates,'
+     *      //'duplicate_events,mcall_max'
+         write(21,9011)ntries,nevent,mode3_direct_trials,
+     *      mode3_legacy_trials,mode3_internal_rows,
+     *      mode3_final_candidates,mode3_target_candidates,
+     *      mode3_direct_events,mode3_legacy_events,
+     *      mode3_emitting_candidates,mode3_duplicate_events,mcall_max
+         flush(21)
+         mode3_last_heartbeat=ntries
       endif
       if (sampling_mode .eq. 4 .and. mode4_operation .eq. 0) then
          open(unit=17,file=file_mode4,status='replace')
@@ -1077,6 +1268,7 @@ c     This requires a jacobian. Jacobian=1./(kexp*uek)=(1./kexp)exp(kexp*ek)
          sigr_max=0.
          go to 20
       endif
+      if (sampling_mode .eq. 3)go to 20
       if (sampling_mode .eq. 4)go to 20
       if (fmcall .eq. 0.)then
          write(6,*)' sigr_max from input data =',sigr_max
@@ -1193,6 +1385,22 @@ c     distributed according to the Mo-Tsai integrand.
  20   continue
       if (sampling_mode .eq. 1 .and.
      *    ntries .ge. survey_ntrials) go to 50
+      if (sampling_mode .eq. 3 .and. ntries .gt. 0 .and.
+     *    ntries .ne. mode3_last_heartbeat .and.
+     *    mod(ntries,mode3_heartbeat_interval) .eq. 0) then
+         write(21,9011)ntries,nevent,mode3_direct_trials,
+     *      mode3_legacy_trials,mode3_internal_rows,
+     *      mode3_final_candidates,mode3_target_candidates,
+     *      mode3_direct_events,mode3_legacy_events,
+     *      mode3_emitting_candidates,mode3_duplicate_events,mcall_max
+         flush(21)
+         flush(12)
+         flush(13)
+         if (mode3_operation .eq. 1)flush(20)
+         mode3_last_heartbeat=ntries
+      endif
+      if (sampling_mode .eq. 3 .and. mode3_operation .eq. 1
+     *    .and. ntries .ge. mode3_trial_limit) go to 50
       if (sampling_mode .eq. 4 .and. ntries .gt. 0 .and.
      *    ntries .ne. mode4_last_heartbeat .and.
      *    mod(ntries,mode4_heartbeat_interval) .eq. 0) then
@@ -1234,6 +1442,14 @@ c     distributed according to the Mo-Tsai integrand.
          endif
       elseif (sampling_mode .eq. 1) then
          survey_legacy_trials=survey_legacy_trials+1
+      elseif (sampling_mode .eq. 3) then
+         proposal_selector=myran()
+         if (proposal_selector .lt. mode3_direct_fraction) then
+            proposal_component=1
+            mode3_direct_trials=mode3_direct_trials+1
+         else
+            mode3_legacy_trials=mode3_legacy_trials+1
+         endif
       elseif (sampling_mode .eq. 4) then
          proposal_selector=myran()
          if (proposal_selector .lt.
@@ -1303,7 +1519,16 @@ c     Cut off the incident energy at e_s=ebeam/4.
       ps	= sqrt(es**2-mel**2)
       rs	= ps/es
 
-      if (sampling_mode .eq. 4 .and.
+      if (sampling_mode .eq. 3 .and.
+     *    proposal_component .eq. 1) then
+         uq2=uq2_min+uq2rng*myran()
+         q2=1./uq2
+         r_u=(uq2-uq2_min)/uq2rng
+         proposal_xb=mode3_xb_low+
+     *      (mode3_xb_high-mode3_xb_low)*myran()
+         ep=es-q2/(2.*real(analysis_mp)*proposal_xb)
+         r_ep=(epmax-ep)/eprng
+      elseif (sampling_mode .eq. 4 .and.
      *    proposal_component .eq. 1) then
          r_u=mode4_ru_low+
      *      (mode4_ru_high-mode4_ru_low)*myran()
@@ -1318,7 +1543,8 @@ c     Cut off the incident energy at e_s=ebeam/4.
          uq2=uq2_min+uq2rng*r_u
          q2=1./uq2
          ep=epmax-eprng*r_ep
-      elseif (proposal_component .eq. 1) then
+      elseif (sampling_mode .eq. 1 .and.
+     *        proposal_component .eq. 1) then
          proposal_q2_bin=min(int(survey_nq2_bins*myran())+1,
      *      survey_nq2_bins)
          q2=survey_q2_edges(proposal_q2_bin)+
@@ -1553,15 +1779,38 @@ c        The guard-complement component was sampled once at trial start.
       
       if (ek .gt. ekmax)go to 20
 
-      if (sampling_mode .eq. 1 .and.
-     *    survey_proposal_mode .eq. 1) then
+      if ((sampling_mode .eq. 1 .and.
+     *     survey_proposal_mode .eq. 1) .or.
+     *    sampling_mode .eq. 3) then
          call radiative_t_mapping(es,ep,th0,ek,cstk,mpi,0.938D0,
      *      analysis_mp,proposal_t_at_cosine_zero,
      *      proposal_t_jacobian,proposal_mapping_status)
-         if (proposal_mapping_status .ne. 0)go to 20
+         if (proposal_mapping_status .ne. 0) then
+c           A failed mapping has zero density under the direct proposal, but
+c           it can remain a valid legacy-component point.  Rejecting it here
+c           would remove legacy support and would make direct_fraction=0
+c           differ from the historical proposal.
+            if (sampling_mode .eq. 3 .and.
+     *          proposal_component .eq. 0) then
+               proposal_t_jacobian=0.
+            else
+               go to 20
+            endif
+         endif
       endif
 
-      if (sampling_mode .eq. 4 .and.
+      if (sampling_mode .eq. 3 .and.
+     *    proposal_component .eq. 1) then
+         proposal_minus_t=mode3_t_low+
+     *      (mode3_t_high-mode3_t_low)*myran()
+         csthcm=(proposal_t_at_cosine_zero-proposal_minus_t)/
+     *      proposal_t_jacobian
+         if (csthcm .lt. -1. .or. csthcm .gt. 1.)go to 20
+         hadron_cosine_base=(csthcm+1.)/2.
+         phicm=mode3_phi_low+
+     *      (mode3_phi_high-mode3_phi_low)*myran()
+         hadron_phi_base=phicm/360.
+      elseif (sampling_mode .eq. 4 .and.
      *    proposal_component .eq. 1) then
          hadron_cosine_base=mode4_hcos_low+
      *      (mode4_hcos_high-mode4_hcos_low)*myran()
@@ -1577,7 +1826,8 @@ c        The guard-complement component was sampled once at trial start.
      *        mode4_calibration_proposal .eq. 1) then
          csthcm=-1.+2.*hadron_cosine_base
          phicm=360.*hadron_phi_base
-      elseif (proposal_component .eq. 1) then
+      elseif (sampling_mode .eq. 1 .and.
+     *        proposal_component .eq. 1) then
          proposal_t_bin=min(int(survey_nt_bins*myran())+1,
      *      survey_nt_bins)
          proposal_minus_t=survey_t_edges(proposal_t_bin)+
@@ -1600,6 +1850,9 @@ c        The guard-complement component was sampled once at trial start.
          phicm=360.*hadron_phi_base
          if (sampling_mode .eq. 1 .and.
      *       survey_proposal_mode .eq. 1) then
+            proposal_minus_t=proposal_t_at_cosine_zero-
+     *         proposal_t_jacobian*csthcm
+         elseif (sampling_mode .eq. 3) then
             proposal_minus_t=proposal_t_at_cosine_zero-
      *         proposal_t_jacobian*csthcm
          endif
@@ -1774,6 +2027,117 @@ c     integrand and gives invalid final candidates zero observed contribution.
      *      survey_nphi_bins,survey_phi_edges,
      *      proposal_balanced_to_legacy,proposal_density_ratio)
          sigr=sigr*proposal_density_ratio
+      endif
+
+c     Mode 3 retains the legacy u=1/Q_l**2 and radiative variables, but its
+c     direct component samples x_l, -t_h, and phi_h uniformly.  The exact
+c     q_legacy/q_mixture correction includes both coordinate Jacobians.  The
+c     legacy component remains nonzero everywhere in the original domain.
+
+      if (sampling_mode .eq. 3) then
+         proposal_xb=0.
+         if (es-ep .gt. 0.) then
+            proposal_xb=q2/(2.*real(analysis_mp)*real(es-ep))
+         endif
+         proposal_minus_t=ppx**2+ppy**2+ppz**2
+     *      -(real(analysis_mp)-eprot)**2
+         call mode3_proposal_ratio(q2,proposal_xb,
+     *      proposal_minus_t,phicm,proposal_t_jacobian,
+     *      eprng,analysis_mp,mode3_direct_fraction,
+     *      mode3_xb_low,mode3_xb_high,mode3_t_low,mode3_t_high,
+     *      mode3_phi_low,mode3_phi_high,
+     *      proposal_balanced_to_legacy,proposal_density_ratio,
+     *      mode3_inside_direct)
+         sigr=sigr*proposal_density_ratio
+         mode3_internal_rows=mode3_internal_rows+1
+      endif
+
+c     The global target is the configured padded box in final-LUND analysis
+c     coordinates.  Sampling outgoing external loss once per proposal makes
+c     this selection part of the Monte-Carlo integral.  Stochastic
+c     multiplicity preserves equal event weights when the envelope is crossed.
+
+      if (sampling_mode .eq. 3) then
+         ep_sav=ep
+         call build_final_candidate(ebeam,es,ep_sav,ep,ep_min,th0,
+     *      theta,ek,cstk,phik,mpi_s,csthcm,phicm,targp,delta,
+     *      ppx,ppy,ppz,eprot,ppix,ppiy,ppiz,epi,ekx,eky,ekz,
+     *      wreal,mm2,epw,phir,outgoing_loss_base,
+     *      outgoing_loss_accept_test,candidate_status)
+         if (candidate_status .ne. 0)go to 30
+         mode3_final_candidates=mode3_final_candidates+1
+         call observed_analysis_coordinates(ebeam,analysis_mp,
+     *      q2_obs,xb_obs,minus_t_obs,phi_obs,w_obs,y_obs,
+     *      coordinate_status)
+         if (coordinate_status .ne. 0)go to 30
+         call mode4_stratum_membership(q2_obs,xb_obs,minus_t_obs,
+     *      phi_obs,w_obs,y_obs,mode3_q2_low,mode3_q2_high,
+     *      mode3_target_xb_low,mode3_target_xb_high,
+     *      mode3_target_t_low,mode3_target_t_high,
+     *      mode3_target_phi_low,mode3_target_phi_high,
+     *      mode3_w_minimum,mode3_apply_y_max,mode3_y_maximum,
+     *      mode3_target_status)
+         if (mode3_target_status .ne. 0)go to 30
+         mode3_target_candidates=mode3_target_candidates+1
+         sig_tot=sig_tot+dble(sigr)
+         if (mode3_operation .eq. 1) then
+            write(20,9004)ntries,proposal_component,
+     *         mode3_inside_direct,proposal_density_ratio,sigr,
+     *         proposal_xb,proposal_minus_t,phicm,
+     *         q2_obs,xb_obs,minus_t_obs,phi_obs,w_obs,y_obs
+            go to 30
+         endif
+         sig_ratio=sigr/sigr_max
+         rtest=myran()
+         mcall=sig_ratio
+         stest=sig_ratio-mcall
+         if (stest .gt. rtest)mcall=mcall+1
+         if (mcall .gt. mcall_max)mcall_max=mcall
+         if (mcall .eq. 0)go to 30
+c        A type-2 OSG input file may contain at most the requested number of
+c        events.  Treat the stochastic multiplicities as an ordered event
+c        stream and stop that stream exactly at nmax.  The uncapped value is
+c        retained in mcall_max for envelope diagnostics.
+         mode3_remaining_events=nmax-nevent
+         if (mcall .gt. mode3_remaining_events) then
+            mcall=mode3_remaining_events
+         endif
+         mode3_emitting_candidates=mode3_emitting_candidates+1
+         if (mcall .gt. 1)mode3_duplicate_events=
+     *      mode3_duplicate_events+mcall-1
+         if (mcall .lt. 100)then
+            dismc(intreg,mcall)=dismc(intreg,mcall)+1
+         else
+            dismc(intreg,100)=dismc(intreg,100)+1
+         endif
+         lundmass(1)=MEL
+         lundmass(4)=0.
+         lundmass(2)=MP
+         lundmass(3)=MPI
+         do j=1,mcall
+            write(13,*) "4 1 1 0 0 ",
+     *         q2/(2.0*MP*(ebeam-p(1,4))),0,epw,
+     *         q2,(ebeam-p(1,4))
+            write(13,*)1,q(1),1,pdgid(1),0,0,
+     *         p(1,1),p(1,2),p(1,3),p(1,4),
+     *         lundmass(1),vertex_x,vertex_y,vertex_z
+            write(13,*)2,q(2),1,pdgid(2),0,0,
+     *         p(2,1),p(2,2),p(2,3),p(2,4),
+     *         lundmass(2),vertex_x,vertex_y,vertex_z
+            write(13,*)3,q(3),1,pdgid(3),0,0,
+     *         p(3,1),p(3,2),p(3,3),p(3,4),
+     *         lundmass(3),vertex_x,vertex_y,vertex_z
+            write(13,*)4,q(4),1,pdgid(4),0,0,
+     *         p(4,1),p(4,2),p(4,3),p(4,4),
+     *         lundmass(4),vertex_x,vertex_y,vertex_z
+            nevent=nevent+1
+            if (proposal_component .eq. 1) then
+               mode3_direct_events=mode3_direct_events+1
+            else
+               mode3_legacy_events=mode3_legacy_events+1
+            endif
+         enddo
+         go to 124
       endif
 
 c     Mode 4 samples a full-support mixture in the five learned native
@@ -2188,8 +2552,10 @@ C          t_elapse	= t_elapse+INT(itime2-itime1)
 
 c     Do we have enough events in the n-tuple?
 
-       if (sampling_mode .eq. 4 .and. nevent .ge. nmax)go to 50
-       if (sampling_mode .ne. 4 .and. nevent .gt. nmax)go to 50
+       if ((sampling_mode .eq. 3 .or. sampling_mode .eq. 4)
+     *    .and. nevent .ge. nmax)go to 50
+       if (sampling_mode .ne. 3 .and. sampling_mode .ne. 4
+     *    .and. nevent .gt. nmax)go to 50
        
  30    go to 20
 
@@ -2198,6 +2564,20 @@ c     Close out the n-tuple file
  50   continue
 Clcs      call hrout(0,icycle,' ')
 Clcs      call hrend('aaoradgen')
+
+      if (sampling_mode .eq. 3 .and.
+     *    ntries .ne. mode3_last_heartbeat) then
+         write(21,9011)ntries,nevent,mode3_direct_trials,
+     *      mode3_legacy_trials,mode3_internal_rows,
+     *      mode3_final_candidates,mode3_target_candidates,
+     *      mode3_direct_events,mode3_legacy_events,
+     *      mode3_emitting_candidates,mode3_duplicate_events,mcall_max
+         flush(21)
+         flush(12)
+         flush(13)
+         if (mode3_operation .eq. 1)flush(20)
+         mode3_last_heartbeat=ntries
+      endif
 
       if (sampling_mode .eq. 4 .and.
      *    ntries .ne. mode4_last_heartbeat) then
@@ -2243,6 +2623,34 @@ Clcs      call hrend('aaoradgen')
          write(12,*)' Survey observed cross section =',sig_sum,
      *      ' micro-barns'
       endif
+      if (sampling_mode .eq. 3)then
+         tries=ntries
+         events=nevent
+         sig_sum=sig_tot*analysis_volume/tries
+         if (mode3_operation .eq. 1) then
+            sig_int=0.
+         else
+            sig_int=events/tries*sigr_max*analysis_volume
+         endif
+         write(6,*)' Mode-3 proposals/events =',ntries,nevent
+         write(6,*)' Mode-3 direct/legacy trials =',
+     *      mode3_direct_trials,mode3_legacy_trials
+         write(6,*)' Mode-3 final/target candidates =',
+     *      mode3_final_candidates,mode3_target_candidates
+         write(6,*)' Mode-3 direct/legacy events =',
+     *      mode3_direct_events,mode3_legacy_events
+         write(6,*)' Mode-3 integrated cross section =',
+     *      sig_int,sig_sum,' micro-barns'
+         write(12,*)' Mode-3 proposals/events =',ntries,nevent
+         write(12,*)' Mode-3 direct/legacy trials =',
+     *      mode3_direct_trials,mode3_legacy_trials
+         write(12,*)' Mode-3 final/target candidates =',
+     *      mode3_final_candidates,mode3_target_candidates
+         write(12,*)' Mode-3 direct/legacy events =',
+     *      mode3_direct_events,mode3_legacy_events
+         write(12,*)' Mode-3 integrated cross section =',
+     *      sig_int,sig_sum,' micro-barns'
+      endif
       if (sampling_mode .eq. 4)then
          tries=ntries
          events=nevent
@@ -2275,6 +2683,8 @@ Clcs      call hrend('aaoradgen')
       close(12)
       close(13)
       if (sampling_mode .eq. 1)close(16)
+      if (sampling_mode .eq. 3 .and. mode3_operation .eq. 1)close(20)
+      if (sampling_mode .eq. 3)close(21)
       if (sampling_mode .eq. 4 .and. mode4_operation .eq. 0)close(17)
       if (sampling_mode .eq. 4 .and. mode4_operation .eq. 1)close(19)
       if (sampling_mode .eq. 4)close(18)
@@ -2308,6 +2718,15 @@ Clcs      call hrend('aaoradgen')
      *      survey_rows,survey_final_valid
          write(14,*)' Survey internal cross section =',
      *      survey_sig_internal_tot*analysis_volume/tries
+      elseif (sampling_mode .eq. 3)then
+         write(14,*)' Mode-3 direct/legacy trials =',
+     *      mode3_direct_trials,mode3_legacy_trials
+         write(14,*)' Mode-3 final/target candidates =',
+     *      mode3_final_candidates,mode3_target_candidates
+         write(14,*)' Mode-3 direct/legacy events =',
+     *      mode3_direct_events,mode3_legacy_events
+         write(14,*)' Mode-3 operation/trial limit =',
+     *      mode3_operation,mode3_trial_limit
       else
          write(14,*)' Mode-4 core/legacy trials =',
      *      mode4_core_trials,mode4_legacy_trials
@@ -2319,7 +2738,8 @@ Clcs      call hrend('aaoradgen')
      *      mode4_operation,mode4_trial_limit
       endif
       write(14,*)' Elapsed CPU time = ',t_elapse/60,' minutes'
-      if ((sampling_mode .eq. 0 .or. sampling_mode .eq. 4)
+      if ((sampling_mode .eq. 0 .or. sampling_mode .eq. 3 .or.
+     *    sampling_mode .eq. 4)
      *    .and. nevent .gt. 0)then
          write(14,*)' CPU time/event = ', t_elapse/nevent,' sec'
       endif
@@ -2374,6 +2794,61 @@ Clcs      call hrend('aaoradgen')
      *      survey_sig_internal_tot*analysis_volume/tries
          write(15,*)'survey_observed_sig_sum=',sig_sum
          write(15,*)'survey_emits_lund=0'
+      endif
+      if (sampling_mode .eq. 3)then
+         write(15,*)'mode3_schema=aao-rad-mode3-v1'
+         write(15,*)'mode3_operation=',mode3_operation
+         write(15,*)'mode3_seed=',mode3_seed
+         write(15,*)'mode3_replica=',mode3_replica
+         write(15,*)'mode3_direct_fraction=',mode3_direct_fraction
+         write(15,*)'mode3_legacy_fraction=',mode3_legacy_fraction
+         write(15,*)'mode3_direct_xb_low=',mode3_xb_low
+         write(15,*)'mode3_direct_xb_high=',mode3_xb_high
+         write(15,*)'mode3_direct_t_low=',mode3_t_low
+         write(15,*)'mode3_direct_t_high=',mode3_t_high
+         write(15,*)'mode3_direct_phi_low=',mode3_phi_low
+         write(15,*)'mode3_direct_phi_high=',mode3_phi_high
+         write(15,*)'mode3_target_q2_low=',mode3_q2_low
+         write(15,*)'mode3_target_q2_high=',mode3_q2_high
+         write(15,*)'mode3_target_xb_low=',mode3_target_xb_low
+         write(15,*)'mode3_target_xb_high=',mode3_target_xb_high
+         write(15,*)'mode3_target_t_low=',mode3_target_t_low
+         write(15,*)'mode3_target_t_high=',mode3_target_t_high
+         write(15,*)'mode3_target_phi_low=',mode3_target_phi_low
+         write(15,*)'mode3_target_phi_high=',mode3_target_phi_high
+         write(15,*)'mode3_w_minimum=',mode3_w_minimum
+         write(15,*)'mode3_apply_y_max=',mode3_apply_y_max
+         write(15,*)'mode3_y_maximum=',mode3_y_maximum
+         write(15,*)'mode3_trial_limit=',mode3_trial_limit
+         write(15,*)'mode3_heartbeat_interval=',
+     *      mode3_heartbeat_interval
+         write(15,*)'mode3_heartbeat_file=',file_mode3_heartbeat
+         if (mode3_operation .eq. 1) then
+            write(15,*)'mode3_calibration_file=',
+     *         file_mode3_calibration
+         else
+            write(15,*)'mode3_calibration_file=none'
+         endif
+         write(15,*)'mode3_direct_trials=',mode3_direct_trials
+         write(15,*)'mode3_legacy_trials=',mode3_legacy_trials
+         write(15,*)'mode3_internal_rows=',mode3_internal_rows
+         write(15,*)'mode3_final_candidates=',mode3_final_candidates
+         write(15,*)'mode3_target_candidates=',mode3_target_candidates
+         write(15,*)'mode3_direct_events=',mode3_direct_events
+         write(15,*)'mode3_legacy_events=',mode3_legacy_events
+         write(15,*)'mode3_emitting_candidates=',
+     *      mode3_emitting_candidates
+         write(15,*)'mode3_duplicate_events=',mode3_duplicate_events
+         write(15,*)'mode3_phase_volume=',analysis_volume
+         if (mode3_operation .eq. 0 .and. events .gt. 0.) then
+            write(15,*)'mode3_event_weight_microbarn=',sig_sum/events
+            write(15,*)'mode3_lund_structure=legacy-four-particle'
+            write(15,*)'mode3_emits_lund=1'
+         else
+            write(15,*)'mode3_event_weight_microbarn=0'
+            write(15,*)'mode3_lund_structure=none-calibration'
+            write(15,*)'mode3_emits_lund=0'
+         endif
       endif
       if (sampling_mode .eq. 4)then
          write(15,*)'mode4_schema=aao-rad-mode4-v3'
@@ -2452,7 +2927,9 @@ Clcs      call hrend('aaoradgen')
  9001 format(I0,10(',',I0),51(',',ES24.16E3))
  9002 format(I0,',',I0,13(',',ES24.16E3))
  9003 format(I0,2(',',I0),14(',',ES24.16E3))
+ 9004 format(I0,2(',',I0),11(',',ES24.16E3))
  9010 format(I0,13(',',I0))
+ 9011 format(I0,11(',',I0))
 
       close(14)
 Cvpk      CALL bos_end(recname)
@@ -2461,6 +2938,60 @@ Cvpk      CALL bos_end(recname)
 
        write(6,*)' END OF LOOP'
        stop
+      end
+
+c   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+      subroutine mode3_proposal_ratio(q2,xb,minus_t,phicm,
+     * t_jacobian,eprng,analysis_mp,direct_fraction,
+     * xb_low,xb_high,t_low,t_high,phi_low,phi_high,
+     * direct_to_legacy,density_ratio,inside)
+
+c     Return q_legacy/q_mixture for the global mode-3 proposal
+c
+c       q_mix = direct_fraction*q_direct
+c             + (1-direct_fraction)*q_legacy.
+c
+c     Both components use the same uniform u=1/Q_l**2 density and all the
+c     same photon/external-radiation variables, so those factors cancel.  The
+c     remaining coordinate-density ratio is
+c
+c       q_direct/q_legacy =
+c         [E'_range * 2 M x_l**2 / (Q_l**2 * x_range)]
+c         [2 J_t / t_range] [360 / phi_range],
+c
+c     where J_t=|d(-t_h)/d cos(theta*)|.  Outside direct support the ratio is
+c     zero and the nonzero legacy fraction guarantees complete support.
+
+      implicit none
+
+      real q2,xb,minus_t,phicm,t_jacobian,eprng
+      real direct_fraction,xb_low,xb_high,t_low,t_high
+      real phi_low,phi_high,direct_to_legacy,density_ratio
+      real phi_wrapped,legacy_fraction
+      real*8 analysis_mp
+      integer inside
+
+      legacy_fraction=1.-direct_fraction
+      direct_to_legacy=0.
+      density_ratio=1./legacy_fraction
+      inside=1
+      phi_wrapped=modulo(phicm,360.)
+      if (q2 .le. 0. .or. xb .le. 0. .or.
+     *    t_jacobian .le. 0.)inside=0
+      if (xb .lt. xb_low .or. xb .gt. xb_high)inside=0
+      if (minus_t .lt. t_low .or. minus_t .gt. t_high)inside=0
+      if (phi_wrapped .lt. phi_low .or.
+     *    phi_wrapped .gt. phi_high)inside=0
+      if (inside .eq. 0)return
+      direct_to_legacy=
+     *   eprng*2.*real(analysis_mp)*xb**2/
+     *      (q2*(xb_high-xb_low))*
+     *   2.*t_jacobian/(t_high-t_low)*
+     *   360./(phi_high-phi_low)
+      density_ratio=1./(legacy_fraction+
+     *   direct_fraction*direct_to_legacy)
+      return
       end
 
 c   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%

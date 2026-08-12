@@ -27,6 +27,7 @@ test: aao_rad
 		test_radiative_active_strata.py \
 		test_radiative_momentum_audit.py \
 		test_radiative_full_campaign.py \
+		test_radiative_mode3.py \
 		test_radiative_mode4.py
 
 
