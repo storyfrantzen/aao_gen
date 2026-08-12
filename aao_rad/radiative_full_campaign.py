@@ -153,6 +153,38 @@ def _write_flat_indices(path: Path, records: Iterable[dict]) -> None:
     )
 
 
+def _read_flat_indices(path: Path, *, label: str) -> list[int]:
+    """Read one duplicate-free flat index per non-comment line."""
+    values: list[int] = []
+    for line_number, raw_line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            value = int(line)
+        except ValueError as error:
+            raise CampaignError(
+                f"{path}:{line_number}: {label} requires one integer flat "
+                "index per line"
+            ) from error
+        values.append(value)
+    if not values:
+        raise CampaignError(f"{path}: {label} contains no flat indices")
+    duplicates = sorted(
+        value for value in set(values) if values.count(value) > 1
+    )
+    if duplicates:
+        preview = ", ".join(str(value) for value in duplicates[:20])
+        suffix = "..." if len(duplicates) > 20 else ""
+        raise CampaignError(
+            f"{path}: {label} contains duplicate flat indices: "
+            f"{preview}{suffix}"
+        )
+    return values
+
+
 def _prepare_namespace(
     *,
     command: str,
@@ -451,6 +483,20 @@ def _load_campaign(path: Path) -> tuple[Path, dict]:
         manifest = _require_file(Path(str(item["path"])))
         if _sha256(manifest) != item["sha256"]:
             raise CampaignError(f"{manifest}: pooled manifest changed")
+    selection = payload.get("selection") or {}
+    for name in (
+        "flat_indices",
+        "requested_flat_indices",
+        "deferred_flat_indices",
+        "production_filter_source_snapshot",
+    ):
+        raw_path = selection.get(name)
+        expected_hash = selection.get(f"{name}_sha256")
+        if raw_path is None or expected_hash is None:
+            continue
+        artifact = _require_file(Path(str(raw_path)))
+        if _sha256(artifact) != str(expected_hash):
+            raise CampaignError(f"campaign selection artifact {name} changed")
     parent = payload.get("parent_campaign")
     if parent is not None:
         parent_path = _require_file(Path(str(parent)))
@@ -1961,13 +2007,41 @@ def plan_production(args: argparse.Namespace) -> Path:
         if str(item.get("pilot_readiness")) in READY_STATES
         and item.get("recommended_envelope") is not None
     }
-    expected_file = Path(str(parent["selection"]["flat_indices"]))
-    expected = {
-        int(line.strip())
-        for line in expected_file.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    }
-    missing = sorted(expected - set(ready))
+    expected_file = _require_file(
+        Path(str(parent["selection"]["flat_indices"]))
+    )
+    expected_sha256 = parent["selection"].get("flat_indices_sha256")
+    if expected_sha256 is None or _sha256(expected_file) != str(
+        expected_sha256
+    ):
+        raise CampaignError("parent campaign flat-index selection changed")
+    expected_values = _read_flat_indices(
+        expected_file, label="parent campaign selection"
+    )
+    expected = set(expected_values)
+    filter_source_raw = getattr(args, "flat_index_file", None)
+    filter_source = (
+        _require_file(filter_source_raw)
+        if filter_source_raw is not None
+        else None
+    )
+    if filter_source is not None:
+        requested_values = _read_flat_indices(
+            filter_source, label="production filter"
+        )
+        requested = set(requested_values)
+        outside_parent = sorted(requested - expected)
+        if outside_parent:
+            preview = ", ".join(str(value) for value in outside_parent[:20])
+            suffix = "..." if len(outside_parent) > 20 else ""
+            raise CampaignError(
+                f"production filter contains {len(outside_parent)} strata "
+                "outside the parent campaign selection: "
+                f"{preview}{suffix}"
+            )
+    else:
+        requested = set(expected)
+    missing = sorted(requested - set(ready))
     if missing and not args.allow_incomplete:
         preview = ", ".join(str(value) for value in missing[:20])
         suffix = "..." if len(missing) > 20 else ""
@@ -1975,18 +2049,35 @@ def plan_production(args: argparse.Namespace) -> Path:
             f"{len(missing)} selected strata are not pilot-ready: "
             f"{preview}{suffix}"
         )
-    selected = sorted(expected & set(ready))
+    selected = sorted(requested & set(ready))
     if not selected:
         raise CampaignError("production selection contains no ready strata")
+    deferred_by_filter = sorted(expected - requested)
+    deferred = sorted(expected - set(selected))
     output = args.output.expanduser().resolve()
     if output.exists():
         raise FileExistsError(output)
     output.mkdir(parents=True)
-    selection = output / "selection" / "ready_flat_indices.txt"
+    selection_directory = output / "selection"
+    requested_selection = selection_directory / "requested_flat_indices.txt"
+    selection = selection_directory / "ready_flat_indices.txt"
+    deferred_selection = selection_directory / "deferred_flat_indices.txt"
+    _write_flat_indices(
+        requested_selection,
+        [{"flat_index": value} for value in sorted(requested)],
+    )
     _write_flat_indices(
         selection,
         [{"flat_index": value} for value in selected],
     )
+    _write_flat_indices(
+        deferred_selection,
+        [{"flat_index": value} for value in deferred],
+    )
+    filter_snapshot: Optional[Path] = None
+    if filter_source is not None:
+        filter_snapshot = selection_directory / "production_filter_source.txt"
+        filter_snapshot.write_bytes(filter_source.read_bytes())
     frozen = parent["frozen_inputs"]
     config = _require_file(Path(str(frozen["config"])))
     recipes = _require_file(Path(str(frozen["recipes"])))
@@ -2034,8 +2125,33 @@ def plan_production(args: argparse.Namespace) -> Path:
         frozen_inputs=frozen,
         selection={
             **parent["selection"],
+            "parent_selected_strata": len(expected),
+            "parent_flat_indices": str(expected_file),
+            "parent_flat_indices_sha256": _sha256(expected_file),
+            "production_filter_enabled": filter_source is not None,
+            "production_filter_source": (
+                str(filter_source) if filter_source is not None else None
+            ),
+            "production_filter_source_sha256": (
+                _sha256(filter_source) if filter_source is not None else None
+            ),
+            "production_filter_source_snapshot": (
+                str(filter_snapshot) if filter_snapshot is not None else None
+            ),
+            "production_filter_source_snapshot_sha256": (
+                _sha256(filter_snapshot) if filter_snapshot is not None else None
+            ),
+            "production_filter_subset_of_parent_verified": True,
+            "production_filter_duplicate_free_verified": True,
+            "requested_strata": len(requested),
+            "requested_flat_indices": str(requested_selection),
+            "requested_flat_indices_sha256": _sha256(requested_selection),
             "ready_strata": len(selected),
             "not_ready_strata": len(missing),
+            "deferred_strata": len(deferred),
+            "deferred_by_filter_strata": len(deferred_by_filter),
+            "deferred_flat_indices": str(deferred_selection),
+            "deferred_flat_indices_sha256": _sha256(deferred_selection),
             "allow_incomplete": args.allow_incomplete,
             "flat_indices": str(selection),
             "flat_indices_sha256": _sha256(selection),
@@ -2363,6 +2479,15 @@ def _parser() -> argparse.ArgumentParser:
     production.add_argument("--calibration", type=Path, required=True)
     production.add_argument("--output", type=Path, required=True)
     production.add_argument("--events-per-stratum", type=int, required=True)
+    production.add_argument(
+        "--flat-index-file",
+        type=Path,
+        help=(
+            "optional duplicate-free subset of the parent campaign "
+            "selection; the source, canonical request, ready selection, "
+            "and deferred complement are snapshotted and hashed"
+        ),
+    )
     production.add_argument("--replicas", type=int, default=1)
     production.add_argument("--seed-base", type=int, default=307_000_001)
     production.add_argument("--heartbeat-interval", type=int, default=100_000)

@@ -884,6 +884,129 @@ class FullCampaignTests(unittest.TestCase):
             ["bash", "-n", str(output / "run_swif_task.sh")], check=True
         )
 
+    def test_production_plan_snapshots_subset_and_deferred_complement(
+        self,
+    ) -> None:
+        campaign_path = self._plan()
+        calibration_path = self.root / "ready_subset.json"
+        strata = [
+            self._calibration_stratum(
+                index,
+                "provisional_zero_complement",
+                "ready_provisional_zero_complement",
+                1200,
+                0,
+            )
+            for index in range(4)
+        ]
+        _write_json(
+            calibration_path,
+            {"schema": radiative_mode4.CALIBRATION_SCHEMA, "strata": strata},
+        )
+        source = self.root / "majority.txt"
+        source.write_text("# tractable strata\n3\n\n1\n", encoding="utf-8")
+        output = self.root / "production_subset"
+        args = argparse.Namespace(
+            campaign=campaign_path,
+            calibration=calibration_path,
+            output=output,
+            events_per_stratum=200,
+            replicas=2,
+            seed_base=307_000_001,
+            heartbeat_interval=100_000,
+            allow_incomplete=False,
+            flat_index_file=source,
+        )
+        with mock.patch.object(
+            radiative_mode4, "prepare", side_effect=self._fake_prepare
+        ):
+            result = full.plan_production(args)
+        payload = json.loads(result.read_text(encoding="utf-8"))
+        selection = payload["selection"]
+        self.assertEqual(payload["task_count"], 4)
+        self.assertTrue(selection["production_filter_enabled"])
+        self.assertTrue(
+            selection["production_filter_subset_of_parent_verified"]
+        )
+        self.assertTrue(selection["production_filter_duplicate_free_verified"])
+        self.assertEqual(selection["parent_selected_strata"], 4)
+        self.assertEqual(selection["requested_strata"], 2)
+        self.assertEqual(selection["ready_strata"], 2)
+        self.assertEqual(selection["deferred_strata"], 2)
+        self.assertEqual(selection["deferred_by_filter_strata"], 2)
+        self.assertEqual(selection["not_ready_strata"], 0)
+        self.assertEqual(
+            Path(selection["requested_flat_indices"]).read_text(
+                encoding="utf-8"
+            ),
+            "1\n3\n",
+        )
+        self.assertEqual(
+            Path(selection["flat_indices"]).read_text(encoding="utf-8"),
+            "1\n3\n",
+        )
+        self.assertEqual(
+            Path(selection["deferred_flat_indices"]).read_text(
+                encoding="utf-8"
+            ),
+            "0\n2\n",
+        )
+        snapshot = Path(selection["production_filter_source_snapshot"])
+        self.assertEqual(snapshot.read_bytes(), source.read_bytes())
+        self.assertEqual(
+            selection["production_filter_source_snapshot_sha256"],
+            _sha256(snapshot),
+        )
+        # The campaign loader verifies every selection snapshot before a
+        # scheduler task or finalizer is allowed to consume the campaign.
+        loaded_path, loaded = full._load_campaign(result)
+        self.assertEqual(loaded_path, result)
+        self.assertEqual(loaded["task_count"], 4)
+
+    def test_production_filter_rejects_duplicates_and_nonparent_strata(
+        self,
+    ) -> None:
+        campaign_path = self._plan()
+        calibration_path = self.root / "ready_filter_errors.json"
+        _write_json(
+            calibration_path,
+            {
+                "schema": radiative_mode4.CALIBRATION_SCHEMA,
+                "strata": [
+                    self._calibration_stratum(
+                        index,
+                        "provisional_zero_complement",
+                        "ready_provisional_zero_complement",
+                        1200,
+                        0,
+                    )
+                    for index in range(5)
+                ],
+            },
+        )
+        duplicate = self.root / "duplicate.txt"
+        duplicate.write_text("1\n1\n", encoding="utf-8")
+        outside = self.root / "outside.txt"
+        outside.write_text("4\n", encoding="utf-8")
+
+        def arguments(source: Path, output: str) -> argparse.Namespace:
+            return argparse.Namespace(
+                campaign=campaign_path,
+                calibration=calibration_path,
+                output=self.root / output,
+                events_per_stratum=200,
+                replicas=1,
+                seed_base=307_000_001,
+                heartbeat_interval=100_000,
+                allow_incomplete=False,
+                flat_index_file=source,
+            )
+
+        with self.assertRaisesRegex(full.CampaignError, "duplicate flat"):
+            full.plan_production(arguments(duplicate, "duplicate_output"))
+        with self.assertRaisesRegex(full.CampaignError, "outside the parent"):
+            full.plan_production(arguments(outside, "outside_output"))
+
 
 if __name__ == "__main__":
     unittest.main()
