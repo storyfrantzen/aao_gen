@@ -1,0 +1,17 @@
+5                  ! Physics model: MAID2007
+1                  ! Polarized-electron flag used by legacy RGA production
+.20 .12 .20 .20    ! Integration-region sizes
+4                  ! Number of particles
+1                  ! pi0 channel
+.2                 ! Missing-mass-squared error limit
+5.0                ! Target-cell length (cm)
+0.8                ! Target-cylinder radius (cm)
+0.0                ! Beam vertex x (cm)
+0.0                ! Beam vertex y (cm)
+0.0                ! Beam vertex z (cm)
+10.604             ! Replaced from frozen analysis config
+1.0 10.5           ! Replaced by padded Q2 bounds
+2.0 10.604         ! Replaced by analysis electron-momentum bounds
+0.010              ! Minimum radiated-photon energy (GeV)
+5000               ! Replaced per production/calibration task
+1                  ! Replaced by the calibrated mode-3 envelope

@@ -259,6 +259,40 @@ def _canonical_legacy(
     return "\n".join(base) + "\n"
 
 
+def _legacy_physics_settings(records: list[str]) -> dict[str, object]:
+    """Return the non-campaign physics settings inherited from the template."""
+
+    try:
+        theory = int(records[0].split()[0])
+        helicity = int(records[1].split()[0])
+        regions = [float(value) for value in records[2].split()]
+        missing_mass_cut = float(records[5].split()[0])
+        target_length = float(records[6].split()[0])
+        target_radius = float(records[7].split()[0])
+        vertex = [float(records[index].split()[0]) for index in range(8, 11)]
+        minimum_photon_energy = float(records[14].split()[0])
+        original_fmcall = float(records[16].split()[0])
+    except (ValueError, IndexError) as error:
+        raise Mode3Error("legacy input contains malformed physics settings") from error
+    if len(regions) != 4 or any(value <= 0.0 for value in regions):
+        raise Mode3Error("legacy integration-region record must contain 4 positives")
+    if minimum_photon_energy <= 0.0:
+        raise Mode3Error("legacy minimum photon energy must be positive")
+    position = 17 + int(original_fmcall == 0.0)
+    theory_record = records[position].split() if theory > 10 else []
+    return {
+        "physics_model": theory,
+        "electron_helicity_flag": helicity,
+        "integration_regions": regions,
+        "missing_mass_squared_cut": missing_mass_cut,
+        "target_length_cm": target_length,
+        "target_radius_cm": target_radius,
+        "vertex_cm": vertex,
+        "minimum_photon_energy_gev": minimum_photon_energy,
+        "optional_theory_record": [float(value) for value in theory_record],
+    }
+
+
 def _trailer(
     settings: dict[str, object], *, seed: int, replica: int,
     direct_fraction: float, operation: int, trials: int, heartbeat: int
@@ -300,6 +334,15 @@ def _prepare(args: argparse.Namespace, *, operation: str) -> Path:
         raise FileNotFoundError(config_path if not config_path.is_file() else input_path)
     settings = _configuration(config_path, args.padding_fraction)
     records = _legacy_records(input_path)
+    minimum_photon_energy = getattr(args, "minimum_photon_energy", None)
+    if minimum_photon_energy is not None:
+        if not 0.0 < minimum_photon_energy < float(settings["beam_energy"]):
+            raise ValueError(
+                "--minimum-photon-energy must lie between zero and the beam energy"
+            )
+        records = list(records)
+        records[14] = f"{minimum_photon_energy:.17g}"
+    settings["generator_physics"] = _legacy_physics_settings(records)
     # The legacy input is a physics-model template.  Beam energy, Q2 bounds,
     # and electron momentum bounds are intentionally replaced by the frozen
     # analysis configuration below; requiring the template's old beam value
@@ -880,6 +923,14 @@ def _common_prepare(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tag", default="aao_rad_mode3")
     parser.add_argument("--padding-fraction", type=float, default=0.035)
     parser.add_argument("--direct-fraction", type=float, default=0.75)
+    parser.add_argument(
+        "--minimum-photon-energy",
+        type=float,
+        help=(
+            "override the legacy input's minimum radiated-photon energy in GeV; "
+            "the value is frozen into calibration/production compatibility metadata"
+        ),
+    )
     parser.add_argument("--seed-base", type=int, required=True)
     parser.add_argument("--heartbeat-interval", type=int, default=100_000)
     parser.add_argument("--generator-revision", required=True)

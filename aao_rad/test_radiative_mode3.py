@@ -75,6 +75,7 @@ def _prepare_args(
         tag="test_mode3",
         padding_fraction=0.0,
         direct_fraction=direct_fraction,
+        minimum_photon_energy=None,
         seed_base=731001,
         heartbeat_interval=100,
         generator_revision="generator-test",
@@ -166,6 +167,12 @@ class Mode3WorkflowTests(unittest.TestCase):
         self.assertEqual(records[18], "3")
         self.assertEqual(records[21], "0.75")
         self.assertEqual(records[-3:], ["1", "2000", "100"])
+        self.assertEqual(
+            manifest["settings"]["generator_physics"][
+                "minimum_photon_energy_gev"
+            ],
+            0.005,
+        )
 
         calibration = {
             "schema": mode3.CALIBRATION_SCHEMA,
@@ -198,6 +205,45 @@ class Mode3WorkflowTests(unittest.TestCase):
             Path(production["runs"][2]["lund"]).parent.name,
             "chunk_0001",
         )
+
+    def test_photon_threshold_is_frozen_across_calibration_and_production(self) -> None:
+        args = _prepare_args(
+            self.root, self.config, self.legacy, operation="calibration"
+        )
+        args.minimum_photon_energy = 0.010
+        manifest_path = mode3.prepare_calibration(args)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        generated = mode3._records(
+            Path(manifest["runs"][0]["input"]).read_text(encoding="utf-8")
+        )
+        self.assertAlmostEqual(float(generated[14]), 0.010)
+        self.assertAlmostEqual(
+            manifest["settings"]["generator_physics"][
+                "minimum_photon_energy_gev"
+            ],
+            0.010,
+        )
+
+        calibration = {
+            "schema": mode3.CALIBRATION_SCHEMA,
+            "settings": manifest["settings"],
+            "direct_fraction": 0.75,
+            "recommended_sigr_max": 0.01,
+        }
+        calibration_path = self.root / "threshold-envelope.json"
+        calibration_path.write_text(json.dumps(calibration), encoding="utf-8")
+        production = _prepare_args(
+            self.root, self.config, self.legacy, operation="production"
+        )
+        production.output = self.root / "threshold-production"
+        production.calibration = calibration_path
+        production.total_events = 10
+        production.events_per_job = 5
+        production.lund_files_per_directory = 5_000
+        with self.assertRaisesRegex(
+            mode3.Mode3Error, "production settings differ from calibration"
+        ):
+            mode3.prepare_production(production)
 
     def test_executable_calibration_and_production_smoke(self) -> None:
         executable = Path(__file__).resolve().parent / "build" / "aao_rad"

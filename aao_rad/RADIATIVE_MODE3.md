@@ -74,6 +74,13 @@ No `y_max` is applied because the RGA analysis configuration does not define
 one. Padding expands `Q2`, `xB`, and `-t`; it does not relax the configured `W`
 or final-electron-momentum selections.
 
+The minimum radiated-photon energy is inherited from the legacy input unless
+`--minimum-photon-energy` is supplied.  This setting is frozen into the
+calibration metadata; production with a different threshold is rejected.
+The RGA submission helper uses `input/rga10604_mode3_legacy.inp`, which
+preserves the polarized-electron flag, target geometry, and other non-campaign
+settings from the earlier RGA legacy-production script.
+
 ## Campaign artifacts
 
 `radiative_mode3.py` creates immutable inputs, a manifest, a task table,
