@@ -873,9 +873,15 @@ def emit_swif(args: argparse.Namespace) -> Path:
     driver = Path(__file__).resolve()
     wrapper = root / f"run_swif_{start:06d}_{stop:06d}.sh"
     executable_hash = _sha256(executable)
-    scratch_argument = (
-        f" --scratch-root {shlex.quote(str(args.scratch_root.expanduser().resolve()))}"
+    requested_scratch = (
+        shlex.quote(str(args.scratch_root.expanduser().resolve()))
         if args.scratch_root
+        else ""
+    )
+    scratch_fallback = (
+        f'if [ -z "$MODE3_SCRATCH_ROOT" ]; then '
+        f"MODE3_SCRATCH_ROOT={requested_scratch}; fi\n"
+        if requested_scratch
         else ""
     )
     wrapper.write_text(
@@ -885,8 +891,12 @@ def emit_swif(args: argparse.Namespace) -> Path:
         "module use /scigroup/cvmfs/hallb/clas12/sw/modulefiles 2>/dev/null || true\n"
         "module load clas12/5.4 2>/dev/null || true\n"
         f"test \"$(sha256sum \"$3\" | awk '{{print $1}}')\" = {shlex.quote(executable_hash)}\n"
+        "MODE3_SCRATCH_ROOT=\"${SWIF_JOB_WORK_DIR:-${TMPDIR:-}}\"\n"
+        f"{scratch_fallback}"
+        "if [ -z \"$MODE3_SCRATCH_ROOT\" ]; then MODE3_SCRATCH_ROOT=\"$PWD\"; fi\n"
+        "mkdir -p \"$MODE3_SCRATCH_ROOT\"\n"
         f"python3 {shlex.quote(str(driver))} run \"$1\" --replica-index \"$2\" "
-        f"--executable \"$3\"{scratch_argument}\n",
+        f"--executable \"$3\" --scratch-root \"$MODE3_SCRATCH_ROOT\"\n",
         encoding="utf-8",
     )
     wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)

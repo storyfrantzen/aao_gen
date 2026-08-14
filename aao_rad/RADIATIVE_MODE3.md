@@ -91,5 +91,10 @@ below the 10,000-job type-2 OSG submission limit. All events in the finalized
 global campaign share the `pooled_event_weight_microbarn` recorded in
 `campaign_weights.json`; no per-stratum weights are needed.
 
+Generated SWIF wrappers use `$SWIF_JOB_WORK_DIR` for temporary files, falling
+back to `$TMPDIR`, an explicitly requested scratch root, and finally the job's
+current directory. A login-node `/scratch/$USER` path is not assumed to exist
+on worker nodes.
+
 Use `python3 radiative_mode3.py --help` or a subcommand's `--help` for the full
 command interface.

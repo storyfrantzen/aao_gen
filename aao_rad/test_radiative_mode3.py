@@ -331,7 +331,16 @@ class Mode3WorkflowTests(unittest.TestCase):
         )
         text = script.read_text(encoding="utf-8")
         self.assertEqual(text.count("swif2 add-job"), 2)
-        self.assertIn("--scratch-root", (args.output / "run_swif_000001_000003.sh").read_text(encoding="utf-8"))
+        wrapper_text = (args.output / "run_swif_000001_000003.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("--scratch-root", wrapper_text)
+        self.assertIn("SWIF_JOB_WORK_DIR", wrapper_text)
+        self.assertIn(str(self.root / "scratch"), wrapper_text)
+        self.assertLess(
+            wrapper_text.index("SWIF_JOB_WORK_DIR"),
+            wrapper_text.index(str(self.root / "scratch")),
+        )
         completed = subprocess.run(
             ["bash", "-n", str(script)], capture_output=True, text=True
         )
