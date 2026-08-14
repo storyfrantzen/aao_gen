@@ -56,6 +56,29 @@ also supplies the production envelope. Run a small production pilot before a
 large campaign and inspect `maximum_mcall`, `duplicate_events`, proposal yield,
 and the exact LUND line count.
 
+## Simple automatic-envelope production
+
+The fixed-envelope workflow above is useful when one wants a reusable,
+validated envelope and a quantitative proposal-closure test.  It is not a
+mathematical requirement for unbiased generation.  Mode-3 operation `2`
+instead performs a short prescan with the actual mode-3 proposal, sets
+
+```text
+sigr_max = fmcall * maximum_observed_integrand
+```
+
+discards the prescan statistics, and immediately starts production.  As in
+legacy AAO, an underestimated maximum does not bias the generated sample:
+stochastic multiplicity emits `floor(sigr/sigr_max)` events plus one with the
+remaining fractional probability.  Envelope crossings therefore appear as
+duplicate events and reduce efficiency rather than changing the distribution.
+
+`submit_aao_rad_mode3_native_rga10604_200M.csh` uses this path with a pure
+analysis-coordinate proposal (`direct_fraction=1`), 10,000 prescan trials per
+job, and the padded RGA domain.  This deliberately forgoes the unrestricted
+legacy component: the configured direct hard-coordinate box must therefore be
+wide enough for the radiative feed-in that the study intends to retain.
+
 ## RGA 10.604-GeV padded domain
 
 With `configs/analysis/rga/10.604.json` and the default padding fraction 0.035,

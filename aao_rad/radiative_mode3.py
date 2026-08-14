@@ -205,8 +205,8 @@ def proposal_density_ratio(
     """Python parity implementation of the exact Fortran mixture correction."""
 
     legacy_fraction = 1.0 - direct_fraction
-    if not 0.0 <= direct_fraction < 1.0:
-        raise ValueError("direct_fraction must lie in [0,1)")
+    if not 0.0 <= direct_fraction <= 1.0:
+        raise ValueError("direct_fraction must lie in [0,1]")
     inside = (
         q2 > 0.0
         and xb > 0.0
@@ -216,7 +216,7 @@ def proposal_density_ratio(
         and phi_bounds[0] <= phi_deg % 360.0 <= phi_bounds[1]
     )
     if not inside:
-        return 1.0 / legacy_fraction
+        return 1.0 / legacy_fraction if legacy_fraction > 0.0 else 0.0
     direct_to_legacy = (
         ep_range
         * 2.0
@@ -347,8 +347,8 @@ def _prepare(args: argparse.Namespace, *, operation: str) -> Path:
     # and electron momentum bounds are intentionally replaced by the frozen
     # analysis configuration below; requiring the template's old beam value
     # to match would reject the historical 10.6-GeV input for RGA 10.604 GeV.
-    if not 0.0 <= args.direct_fraction < 1.0:
-        raise ValueError("--direct-fraction must lie in [0,1)")
+    if not 0.0 <= args.direct_fraction <= 1.0:
+        raise ValueError("--direct-fraction must lie in [0,1]")
     if args.replicas <= 0 or args.heartbeat_interval <= 0:
         raise ValueError("replicas and heartbeat interval must be positive")
     if args.seed_base == 0:

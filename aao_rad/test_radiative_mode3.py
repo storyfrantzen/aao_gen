@@ -146,6 +146,13 @@ class Mode3WorkflowTests(unittest.TestCase):
         self.assertEqual(mode3.proposal_density_ratio(**arguments), 4.0)
         arguments["direct_fraction"] = 0.0
         self.assertEqual(mode3.proposal_density_ratio(**arguments), 1.0)
+        arguments["direct_fraction"] = 1.0
+        self.assertEqual(mode3.proposal_density_ratio(**arguments), 0.0)
+        arguments["minus_t"] = 0.5
+        expected_direct_only = 1.0 / direct_to_legacy
+        self.assertAlmostEqual(
+            mode3.proposal_density_ratio(**arguments), expected_direct_only
+        )
 
     def test_prepare_snapshots_mode3_input_and_splits_production(self) -> None:
         args = _prepare_args(
@@ -304,6 +311,42 @@ class Mode3WorkflowTests(unittest.TestCase):
         self.assertEqual(generated["events"], 2)
         self.assertEqual(generated["lund_lines"], 5 * generated["events"])
         self.assertTrue(Path(generated["lund"]).is_file())
+
+    def test_executable_direct_only_automatic_envelope_smoke(self) -> None:
+        executable = Path(__file__).resolve().parent / "build" / "aao_rad"
+        if not executable.is_file():
+            self.skipTest("build/aao_rad is created by the Makefile test target")
+        settings = mode3._configuration(self.config, 0.0)
+        records = mode3._legacy_records(self.legacy)
+        base = records[:17]
+        base[15] = "2"
+        base[16] = "2.0"
+        generated = "\n".join(base) + "\n" + mode3._trailer(
+            settings,
+            seed=791001,
+            replica=0,
+            direct_fraction=1.0,
+            operation=2,
+            trials=2_000,
+            heartbeat=100,
+        )
+        work = self.root / "automatic-envelope"
+        work.mkdir()
+        completed = subprocess.run(
+            [str(executable)],
+            input=generated,
+            text=True,
+            cwd=work,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("Mode-3 automatic sigr_max", completed.stdout)
+        norm = mode3._parse_norm(work / "aao_rad.norm")
+        self.assertEqual(int(mode3._number(norm, "mode3_operation")), 0)
+        self.assertEqual(int(mode3._number(norm, "events")), 2)
+        self.assertGreater(mode3._number(norm, "sigr_max"), 0.0)
+        self.assertEqual(len((work / "aao_rad.lund").read_text().splitlines()), 10)
 
     def test_swif_emission_is_chunkable_and_shell_valid(self) -> None:
         args = _prepare_args(

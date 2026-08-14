@@ -174,6 +174,7 @@ c     and make a new version.
       real mode3_target_t_low,mode3_target_t_high
       real mode3_target_phi_low,mode3_target_phi_high
       real mode3_w_minimum,mode3_y_maximum
+      real mode3_scan_maximum
       real mode4_core_fraction,mode4_legacy_fraction
       real mode4_base_padding,mode4_core_volume
       real mode4_q2_low,mode4_q2_high
@@ -212,6 +213,7 @@ c      integer iext
       integer mode3_apply_y_max,mode3_target_status
       integer mode3_operation,mode3_inside_direct
       integer mode3_remaining_events
+      integer mode3_auto_envelope
       integer mode4_apply_y_max,mode4_stratum_status
       integer mode4_operation,mode4_inside_core
       integer mode4_calibration_proposal
@@ -545,6 +547,7 @@ c     of a learned continuous core and the unrestricted legacy proposal.
       mode3_apply_y_max=0
       mode3_y_maximum=1.
       mode3_operation=0
+      mode3_auto_envelope=0
       mode3_trial_limit=0
       mode3_heartbeat_interval=100000
       mode4_seed=0
@@ -732,8 +735,8 @@ c     of a learned continuous core and the unrestricted legacy proposal.
          endif
          read(5,*,iostat=input_status)mode3_direct_fraction
          if (input_status .ne. 0 .or. mode3_direct_fraction .lt. 0.
-     *       .or. mode3_direct_fraction .ge. 1.) then
-            write(6,*)'Mode 3 direct fraction must lie in [0,1)'
+     *       .or. mode3_direct_fraction .gt. 1.) then
+            write(6,*)'Mode 3 direct fraction must lie in [0,1]'
             stop 2
          endif
          mode3_legacy_fraction=1.-mode3_direct_fraction
@@ -803,8 +806,9 @@ c     of a learned continuous core and the unrestricted legacy proposal.
          read(5,*,iostat=input_status)mode3_operation
          if (input_status .ne. 0 .or.
      *       (mode3_operation .ne. 0 .and.
-     *        mode3_operation .ne. 1)) then
-            write(6,*)'Mode 3 operation must be 0 or 1'
+     *        mode3_operation .ne. 1 .and.
+     *        mode3_operation .ne. 2)) then
+            write(6,*)'Mode 3 operation must be 0, 1, or 2'
             stop 2
          endif
          read(5,*,iostat=input_status)mode3_trial_limit
@@ -818,13 +822,22 @@ c     of a learned continuous core and the unrestricted legacy proposal.
             write(6,*)'Mode-3 heartbeat interval must be positive'
             stop 2
          endif
-         if (mode3_operation .eq. 1 .and.
+         if ((mode3_operation .eq. 1 .or.
+     *        mode3_operation .eq. 2) .and.
      *       mode3_trial_limit .le. 0) then
-            write(6,*)'Mode-3 calibration requires positive trials'
+            write(6,*)'Mode-3 scan/calibration requires positive trials'
             stop 2
          endif
-         if (fmcall .ne. 0. .or. sigr_max .le. 0.) then
-            write(6,*)'Mode 3 requires fmcall=0 and positive sigr_max'
+         if (mode3_operation .eq. 2) then
+            if (fmcall .le. 0.) then
+               write(6,*)'Mode-3 automatic scan requires fmcall>0'
+               stop 2
+            endif
+            mode3_auto_envelope=1
+            sigr_max=0.
+         elseif (fmcall .ne. 0. .or. sigr_max .le. 0.) then
+            write(6,*)'Fixed-envelope mode 3 requires fmcall=0'
+     *         //' and positive sigr_max'
             stop 2
          endif
          if (epirea .ne. 1 .or. npart .ne. 4) then
@@ -1052,6 +1065,7 @@ c
       mode3_emitting_candidates=0
       mode3_duplicate_events=0
       mode3_last_heartbeat=-1
+      mode3_scan_maximum=0.
       mode4_core_trials=0
       mode4_legacy_trials=0
       mode4_internal_rows=0
@@ -1383,6 +1397,36 @@ c     Use a Monte-Carlo to calculate a distribution of nmax events
 c     distributed according to the Mo-Tsai integrand.
       ehel = 0      
  20   continue
+      if (sampling_mode .eq. 3 .and. mode3_auto_envelope .eq. 1
+     *    .and. ntries .ge. mode3_trial_limit) then
+         if (mode3_scan_maximum .le. 0.) then
+            write(6,*)'Mode-3 automatic scan found no target support'
+            stop 2
+         endif
+         sigr_max=mode3_scan_maximum*fmcall
+         write(6,*)'Mode-3 automatic scan proposals/maximum:',
+     *      ntries,mode3_scan_maximum
+         write(6,*)'Mode-3 automatic sigr_max:',sigr_max
+         write(12,*)'Mode-3 automatic scan proposals/maximum:',
+     *      ntries,mode3_scan_maximum
+         write(12,*)'Mode-3 automatic sigr_max:',sigr_max
+c        Discard scan statistics exactly as the legacy preliminary scan does.
+         ntries=0
+         sig_tot=0.
+         mode3_direct_trials=0
+         mode3_legacy_trials=0
+         mode3_internal_rows=0
+         mode3_final_candidates=0
+         mode3_target_candidates=0
+         mode3_direct_events=0
+         mode3_legacy_events=0
+         mode3_emitting_candidates=0
+         mode3_duplicate_events=0
+         mode3_last_heartbeat=-1
+         mcall_max=0
+         mode3_auto_envelope=0
+         mode3_operation=0
+      endif
       if (sampling_mode .eq. 1 .and.
      *    ntries .ge. survey_ntrials) go to 50
       if (sampling_mode .eq. 3 .and. ntries .gt. 0 .and.
@@ -2080,6 +2124,11 @@ c     multiplicity preserves equal event weights when the envelope is crossed.
          if (mode3_target_status .ne. 0)go to 30
          mode3_target_candidates=mode3_target_candidates+1
          sig_tot=sig_tot+dble(sigr)
+         if (mode3_auto_envelope .eq. 1) then
+            if (sigr .gt. mode3_scan_maximum)
+     *         mode3_scan_maximum=sigr
+            go to 30
+         endif
          if (mode3_operation .eq. 1) then
             write(20,9004)ntries,proposal_component,
      *         mode3_inside_direct,proposal_density_ratio,sigr,
@@ -2974,7 +3023,11 @@ c     zero and the nonzero legacy fraction guarantees complete support.
 
       legacy_fraction=1.-direct_fraction
       direct_to_legacy=0.
-      density_ratio=1./legacy_fraction
+      if (legacy_fraction .gt. 0.) then
+         density_ratio=1./legacy_fraction
+      else
+         density_ratio=0.
+      endif
       inside=1
       phi_wrapped=modulo(phicm,360.)
       if (q2 .le. 0. .or. xb .le. 0. .or.
