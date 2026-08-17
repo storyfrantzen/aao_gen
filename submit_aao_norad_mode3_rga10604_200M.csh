@@ -1,0 +1,161 @@
+#!/bin/tcsh -f
+
+# Submit globally unweighted Born e p pi0 events for the padded RGA region.
+#
+# Production is deliberately split into eight independent 25M-event batches:
+#   5,000 jobs/batch x 5,000 events/job x 8 batches = 200M events.
+#
+# Run one batch at a time with --batch 0 through --batch 7.  Each job requests
+# 5,000 events to align with the OSG type-2 limit. AAO stochastic multiplicity
+# can rarely overshoot nmax, so exact per-file counts must still be audited
+# before OSG submission.
+
+set script_dir = `dirname "$0"`
+set script_dir = `cd "$script_dir" && pwd`
+set runner = "$script_dir/run_swif_norad_job.sh"
+
+if ( ! -x "$runner" ) then
+    echo "ERROR: missing executable SWIF runner: $runner"
+    exit 1
+endif
+
+if ( $#argv < 1 || $#argv > 2 ) then
+    echo "Usage: $0 --smoke|--pilot|--batch BATCH_INDEX"
+    echo "  --smoke   submits 1 x 100 events"
+    echo "  --pilot   submits 10 x 5,000 events"
+    echo "  --batch N submits production batch N, where N is 0 through 7"
+    exit 2
+endif
+
+set mode = "$argv[1]"
+set events_per_job = 5000
+set first_task = 0
+set jobs = 0
+set production = 0
+
+if ( "$mode" == "--smoke" && $#argv == 1 ) then
+    set workflow = "aao_norad_rga10604_mode3_smoke"
+    set events_per_job = 100
+    set jobs = 1
+    set campaign_root = "/volatile/clas12/$USER/norad_mode3/$workflow"
+    set outbase = "$campaign_root"
+else if ( "$mode" == "--pilot" && $#argv == 1 ) then
+    set workflow = "aao_norad_rga10604_mode3_pilot10"
+    set jobs = 10
+    set campaign_root = "/volatile/clas12/$USER/norad_mode3/$workflow"
+    set outbase = "$campaign_root"
+else if ( "$mode" == "--batch" && $#argv == 2 ) then
+    set batch = "$argv[2]"
+    if ( "$batch" !~ [0-7] ) then
+        echo "ERROR: BATCH_INDEX must be one integer from 0 through 7"
+        exit 2
+    endif
+    set production = 1
+    set jobs = 5000
+    @ first_task = $batch * $jobs
+    set batch_tag = `printf "%02d" $batch`
+    set workflow = "aao_norad_rga10604_mode3_200M_b${batch_tag}"
+    set campaign_root = "/volatile/clas12/$USER/norad_mode3/aao_norad_rga10604_mode3_200M"
+    set outbase = "$campaign_root/batch_$batch_tag"
+else
+    echo "Usage: $0 --smoke|--pilot|--batch BATCH_INDEX"
+    exit 2
+endif
+
+# RGA analysis binning padded by 3.5% of each complete nonperiodic span.
+set beam = "10.604"
+set q2_low = "0.6675"
+set q2_high = "10.8325"
+set xb_low = "0.02725"
+set xb_high = "0.72275"
+set t_low = "0.02315"
+set t_high = "2.06685"
+set phi_low = "0.0"
+set phi_high = "360.0"
+set electron_p_min = "2.0"
+
+set physics_model = 5
+set fmcall = "2.0"
+set seed_base = 1707000001
+
+# Conservative requests based on the generator's small observed memory use.
+set walltime = "8hr"
+set ram = "256mb"
+set disk = "1gb"
+set files_per_directory = 2500
+
+@ total_events = $events_per_job * $jobs
+@ last_task = $first_task + $jobs - 1
+
+mkdir -p "$outbase/inputs" "$outbase/lund"
+
+echo "Creating $workflow"
+echo "  task range: $first_task through $last_task"
+echo "  events: $total_events ($jobs jobs x $events_per_job)"
+echo "  proposal: 1/Q2, xB, -t, phi (Born mode 3)"
+echo "  padded box: Q2=${q2_low}:${q2_high}, xB=${xb_low}:${xb_high}"
+echo "              -t=${t_low}:${t_high}, phi=${phi_low}:${phi_high}"
+echo "  electron momentum: ${electron_p_min}:${beam} GeV"
+echo "  resources/job: 1 core, $ram RAM, $disk disk, $walltime"
+echo "  output: $outbase"
+echo "  NOTE: apply the nominal W > 2 GeV analysis cut downstream."
+
+swif2 create -workflow "$workflow"
+
+@ local_task = 0
+while ( $local_task < $jobs )
+    @ global_task = $first_task + $local_task
+    @ chunk_index = $local_task / $files_per_directory
+    @ seed_positive = $seed_base + $global_task
+    @ seed = -1 * $seed_positive
+
+    set task_tag = `printf "%08d" $global_task`
+    set chunk_tag = `printf "%04d" $chunk_index`
+    set input_dir = "$outbase/inputs/chunk_$chunk_tag"
+    set output_dir = "$outbase/lund/chunk_$chunk_tag"
+    set input = "$input_dir/mode3_born_rga10604__g${task_tag}.inp"
+
+    mkdir -p "$input_dir" "$output_dir"
+
+    cat >! "$input" << EOF
+$physics_model
+1
+3
+1
+$beam
+$q2_low $q2_high
+$electron_p_min $beam
+$events_per_job
+$fmcall
+0
+$seed
+3
+$xb_low $xb_high
+$t_low $t_high
+$phi_low $phi_high
+EOF
+
+    swif2 add-job \
+        -workflow "$workflow" \
+        -name "${workflow}_g${task_tag}" \
+        -cores 1 \
+        -ram "$ram" \
+        -disk "$disk" \
+        -time "$walltime" \
+        -os el9 \
+        -input "$input" "$input" \
+        -- "$runner" "$input" "$output_dir"
+
+    @ local_task++
+end
+
+swif2 run "$workflow"
+
+echo "Submitted $workflow"
+if ( $production ) then
+    echo "This is production batch $batch_tag of 00 through 07."
+endif
+echo "Monitor with:"
+echo "  swif2 diagnose $workflow"
+echo "  swif2 status $workflow"
+echo "  swif2 status $workflow --problems"
