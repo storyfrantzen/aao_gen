@@ -171,6 +171,12 @@ c       4 = bin-conditional uniform 1/Q2, xB, -t, phi coordinates
          read(5,*,iostat=input_status) stratum_flat,stratum_iq2,
      *      stratum_ixb,stratum_it,stratum_iphi
          if (input_status .ne. 0) stop 'Missing conditional bin indices'
+      else if (sampling_mode .eq. 3) then
+c        An optional final line conditions the global mode-3 domain on W/y.
+c        EOF preserves every historical mode-3 input unchanged.
+         read(5,*,iostat=input_status) conditional_apply_cuts,
+     *      conditional_w_min,conditional_y_max
+         if (input_status .gt. 0) stop 'Malformed mode-3 W/y cuts'
       endif
       if (sampling_mode .lt. 0 .or. sampling_mode .gt. 4) then
          stop 'sampling_mode must be 0, 1, 2, 3, or 4'
@@ -187,18 +193,21 @@ c       4 = bin-conditional uniform 1/Q2, xB, -t, phi coordinates
             stop 'Invalid phi sampling bounds'
          endif
       endif
-      if (sampling_mode .eq. 4) then
+      if (sampling_mode .eq. 3 .or. sampling_mode .eq. 4) then
          if (conditional_apply_cuts .ne. 0 .and.
      *       conditional_apply_cuts .ne. 1) then
             stop 'Conditional phase-space flag must be 0 or 1'
          endif
-         if (conditional_w_min .le. 0.) then
+         if (conditional_apply_cuts .eq. 1 .and.
+     *       conditional_w_min .le. 0.) then
             stop 'Invalid configured W minimum'
          endif
          if (conditional_y_max .le. 0. .or.
      *       conditional_y_max .gt. 1.) then
             stop 'Invalid conditional y maximum'
          endif
+      endif
+      if (sampling_mode .eq. 4) then
          if (stratum_flat .lt. 0 .or. stratum_iq2 .lt. 0 .or.
      *       stratum_ixb .lt. 0 .or. stratum_it .lt. 0 .or.
      *       stratum_iphi .lt. 0) then
@@ -353,11 +362,13 @@ c      if (boso.eq.1) call bos_ini(recname)
          write(12,*)' Analysis -t bounds:',mt_min,mt_max
          write(12,*)' Analysis phi bounds (deg):',phi_min,phi_max
       endif
-      if (sampling_mode .eq. 4) then
+      if (sampling_mode .eq. 3 .or. sampling_mode .eq. 4) then
          write(12,*)' Condition on analysis phase space:',
      *      conditional_apply_cuts
          write(12,*)' Conditional W minimum:',conditional_w_min
          write(12,*)' Conditional y maximum:',conditional_y_max
+      endif
+      if (sampling_mode .eq. 4) then
          write(12,*)' Conditional flat/q2/xB/t/phi indices:',
      *      stratum_flat,stratum_iq2,stratum_ixb,stratum_it,
      *      stratum_iphi
@@ -384,7 +395,7 @@ c     of the integrand
           xb = xb_min+xbrng*myran(idum)
           q0 = q2/(2.*mp*xb)
           ep = es-q0
-          if (sampling_mode .eq. 4 .and.
+          if ((sampling_mode .eq. 3 .or. sampling_mode .eq. 4) .and.
      *        conditional_apply_cuts .eq. 1) then
             analysis_y = q0/es
             if (analysis_y .gt. conditional_y_max) cycle
@@ -408,7 +419,7 @@ c     of the integrand
         w2 = mp**2+2.*mp*q0-q2
         if (w2 .le. (wg+0.002)**2) cycle
         epw = sqrt(w2)
-        if (sampling_mode .eq. 4 .and.
+        if ((sampling_mode .eq. 3 .or. sampling_mode .eq. 4) .and.
      *      conditional_apply_cuts .eq. 1) then
           if (epw .lt. conditional_w_min) cycle
         endif
@@ -532,7 +543,7 @@ c   %%%%%%%%%%%%%%%%%%% Main Calculation  %%%%%%%%%%%%%%%%%%%%%%%
       epw		= sqrt(w2)
       
       if (epw .lt. wg+0.002)go to 20
-      if (sampling_mode .eq. 4 .and.
+      if ((sampling_mode .eq. 3 .or. sampling_mode .eq. 4) .and.
      *    conditional_apply_cuts .eq. 1) then
          if (epw .lt. conditional_w_min) go to 20
       endif
@@ -889,12 +900,14 @@ c      if (boso.eq.1) call bos_end(recname)
          write(15,*)'phi_min_deg=',phi_min
          write(15,*)'phi_max_deg=',phi_max
       endif
-      if (sampling_mode .eq. 4) then
-         write(15,*)'conditional_unweighted=1'
+      if (sampling_mode .eq. 3 .or. sampling_mode .eq. 4) then
          write(15,*)'phase_space_conditioned=',
      *      conditional_apply_cuts
          write(15,*)'configured_W_min=',conditional_w_min
          write(15,*)'configured_y_max=',conditional_y_max
+      endif
+      if (sampling_mode .eq. 4) then
+         write(15,*)'conditional_unweighted=1'
          write(15,*)'stratum_flat_index=',stratum_flat
          write(15,*)'stratum_iq2=',stratum_iq2
          write(15,*)'stratum_ixb=',stratum_ixb

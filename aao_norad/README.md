@@ -55,6 +55,17 @@ minus_t_min minus_t_max
 phi_min phi_max
 ```
 
+Global mode 3 may optionally append one additional line:
+
+```text
+condition_phase_space W_min y_max
+```
+
+With `condition_phase_space=1`, both the envelope scan and event generation
+retain only points with `W >= W_min` and `y <= y_max`.  Omitting the line
+preserves the historical unconditioned mode-3 behavior.  Setting `y_max=1`
+therefore provides a W-only condition without imposing an additional y cut.
+
 The modes are:
 
 - `0`: historical uniform sampling in `(1/Q2, E', cos(theta*), phi*)`;

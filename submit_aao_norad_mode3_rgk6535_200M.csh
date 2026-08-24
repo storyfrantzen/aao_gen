@@ -21,6 +21,7 @@ endif
 
 if ( $#argv < 1 || $#argv > 2 ) then
     echo "Usage: $0 --smoke|--pilot|--batch BATCH_INDEX"
+    echo "       $0 --nominal-smoke|--nominal-pilot|--nominal-batch BATCH_INDEX"
     echo "  --smoke   submits 1 x 100 events"
     echo "  --pilot   submits 10 x 5,000 events"
     echo "  --batch N submits production batch N, where N is 0 through 7"
@@ -32,6 +33,7 @@ set events_per_job = 5000
 set first_task = 0
 set jobs = 0
 set production = 0
+set nominal_conditioned = 0
 
 if ( "$mode" == "--smoke" && $#argv == 1 ) then
     set workflow = "aao_norad_rgk6535_mode3_smoke"
@@ -57,8 +59,36 @@ else if ( "$mode" == "--batch" && $#argv == 2 ) then
     set workflow = "aao_norad_rgk6535_mode3_200M_b${batch_tag}"
     set campaign_root = "/volatile/clas12/$USER/norad_mode3/aao_norad_rgk6535_mode3_200M"
     set outbase = "$campaign_root/batch_$batch_tag"
+else if ( "$mode" == "--nominal-smoke" && $#argv == 1 ) then
+    set nominal_conditioned = 1
+    set workflow = "aao_norad_rgk6535_mode3_nominal_w2_smoke"
+    set events_per_job = 100
+    set jobs = 1
+    set campaign_root = "/volatile/clas12/$USER/norad_mode3/$workflow"
+    set outbase = "$campaign_root"
+else if ( "$mode" == "--nominal-pilot" && $#argv == 1 ) then
+    set nominal_conditioned = 1
+    set workflow = "aao_norad_rgk6535_mode3_nominal_w2_pilot10"
+    set jobs = 10
+    set campaign_root = "/volatile/clas12/$USER/norad_mode3/$workflow"
+    set outbase = "$campaign_root"
+else if ( "$mode" == "--nominal-batch" && $#argv == 2 ) then
+    set batch = "$argv[2]"
+    if ( "$batch" !~ [0-7] ) then
+        echo "ERROR: BATCH_INDEX must be one integer from 0 through 7"
+        exit 2
+    endif
+    set nominal_conditioned = 1
+    set production = 1
+    set jobs = 5000
+    @ first_task = $batch * $jobs
+    set batch_tag = `printf "%02d" $batch`
+    set workflow = "aao_norad_rgk6535_mode3_nominal_w2_200M_b${batch_tag}"
+    set campaign_root = "/volatile/clas12/$USER/norad_mode3/aao_norad_rgk6535_mode3_nominal_w2_200M"
+    set outbase = "$campaign_root/batch_$batch_tag"
 else
     echo "Usage: $0 --smoke|--pilot|--batch BATCH_INDEX"
+    echo "       $0 --nominal-smoke|--nominal-pilot|--nominal-batch BATCH_INDEX"
     exit 2
 endif
 
@@ -73,6 +103,17 @@ set t_high = "2.06685"
 set phi_low = "0.0"
 set phi_high = "360.0"
 set electron_p_min = "1.0"
+set w_min = "2.0"
+set condition_phase_space = 0
+if ( $nominal_conditioned ) then
+    set q2_low = "1.0"
+    set q2_high = "6.535"
+    set xb_low = "0.05"
+    set xb_high = "0.70"
+    set t_low = "0.09"
+    set t_high = "2.0"
+    set condition_phase_space = 1
+endif
 
 set physics_model = 5
 set fmcall = "2.0"
@@ -93,12 +134,20 @@ echo "Creating $workflow"
 echo "  task range: $first_task through $last_task"
 echo "  events: $total_events ($jobs jobs x $events_per_job)"
 echo "  proposal: 1/Q2, xB, -t, phi (Born mode 3)"
-echo "  padded box: Q2=${q2_low}:${q2_high}, xB=${xb_low}:${xb_high}"
+if ( $nominal_conditioned ) then
+    echo "  nominal conditioned box: Q2=${q2_low}:${q2_high}, xB=${xb_low}:${xb_high}"
+else
+    echo "  padded box: Q2=${q2_low}:${q2_high}, xB=${xb_low}:${xb_high}"
+endif
 echo "              -t=${t_low}:${t_high}, phi=${phi_low}:${phi_high}"
 echo "  electron momentum: ${electron_p_min}:${beam} GeV"
+echo "  phase-space conditioning flag: $condition_phase_space"
+if ( $condition_phase_space ) echo "  generated events require W >= $w_min GeV; no y_max below 1"
 echo "  resources/job: 1 core, $ram RAM, $disk disk, $walltime"
 echo "  output: $outbase"
-echo "  NOTE: apply the nominal W > 2 GeV analysis cut downstream."
+if ( ! $condition_phase_space ) then
+    echo "  NOTE: apply the nominal W >= 2 GeV analysis cut downstream."
+endif
 
 swif2 create -workflow "$workflow"
 
@@ -133,6 +182,7 @@ $seed
 $xb_low $xb_high
 $t_low $t_high
 $phi_low $phi_high
+$condition_phase_space $w_min 1.0
 EOF
 
     swif2 add-job \
