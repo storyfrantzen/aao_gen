@@ -118,6 +118,7 @@ endif
 set physics_model = 5
 set fmcall = "2.0"
 set seed_base = 1807000001
+if ( $nominal_conditioned ) set seed_base = 1907000001
 
 # Conservative requests based on the generator's small observed memory use.
 set walltime = "8hr"
