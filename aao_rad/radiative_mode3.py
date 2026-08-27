@@ -32,7 +32,9 @@ TASK_SCHEMA = "aao-rad-mode3-task-v1"
 RUN_SCHEMA = "aao-rad-mode3-run-v1"
 CALIBRATION_SCHEMA = "aao-rad-mode3-envelope-v1"
 WEIGHTS_SCHEMA = "aao-rad-mode3-weights-v1"
-MODE3_SCHEMA = "aao-rad-mode3-v1"
+MODE3_SCHEMA = "aao-rad-mode3-v2"
+MINIMUM_LEGACY_FRACTION = 0.05
+MAXIMUM_DIRECT_FRACTION = 1.0 - MINIMUM_LEGACY_FRACTION
 CALIBRATION_COLUMNS = [
     "trial",
     "proposal_component",
@@ -347,8 +349,11 @@ def _prepare(args: argparse.Namespace, *, operation: str) -> Path:
     # and electron momentum bounds are intentionally replaced by the frozen
     # analysis configuration below; requiring the template's old beam value
     # to match would reject the historical 10.6-GeV input for RGA 10.604 GeV.
-    if not 0.0 <= args.direct_fraction <= 1.0:
-        raise ValueError("--direct-fraction must lie in [0,1]")
+    if not 0.0 <= args.direct_fraction <= MAXIMUM_DIRECT_FRACTION:
+        raise ValueError(
+            "--direct-fraction must lie in [0,0.95]; at least 5% legacy "
+            "support is required to bound the exact proposal-density correction"
+        )
     if args.replicas <= 0 or args.heartbeat_interval <= 0:
         raise ValueError("replicas and heartbeat interval must be positive")
     if args.seed_base == 0:
@@ -609,9 +614,12 @@ def run(args: argparse.Namespace) -> Path:
             check=False,
         )
         if completed.returncode != 0:
+            stdout_tail = completed.stdout[-4000:]
+            stderr_tail = completed.stderr[-4000:]
             raise Mode3Error(
                 f"AAO failed with exit code {completed.returncode}:\n"
-                f"{completed.stderr[-4000:]}"
+                f"--- stdout tail ---\n{stdout_tail}\n"
+                f"--- stderr tail ---\n{stderr_tail}"
             )
         norm_path = work / "aao_rad.norm"
         if not norm_path.is_file():
@@ -654,6 +662,7 @@ def run(args: argparse.Namespace) -> Path:
             "emitting_candidates": int(_number(norm, "mode3_emitting_candidates")),
             "duplicate_events": int(_number(norm, "mode3_duplicate_events")),
             "phase_volume": phase_volume,
+            "mode3_schema": MODE3_SCHEMA,
         }
         run_path.parent.mkdir(parents=True, exist_ok=True)
         diagnostics = run_path.with_suffix("")
@@ -697,10 +706,22 @@ def run(args: argparse.Namespace) -> Path:
             requested = int(record["requested_events"])
             lund_source = work / "aao_rad.lund"
             lines = _count_lines(lund_source)
-            if events != requested or lines != 5 * events:
+            maximum_multiplicity = int(payload["mcall_max"])
+            if maximum_multiplicity > requested:
                 raise Mode3Error(
-                    f"production expected {requested} events and {5 * events} "
-                    f"LUND lines; found {events} events and {lines} lines"
+                    "production multiplicity exceeded the per-job event capacity; "
+                    "increase and revalidate the envelope before regenerating this job"
+                )
+            if events < requested or events - requested >= maximum_multiplicity:
+                raise Mode3Error(
+                    "production event total is inconsistent with an untruncated final "
+                    f"multiplicity: requested={requested}, events={events}, "
+                    f"mcall_max={maximum_multiplicity}"
+                )
+            if lines != 5 * events:
+                raise Mode3Error(
+                    f"production expected {5 * events} LUND lines for {events} "
+                    f"events; found {lines} lines"
                 )
             lund_target = Path(str(record["lund"]))
             lund_target.parent.mkdir(parents=True, exist_ok=True)
@@ -710,7 +731,7 @@ def run(args: argparse.Namespace) -> Path:
             payload.update(
                 {
                     "requested_events": requested,
-                    "event_overshoot": 0,
+                    "event_overshoot": events - requested,
                     "event_yield_per_proposal": events / proposals,
                     "duplicate_event_fraction": int(payload["duplicate_events"]) / events,
                     "lund": str(lund_target),
@@ -738,6 +759,8 @@ def status(args: argparse.Namespace) -> Path:
                 run_record = _load_json(path)
                 if run_record.get("schema") != RUN_SCHEMA or run_record.get("source_manifest_sha256") != expected_hash:
                     raise Mode3Error("run provenance differs")
+                if manifest["operation"] == "production":
+                    _validate_production_run(run_record, path)
                 state = "complete"
             except Exception as error:  # status must report, not abort
                 state, message = "failed", str(error)
@@ -746,6 +769,53 @@ def status(args: argparse.Namespace) -> Path:
     output = args.output.expanduser().resolve() if args.output else Path(str(manifest["root"])) / "status.json"
     _write_json(output, {"schema": "aao-rad-mode3-status-v1", "created_utc": _now(), "manifest": str(manifest_path), "status_counts": counts, "complete": counts["complete"] == len(rows), "runs": rows})
     return output
+
+
+def _validate_production_run(run: dict[str, object], path: Path) -> None:
+    """Reject truncated or resource-unsafe mode-3 multiplicity streams."""
+
+    required = (
+        "mode3_schema",
+        "requested_events",
+        "events",
+        "mcall_max",
+        "event_overshoot",
+        "emitting_candidates",
+        "duplicate_events",
+    )
+    missing = [key for key in required if key not in run]
+    if missing:
+        raise Mode3Error(
+            f"{path}: production provenance lacks {', '.join(missing)}; "
+            "it predates the unbiased multiplicity validation"
+        )
+    if run["mode3_schema"] != MODE3_SCHEMA:
+        raise Mode3Error(
+            f"{path}: mode-3 schema {run['mode3_schema']!r} predates "
+            f"{MODE3_SCHEMA}; regenerate the production job"
+        )
+    requested = int(run["requested_events"])
+    events = int(run["events"])
+    maximum_multiplicity = int(run["mcall_max"])
+    overshoot = int(run["event_overshoot"])
+    if requested <= 0 or maximum_multiplicity <= 0:
+        raise Mode3Error(f"{path}: invalid production capacity or multiplicity")
+    if maximum_multiplicity > requested:
+        raise Mode3Error(
+            f"{path}: maximum multiplicity {maximum_multiplicity} exceeds "
+            f"the per-job event capacity {requested}; regenerate with a "
+            "larger validated envelope"
+        )
+    if events < requested or overshoot != events - requested:
+        raise Mode3Error(f"{path}: inconsistent production event overshoot")
+    if overshoot >= maximum_multiplicity:
+        raise Mode3Error(
+            f"{path}: final multiplicity was truncated or its overshoot is invalid"
+        )
+    emitting = int(run["emitting_candidates"])
+    duplicates = int(run["duplicate_events"])
+    if emitting + duplicates != events:
+        raise Mode3Error(f"{path}: emitting/duplicate counts do not sum to events")
 
 
 def _complete_runs(manifest_path: Path) -> tuple[dict[str, object], list[dict[str, object]]]:
@@ -759,6 +829,8 @@ def _complete_runs(manifest_path: Path) -> tuple[dict[str, object], list[dict[st
         run_record = _load_json(path)
         if run_record.get("schema") != RUN_SCHEMA or run_record.get("source_manifest_sha256") != expected_hash:
             raise Mode3Error(f"run provenance differs: {path}")
+        if manifest["operation"] == "production":
+            _validate_production_run(run_record, path)
         runs.append(run_record)
     return manifest, runs
 

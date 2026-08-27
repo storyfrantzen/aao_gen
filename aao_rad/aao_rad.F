@@ -175,6 +175,8 @@ c     and make a new version.
       real mode3_target_phi_low,mode3_target_phi_high
       real mode3_w_minimum,mode3_y_maximum
       real mode3_scan_maximum
+      real mode3_minimum_legacy_fraction
+      parameter (mode3_minimum_legacy_fraction=0.05)
       real mode4_core_fraction,mode4_legacy_fraction
       real mode4_base_padding,mode4_core_volume
       real mode4_q2_low,mode4_q2_high
@@ -212,7 +214,6 @@ c      integer iext
       integer candidate_status,coordinate_status,final_valid
       integer mode3_apply_y_max,mode3_target_status
       integer mode3_operation,mode3_inside_direct
-      integer mode3_remaining_events
       integer mode3_auto_envelope
       integer mode4_apply_y_max,mode4_stratum_status
       integer mode4_operation,mode4_inside_core
@@ -735,8 +736,11 @@ c     of a learned continuous core and the unrestricted legacy proposal.
          endif
          read(5,*,iostat=input_status)mode3_direct_fraction
          if (input_status .ne. 0 .or. mode3_direct_fraction .lt. 0.
-     *       .or. mode3_direct_fraction .gt. 1.) then
-            write(6,*)'Mode 3 direct fraction must lie in [0,1]'
+     *       .or. mode3_direct_fraction .gt.
+     *       1.-mode3_minimum_legacy_fraction) then
+            write(6,*)'Mode 3 requires direct fraction in [0,0.95]'
+            write(6,*)'At least 5% legacy support bounds the exact'
+     *         //' proposal-density correction without changing the target'
             stop 2
          endif
          mode3_legacy_fraction=1.-mode3_direct_fraction
@@ -2137,20 +2141,37 @@ c     multiplicity preserves equal event weights when the envelope is crossed.
             go to 30
          endif
          sig_ratio=sigr/sigr_max
+         if (sig_ratio .ne. sig_ratio .or.
+     *       sig_ratio .gt. real(nmax)) then
+            write(6,*)'FATAL mode-3 multiplicity exceeds job capacity'
+            write(6,*)'ntries, nevent, capacity:',ntries,nevent,nmax
+            write(6,*)'sigr, sigr_max, ratio:',
+     *         sigr,sigr_max,sig_ratio
+            write(6,*)'proposal component/density ratio:',
+     *         proposal_component,proposal_density_ratio
+            write(12,*)'FATAL mode-3 multiplicity exceeds job capacity'
+            write(12,*)'ntries, nevent, capacity:',ntries,nevent,nmax
+            write(12,*)'sigr, sigr_max, ratio:',
+     *         sigr,sigr_max,sig_ratio
+            write(12,*)'proposal component/density ratio:',
+     *         proposal_component,proposal_density_ratio
+            flush(12)
+            close(13,status='delete')
+            close(21)
+            stop 3
+         endif
          rtest=myran()
          mcall=sig_ratio
          stest=sig_ratio-mcall
          if (stest .gt. rtest)mcall=mcall+1
          if (mcall .gt. mcall_max)mcall_max=mcall
          if (mcall .eq. 0)go to 30
-c        A type-2 OSG input file may contain at most the requested number of
-c        events.  Treat the stochastic multiplicities as an ordered event
-c        stream and stop that stream exactly at nmax.  The uncapped value is
-c        retained in mcall_max for envelope diagnostics.
-         mode3_remaining_events=nmax-nevent
-         if (mcall .gt. mode3_remaining_events) then
-            mcall=mode3_remaining_events
-         endif
+c        Preserve the complete stochastic multiplicity of the final accepted
+c        proposal.  The file may therefore overshoot nmax by at most
+c        mcall-1 events.  Truncating this block would bias envelope crossings.
+c        The capacity guard above prevents a single proposal from producing
+c        more than one job's requested event count; such a job must instead
+c        be regenerated with a validated, larger envelope.
          mode3_emitting_candidates=mode3_emitting_candidates+1
          if (mcall .gt. 1)mode3_duplicate_events=
      *      mode3_duplicate_events+mcall-1
@@ -2845,7 +2866,7 @@ Clcs      call hrend('aaoradgen')
          write(15,*)'survey_emits_lund=0'
       endif
       if (sampling_mode .eq. 3)then
-         write(15,*)'mode3_schema=aao-rad-mode3-v1'
+         write(15,*)'mode3_schema=aao-rad-mode3-v2'
          write(15,*)'mode3_operation=',mode3_operation
          write(15,*)'mode3_seed=',mode3_seed
          write(15,*)'mode3_replica=',mode3_replica

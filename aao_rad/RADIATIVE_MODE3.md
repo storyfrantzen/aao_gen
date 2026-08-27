@@ -40,8 +40,21 @@ q_direct/q_legacy =
 
 Outside direct support it is zero. The acceptance step uses stochastic
 multiplicity, so a missed envelope maximum does not bias the sample; it creates
-diagnostic duplicates instead. Production stops at exactly the requested event
-count, and the LUND record remains the legacy four-particle, five-line format.
+diagnostic duplicates instead. At least 5% of the proposal must remain legacy,
+which bounds `q_legacy/q_mix` by 20 while leaving the target distribution
+unchanged. Pure-direct production is rejected because its importance weights
+are unbounded near coordinates where the direct density approaches zero.
+
+The final accepted proposal is always emitted with its complete stochastic
+multiplicity. A file can therefore contain a small overshoot beyond its
+requested event count. Truncating that final block would preferentially discard
+copies of high-weight proposals and bias the sample. If one proposal would emit
+more events than the entire job target, mode 3 aborts the job before staging its
+LUND file. Such a job must be regenerated from the beginning with a larger,
+validated envelope; it must not simply be omitted from the campaign.
+Normalization sidecars carrying the new behavior use
+`mode3_schema=aao-rad-mode3-v2`; downstream analysis rejects older mode-3
+sidecars because they cannot prove that the final multiplicity was untruncated.
 
 ## Required validation
 
@@ -73,11 +86,12 @@ stochastic multiplicity emits `floor(sigr/sigr_max)` events plus one with the
 remaining fractional probability.  Envelope crossings therefore appear as
 duplicate events and reduce efficiency rather than changing the distribution.
 
-`submit_aao_rad_mode3_native_rga10604_200M.csh` uses this path with a pure
-analysis-coordinate proposal (`direct_fraction=1`), 10,000 prescan trials per
-job, and the padded RGA domain.  This deliberately forgoes the unrestricted
-legacy component: the configured direct hard-coordinate box must therefore be
-wide enough for the radiative feed-in that the study intends to retain.
+Automatic-envelope production uses the same full-support proposal requirement
+as fixed-envelope production. The normal default is `direct_fraction=0.75`;
+the largest permitted value is 0.95. The capacity guard remains active because
+a finite prescan cannot prove that it observed the global maximum. For large
+campaigns, the reusable fixed-envelope workflow and its legacy-proposal closure
+test remain preferable.
 
 ## RGA 10.604-GeV padded domain
 
@@ -108,11 +122,13 @@ settings from the earlier RGA legacy-production script.
 
 `radiative_mode3.py` creates immutable inputs, a manifest, a task table,
 per-run JSON/normalization diagnostics, and LUND outputs. For a 100-million
-event campaign with 5,000 events per file it creates 20,000 tasks and four
-`lund/chunk_NNNN` directories of 5,000 files each. This keeps each directory
-below the 10,000-job type-2 OSG submission limit. All events in the finalized
-global campaign share the `pooled_event_weight_microbarn` recorded in
-`campaign_weights.json`; no per-stratum weights are needed.
+event campaign with 5,000 requested events per file it creates 20,000 tasks and
+four `lund/chunk_NNNN` directories of 5,000 files each. Individual files may
+overshoot their request by less than their maximum observed multiplicity. This
+keeps each directory below the 10,000-job type-2 OSG submission limit. All
+events in the finalized global campaign share the
+`pooled_event_weight_microbarn` recorded in `campaign_weights.json`; no
+per-stratum weights are needed.
 
 Generated SWIF wrappers use `$SWIF_JOB_WORK_DIR` for temporary files, falling
 back to `$TMPDIR`, an explicitly requested scratch root, and finally the job's

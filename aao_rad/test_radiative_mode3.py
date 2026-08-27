@@ -146,13 +146,14 @@ class Mode3WorkflowTests(unittest.TestCase):
         self.assertEqual(mode3.proposal_density_ratio(**arguments), 4.0)
         arguments["direct_fraction"] = 0.0
         self.assertEqual(mode3.proposal_density_ratio(**arguments), 1.0)
-        arguments["direct_fraction"] = 1.0
-        self.assertEqual(mode3.proposal_density_ratio(**arguments), 0.0)
+        arguments["direct_fraction"] = mode3.MAXIMUM_DIRECT_FRACTION
+        self.assertAlmostEqual(mode3.proposal_density_ratio(**arguments), 20.0)
         arguments["minus_t"] = 0.5
-        expected_direct_only = 1.0 / direct_to_legacy
+        expected_bounded = 1.0 / (0.05 + 0.95 * direct_to_legacy)
         self.assertAlmostEqual(
-            mode3.proposal_density_ratio(**arguments), expected_direct_only
+            mode3.proposal_density_ratio(**arguments), expected_bounded
         )
+        self.assertLessEqual(expected_bounded, 20.0)
 
     def test_prepare_snapshots_mode3_input_and_splits_production(self) -> None:
         args = _prepare_args(
@@ -212,6 +213,39 @@ class Mode3WorkflowTests(unittest.TestCase):
             Path(production["runs"][2]["lund"]).parent.name,
             "chunk_0001",
         )
+
+    def test_prepare_rejects_unbounded_direct_only_proposal(self) -> None:
+        args = _prepare_args(
+            self.root,
+            self.config,
+            self.legacy,
+            operation="calibration",
+            direct_fraction=1.0,
+        )
+        with self.assertRaisesRegex(ValueError, "5% legacy support"):
+            mode3.prepare_calibration(args)
+
+    def test_production_validation_accepts_overshoot_and_rejects_truncation(self) -> None:
+        valid = {
+            "mode3_schema": mode3.MODE3_SCHEMA,
+            "requested_events": 5_000,
+            "events": 5_002,
+            "mcall_max": 4,
+            "event_overshoot": 2,
+            "emitting_candidates": 4_990,
+            "duplicate_events": 12,
+        }
+        mode3._validate_production_run(valid, self.root / "valid.json")
+        unsafe = dict(valid)
+        unsafe.update(
+            events=5_000,
+            mcall_max=40_930_660,
+            event_overshoot=0,
+            emitting_candidates=4_600,
+            duplicate_events=400,
+        )
+        with self.assertRaisesRegex(mode3.Mode3Error, "exceeds"):
+            mode3._validate_production_run(unsafe, self.root / "unsafe.json")
 
     def test_photon_threshold_is_frozen_across_calibration_and_production(self) -> None:
         args = _prepare_args(
@@ -308,11 +342,12 @@ class Mode3WorkflowTests(unittest.TestCase):
             )
         )
         generated = json.loads(production_run.read_text(encoding="utf-8"))
-        self.assertEqual(generated["events"], 2)
+        self.assertGreaterEqual(generated["events"], 2)
+        self.assertLess(generated["event_overshoot"], generated["mcall_max"])
         self.assertEqual(generated["lund_lines"], 5 * generated["events"])
         self.assertTrue(Path(generated["lund"]).is_file())
 
-    def test_executable_direct_only_automatic_envelope_smoke(self) -> None:
+    def test_executable_mixture_automatic_envelope_smoke(self) -> None:
         executable = Path(__file__).resolve().parent / "build" / "aao_rad"
         if not executable.is_file():
             self.skipTest("build/aao_rad is created by the Makefile test target")
@@ -325,7 +360,7 @@ class Mode3WorkflowTests(unittest.TestCase):
             settings,
             seed=791001,
             replica=0,
-            direct_fraction=1.0,
+            direct_fraction=0.75,
             operation=2,
             trials=2_000,
             heartbeat=100,
@@ -344,9 +379,62 @@ class Mode3WorkflowTests(unittest.TestCase):
         self.assertIn("Mode-3 automatic sigr_max", completed.stdout)
         norm = mode3._parse_norm(work / "aao_rad.norm")
         self.assertEqual(int(mode3._number(norm, "mode3_operation")), 0)
-        self.assertEqual(int(mode3._number(norm, "events")), 2)
+        events = int(mode3._number(norm, "events"))
+        maximum_multiplicity = int(mode3._number(norm, "mcall_max"))
+        self.assertGreaterEqual(events, 2)
+        self.assertLess(events - 2, maximum_multiplicity)
         self.assertGreater(mode3._number(norm, "sigr_max"), 0.0)
-        self.assertEqual(len((work / "aao_rad.lund").read_text().splitlines()), 10)
+        self.assertEqual(
+            len((work / "aao_rad.lund").read_text().splitlines()),
+            5 * events,
+        )
+
+    def test_executable_capacity_guard_fails_before_staging_lund(self) -> None:
+        executable = Path(__file__).resolve().parent / "build" / "aao_rad"
+        if not executable.is_file():
+            self.skipTest("build/aao_rad is created by the Makefile test target")
+        calibration_args = _prepare_args(
+            self.root, self.config, self.legacy, operation="calibration"
+        )
+        calibration_manifest = mode3.prepare_calibration(calibration_args)
+        calibration = json.loads(
+            calibration_manifest.read_text(encoding="utf-8")
+        )
+        envelope_path = self.root / "deliberately-unsafe-envelope.json"
+        envelope_path.write_text(
+            json.dumps(
+                {
+                    "schema": mode3.CALIBRATION_SCHEMA,
+                    "settings": calibration["settings"],
+                    "direct_fraction": 0.75,
+                    "recommended_sigr_max": 1.0e-30,
+                }
+            ),
+            encoding="utf-8",
+        )
+        production_args = _prepare_args(
+            self.root, self.config, self.legacy, operation="production"
+        )
+        production_args.output = self.root / "capacity-guard"
+        production_args.calibration = envelope_path
+        production_args.total_events = 2
+        production_args.events_per_job = 2
+        production_args.lund_files_per_directory = 5_000
+        manifest_path = mode3.prepare_production(production_args)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        with self.assertRaisesRegex(
+            mode3.Mode3Error, "FATAL mode-3 multiplicity exceeds job capacity"
+        ):
+            mode3.run(
+                argparse.Namespace(
+                    manifest=manifest_path,
+                    replica_index=0,
+                    executable=executable,
+                    scratch_root=None,
+                    overwrite=False,
+                )
+            )
+        self.assertFalse(Path(manifest["runs"][0]["lund"]).exists())
 
     def test_swif_emission_is_chunkable_and_shell_valid(self) -> None:
         args = _prepare_args(
