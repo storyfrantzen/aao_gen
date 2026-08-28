@@ -178,6 +178,24 @@ last proposal. Mode-4 normalization uses the actual emitted count in
 `sig_sum/events`; increasing `fmcall` remains useful when fewer duplicate
 kinematics are desired.
 
+Global mode 3 preserves the same complete-block rule: the final accepted
+proposal is never truncated merely to stop exactly at the requested event
+count.  A successful mode-3 file may therefore overshoot its requested count
+by fewer than `mcall_max` events.  A pathological proposal requiring more
+copies than the entire requested job capacity is not a useful ordinary
+envelope crossing.  The generator now fails before converting or writing that
+block, deletes the partial LUND and kinematics files, and emits no normalization
+sidecar.  Such a failure means that the production envelope must be increased
+and the affected production configuration regenerated; selecting only jobs
+that happened not to encounter the tail would condition the sample and can
+bias it.
+
+Successful global mode-3 normalization sidecars use
+`mode3_schema=aao-norad-mode3-v2` and record the requested count, actual
+overshoot, and the complete-final-multiplicity invariant.  Downstream readers
+can consequently distinguish fail-safe production from older unguarded mode-3
+artifacts.
+
 Every run also writes `aao_norad.kin`, with one row per LUND event:
 
 ```text

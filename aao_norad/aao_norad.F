@@ -599,6 +599,32 @@ cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
       endif
       signr = signr*jacob
       sig_ratio = signr/sigr_max
+
+c     A mode-3 envelope crossing is unbiased only when the complete
+c     stochastic multiplicity block is emitted.  Refuse a pathological
+c     proposal before converting sig_ratio to an integer or writing any of
+c     its copies.  Continuing such a job could exhaust storage or overflow
+c     mcall; truncating the block to the remaining requested events would
+c     bias the generated sample.  The partial event products are deleted so
+c     that a failed job cannot be mistaken for a usable production artifact.
+      if (sampling_mode .eq. 3 .and.
+     *   (sig_ratio .ne. sig_ratio .or.
+     *    sig_ratio .gt. real(nmax))) then
+         write(6,*)'FATAL Born mode-3 multiplicity exceeds job capacity'
+         write(6,*)'ntries, nevent, capacity:',ntries,nevent,nmax
+         write(6,*)'signr, sigr_max, ratio:',
+     *      signr,sigr_max,sig_ratio
+         write(12,*)'FATAL Born mode-3 multiplicity exceeds job capacity'
+         write(12,*)'ntries, nevent, capacity:',ntries,nevent,nmax
+         write(12,*)'signr, sigr_max, ratio:',
+     *      signr,sigr_max,sig_ratio
+         flush(12)
+         close(13,status='delete')
+         close(16,status='delete')
+         close(12)
+         close(14)
+         stop 3
+      endif
       
 c     Choose the number of times, mcall, to call the routine used
 c     to calculate kinematic quantities for the n-tuple.
@@ -892,6 +918,12 @@ c      if (boso.eq.1) call bos_end(recname)
       write(15,*)'phys=',phys
       write(15,*)'fmcall=',fmcall
       write(15,*)'sampling_mode=',sampling_mode
+      if (sampling_mode .eq. 3) then
+         write(15,*)'mode3_schema=aao-norad-mode3-v2'
+         write(15,*)'mode3_target_events=',nmax
+         write(15,*)'mode3_event_overshoot=',nevent-nmax
+         write(15,*)'mode3_complete_final_multiplicity=1'
+      endif
       if (sampling_mode .ne. 0) then
          write(15,*)'xb_min=',xb_min
          write(15,*)'xb_max=',xb_max
