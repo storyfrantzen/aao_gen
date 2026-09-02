@@ -5,6 +5,32 @@
 Files under `build/` are generated locally and are not tracked. Build the
 needed target once before running local or batch workflows.
 
+Run the Born mode-3 safety and shared DVMP endpoint regressions with `make test`.
+The endpoint tests compile both the Born and radiative copies of the model.
+
+### Forward-boundary numerical fix (September 2026)
+
+`CHECK_KINE`, `XCHECK_KINE`, and `tminq` now share double-precision `-t`
+endpoints using the model's existing `Mp=0.93827` convention. Previously,
+slightly different masses and single-precision endpoint calculations could
+accept a point with `T < T0`, producing a NaN in `sqrt(T-T0)` in the LT term.
+Both model copies are updated. No fitted model parameters, proposal bounds,
+seeds, or multiplicity policy are changed. Points outside the common rounded
+endpoints are rejected, not broadly clamped into the physical region.
+
+New normalization files include `dvmp_boundary_version=1`. The mode-3 v2
+schema and equal event weights are unchanged. Non-finite ratios now have a
+distinct fatal diagnostic instead of being mislabeled as capacity overflows;
+partial failed event products remain unusable and are removed by the guard.
+
+For an interrupted manual campaign, rebuild first, then rerun the same batch
+driver with the same campaign directory and seeds. The manual driver skips
+tasks that already have both nonempty LUND and norm files and reruns missing
+ones. It does not establish the validity of arbitrary preexisting files: retain
+the original logs and provenance, and do not mix different phase-space configs.
+The regression suite includes the failing RGK seed `-2100000029` and RGA seed
+`-2110004993`, each with its original nominal-W2 5,000-event request.
+
 ## How to run `aao_norad`:
 ```
 cd aao_norad

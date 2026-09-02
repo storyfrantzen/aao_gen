@@ -326,6 +326,7 @@ C===============================================================================
 C====================================================================================c
 
       LOGICAL FUNCTION XCHECK_KINE(del2,xb,Q2,E)
+      USE, INTRINSIC :: IEEE_ARITHMETIC, ONLY: IEEE_IS_FINITE
       IMPLICIT NONE
       REAL del2,xb,Q2,E,KSI
       REAL Mp, mele, pi, mpi0
@@ -335,38 +336,23 @@ C===============================================================================
       parameter (pi=3.1415926536)
            
 
-      REAL nu,W2,W,qmod,E1cm,P1cm,E2cm,P2cm,del2max,del2min
-      REAL  xmin1,xmax1,tminq
+      REAL  xmin1,xmax1
       DOUBLE PRECISION y, e1, epsilon
-
-      REAL AM(2)
-      DATA AM/0.134976,0.547300/
-      INTEGER K
-      COMMON/PIETA/K
-
-      MPI0=AM(K)
+      DOUBLE PRECISION tforward,tbackward
+      LOGICAL valid_limits
       XCHECK_KINE=.FALSE.
+      IF(.NOT.IEEE_IS_FINITE(del2).OR.
+     *   .NOT.IEEE_IS_FINITE(E).OR.E.LE.0.) RETURN
+      CALL DVMP_T_LIMITS(Q2,xb,tforward,tbackward,valid_limits)
+      IF(.NOT.valid_limits) RETURN
       xmin1 = Q2/(2.0*Mp*E)
       xmax1 = 1.0
-      nu  = Q2/(2D0*Mp*xb)
-      W2  = Mp**2 + 2.0*Mp*nu - Q2
-C      print *,'W2=',W2
-      IF(W2.LE.(Mp+Mpi0)**2)                  RETURN
-      W   = sqrt(W2)
-      qmod = sqrt(nu**2 + Q2)
-
-      E1cm = Mp*(Mp + nu)/W
-      P1cm = Mp*qmod/W
-      E2cm = (W2 + Mp**2-Mpi0**2)/(2.*W)
-C      print *,'E2cm=',E2cm,Mp
-      IF(E2cm.LE.Mp)                          RETURN
-      P2cm = SQRT(E2CM**2 - Mp**2)
-      del2max = 2.0*(Mp**2 - E1cm*E2cm - P1cm*P2cm)
-      del2min = 2.0*(Mp**2 - E1cm*E2cm + P1cm*P2cm)
-C      print *,'xB=',xb,xmin1,xmax1
       IF( xb.le.xmin1 .or. xb.gt.xmax1 )     RETURN !    x  out of range
-C      print *,'t=',del2,del2min,del2max,tminq(Q2,xb)
-      IF( del2.ge.del2min .or. del2.le.del2max ) return   ! delta out of range
+c     Compare the same rounded endpoints used by tminq and CHECK_KINE.
+c     An interior point can round onto an endpoint in the REAL interface;
+c     equality is valid, but even one REAL step outside is rejected.
+      IF(-del2.LT.REAL(tforward).OR.
+     *   -del2.GT.REAL(tbackward)) RETURN
 
       y=Q2/(2*Mp*xb*E)
       e1=(y*xb*Mp)**2/Q2
@@ -421,35 +407,60 @@ C===============================================================================
       REAL FUNCTION tminq(Q2,X)
       IMPLICIT NONE
       REAL Q2,X
-      REAL W2,W,S,E1CM,E3CM,P1CM,P3CM,TMAX
-      INTEGER I
-      real alpha,Mp,PI,Me
-      REAL MPI0
+      DOUBLE PRECISION tforward,tbackward
+      LOGICAL valid_limits
+
+      CALL DVMP_T_LIMITS(Q2,X,tforward,tbackward,valid_limits)
+      tminq=0.
+      IF(valid_limits) tminq=REAL(tforward)
+      RETURN
+      END
+
+C====================================================================================c
+      SUBROUTINE DVMP_T_LIMITS(Q2,X,tforward,tbackward,valid)
+c     Positive -t limits shared by the angular and (xB,t) model paths.
+c     Keep the CHECK_KINE model mass convention, but evaluate the endpoint
+c     differences in double precision. Previously tminq used a different
+c     proton mass and could make SQRT(T-T0) negative at an accepted point.
+      USE, INTRINSIC :: IEEE_ARITHMETIC, ONLY: IEEE_IS_FINITE
+      IMPLICIT NONE
+      REAL Q2,X,model_mp
+      PARAMETER (model_mp=0.93827)
+      DOUBLE PRECISION tforward,tbackward,mp,meson,w2,w
+      DOUBLE PRECISION e1,e3,p1sq,p3sq,p1,p3,ediff,pdiff
+      LOGICAL valid
 
       REAL AM(2)
       DATA AM/0.134976,0.547300/
       INTEGER K
       COMMON/PIETA/K
-      
-      MPI0=AM(K)
-      tminq=0.
 
-      Mp=0.9382723
-      Me=0.0051
-      PI=3.14151926
-
-      IF(X.LE.0. .OR. X.GE.1.)        RETURN
-      W2 = Q2*(1./X-1.)+Mp**2
-      W=SQRT(W2)
-      IF(W.LT.Mp+Mpi0)                RETURN
-
-      E1CM=(W2+Q2+Mp**2)/(2*W)
-      P1CM=SQRT(E1CM**2-MP**2)
-
-      E3CM=(W2-MPI0**2+Mp**2)/(2*W)
-      P3CM=SQRT(E3CM**2-MP**2)
-      
-      TMINQ=-((Q2+MPI0**2)**2/4./W2-(P1CM-P3CM)**2)
+      valid=.FALSE.
+      tforward=0D0
+      tbackward=0D0
+      IF(.NOT.IEEE_IS_FINITE(Q2).OR.
+     *   .NOT.IEEE_IS_FINITE(X)) RETURN
+      IF(Q2.LE.0..OR.X.LE.0..OR.X.GE.1.) RETURN
+      IF(K.LT.1.OR.K.GT.2) RETURN
+      mp=DBLE(model_mp)
+      meson=DBLE(AM(K))
+      w2=DBLE(Q2)*(1D0/DBLE(X)-1D0)+mp**2
+      IF(w2.LE.(mp+meson)**2) RETURN
+      w=SQRT(w2)
+      e1=(w2+DBLE(Q2)+mp**2)/(2D0*w)
+      e3=(w2-meson**2+mp**2)/(2D0*w)
+      p1sq=(e1-mp)*(e1+mp)
+      p3sq=(e3-mp)*(e3+mp)
+      IF(p1sq.LE.0D0.OR.p3sq.LE.0D0) RETURN
+      p1=SQRT(p1sq)
+      p3=SQRT(p3sq)
+c     Rationalize p1-p3 to avoid subtracting nearly equal momenta.
+      ediff=(DBLE(Q2)+meson**2)/(2D0*w)
+      pdiff=ediff*(e1+e3)/(p1+p3)
+      tforward=(pdiff-ediff)*(pdiff+ediff)
+      tbackward=tforward+4D0*p1*p3
+      valid=IEEE_IS_FINITE(tforward).AND.
+     *      IEEE_IS_FINITE(tbackward).AND.tforward.GE.0D0
 
       RETURN
       END
@@ -564,5 +575,4 @@ C      print *, 'HTE2= ',del2,x,q2,T,T0,HTE2
 
       RETURN
       END
-
 

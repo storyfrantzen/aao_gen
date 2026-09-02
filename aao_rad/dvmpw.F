@@ -182,6 +182,7 @@ C===============================================================================
 C====================================================================================c
 
       LOGICAL FUNCTION CHECK_KINE(COST,W,Q2,E,del2,xb,JACG,JACR)
+      USE, INTRINSIC :: IEEE_ARITHMETIC, ONLY: IEEE_IS_FINITE
       IMPLICIT NONE
       REAL COST,W,del2,xb,Q2,E,JACG,JACR
       real Mp, mele, pi,mpi0
@@ -191,9 +192,11 @@ C===============================================================================
       parameter (pi=3.1415926536)
             
 
-      real nu,W2,qmod,E1cm,P1cm,E2cm,P2cm,del2max,del2min
+      real nu,W2
       real  xmin1,xmax1
       double precision y, e1, epsilon
+      double precision tforward,tbackward
+      logical valid_limits
 
       REAL AM(2)
       DATA AM/0.134976,0.547300/
@@ -203,10 +206,14 @@ C===============================================================================
       MPI0=AM(K)
 
       CHECK_KINE=.FALSE.
+      IF(.NOT.IEEE_IS_FINITE(COST).OR.
+     *   .NOT.IEEE_IS_FINITE(W).OR.
+     *   .NOT.IEEE_IS_FINITE(Q2).OR.
+     *   .NOT.IEEE_IS_FINITE(E)) RETURN
+      IF(Q2.LE.0..OR.E.LE.0..OR.W.LE.Mp+Mpi0) RETURN
       W2=W*W
       XB=Q2/(W2+Q2-Mp*Mp)
       nu  = (W2+Q2-Mp*Mp)/(2*Mp)
-      qmod = sqrt(nu**2 + Q2)
       IF(W         .LE. Mp+Mpi0)              RETURN
       IF(W2        .GE. -Q2+2*Mp*E+Mp*Mp)     RETURN
       IF(Q2/(4*E*(E-NU)) .GE. 1.0)            RETURN
@@ -215,16 +222,12 @@ C===============================================================================
       xmin1 = Q2/(2.0*Mp*E)
       xmax1 = 1.0
 
-      E1cm = Mp*(Mp + nu)/W
-      E2cm = (W2 + Mp**2-Mpi0**2)/(2D0*W)
-      IF(E1cm.LE.Mp .OR. E2cm.LE. Mp) RETURN
-      P1cm = Mp*qmod/W
-      P2cm = SQRT(E2CM**2 - Mp**2)
-      del2max = 2.0*(Mp**2 - E1cm*E2cm - P1cm*P2cm)
-      del2min = 2.0*(Mp**2 - E1cm*E2cm + P1cm*P2cm)
-      del2=del2min-2.*P1cm*P2cm*(1-COST)
+      CALL DVMP_T_LIMITS(Q2,xb,tforward,tbackward,valid_limits)
+      IF(.NOT.valid_limits) RETURN
+c     Use the same endpoints as XCHECK_KINE/tminq, then round only once.
+      del2=-REAL(tforward+(tbackward-tforward)*
+     *           (1D0-DBLE(COST))/2D0)
       IF( xb.le.xmin1 .or. xb.gt.xmax1 )         return   !    x  out of range
-      IF( del2.ge.del2min .or. del2.le.del2max ) return   ! delta out of range
 
       y=Q2/(2*Mp*xb*E)
       e1=(y*xb*Mp)**2/Q2
@@ -235,7 +238,7 @@ C===============================================================================
 C      jacobian
 C      JAC=4*P1cm*P2CM*W*XB/(W2+Q2-Mp*Mp)
       JACG=2*W*XB/(W2+Q2-Mp*Mp)
-      JACR=2*P1cm*P2CM
+      JACR=REAL((tbackward-tforward)/2D0)
 
       CHECK_KINE=.TRUE.
 c      PRINT *,'Check_kine: ', W,xB,nu,qmod,E1cm,E2cm,del2,y,e1

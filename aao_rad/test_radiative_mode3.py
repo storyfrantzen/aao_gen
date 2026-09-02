@@ -378,6 +378,7 @@ class Mode3WorkflowTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("Mode-3 automatic sigr_max", completed.stdout)
         norm = mode3._parse_norm(work / "aao_rad.norm")
+        self.assertEqual(norm["dvmp_boundary_version"], "1")
         self.assertEqual(int(mode3._number(norm, "mode3_operation")), 0)
         events = int(mode3._number(norm, "events"))
         maximum_multiplicity = int(mode3._number(norm, "mcall_max"))
@@ -388,6 +389,31 @@ class Mode3WorkflowTests(unittest.TestCase):
             len((work / "aao_rad.lund").read_text().splitlines()),
             5 * events,
         )
+
+    def test_executable_nonfinite_ratio_has_distinct_diagnostic(self) -> None:
+        executable = Path(__file__).resolve().parent / "build" / "aao_rad"
+        if not executable.is_file():
+            self.skipTest("build/aao_rad is created by the Makefile test target")
+        settings = mode3._configuration(self.config, 0.0)
+        base = mode3._legacy_records(self.legacy)[:17]
+        base[15] = "2"
+        base[16] = "NaN"  # Invalid scan multiplier must never yield usable output.
+        generated = "\n".join(base) + "\n" + mode3._trailer(
+            settings, seed=791001, replica=0, direct_fraction=0.75,
+            operation=2, trials=2_000, heartbeat=100,
+        )
+        work = self.root / "nonfinite-envelope"
+        work.mkdir()
+        completed = subprocess.run(
+            [str(executable)], input=generated, text=True, cwd=work,
+            capture_output=True, timeout=60,
+        )
+        output = completed.stdout + completed.stderr
+        self.assertNotEqual(completed.returncode, 0, output)
+        self.assertIn("FATAL mode-3 non-finite cross section", output)
+        self.assertNotIn("multiplicity exceeds job capacity", output)
+        self.assertFalse((work / "aao_rad.lund").exists())
+        self.assertFalse((work / "aao_rad.norm").exists())
 
     def test_executable_capacity_guard_fails_before_staging_lund(self) -> None:
         executable = Path(__file__).resolve().parent / "build" / "aao_rad"

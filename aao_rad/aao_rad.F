@@ -22,6 +22,7 @@ c     of detectors is not folded into the results.  If this is desired it
 c     should be done with a second program that can operate on the n-tuple
 c     and make a new version.
 
+      use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
       implicit none
       
 #include "bcs.inc"
@@ -40,6 +41,7 @@ c     and make a new version.
       integer env_status, env_len
       integer*8 job_seed, attempt_seed, seed_value
       character*32 env_value
+      character*80 mode3_failure_reason
       real*8 ek,Tk,delta
       real*8 alpha,pi,mp,mn,mpi,mel,wg,T0
       real*8 es,ep,ps,pp,rs,rp,u0,pu,uu,pdotk,sdotk
@@ -2141,15 +2143,19 @@ c     multiplicity preserves equal event weights when the envelope is crossed.
             go to 30
          endif
          sig_ratio=sigr/sigr_max
-         if (sig_ratio .ne. sig_ratio .or.
+         if (.not.ieee_is_finite(sig_ratio) .or.
      *       sig_ratio .gt. real(nmax)) then
-            write(6,*)'FATAL mode-3 multiplicity exceeds job capacity'
+            mode3_failure_reason=
+     *         'FATAL mode-3 multiplicity exceeds job capacity'
+            if (.not.ieee_is_finite(sig_ratio)) mode3_failure_reason=
+     *         'FATAL mode-3 non-finite cross section or envelope ratio'
+            write(6,*)trim(mode3_failure_reason)
             write(6,*)'ntries, nevent, capacity:',ntries,nevent,nmax
             write(6,*)'sigr, sigr_max, ratio:',
      *         sigr,sigr_max,sig_ratio
             write(6,*)'proposal component/density ratio:',
      *         proposal_component,proposal_density_ratio
-            write(12,*)'FATAL mode-3 multiplicity exceeds job capacity'
+            write(12,*)trim(mode3_failure_reason)
             write(12,*)'ntries, nevent, capacity:',ntries,nevent,nmax
             write(12,*)'sigr, sigr_max, ratio:',
      *         sigr,sigr_max,sig_ratio
@@ -2816,6 +2822,7 @@ Clcs      call hrend('aaoradgen')
 
       open(unit=15,file=file_norm)
       write(15,*)'generator=aao_rad'
+      write(15,*)'dvmp_boundary_version=1'
       write(15,*)'sampling_mode=',sampling_mode
       write(15,*)'fixed_trial_survey=',merge(1,0,sampling_mode.eq.1)
       write(15,*)'integrated_cross_section_units=micro-barns'

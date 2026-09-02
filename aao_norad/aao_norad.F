@@ -15,6 +15,7 @@ c     desired it
 c     should be done with a second program that can operate on the n-tuple
 c     and make a new version.
 
+      use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
       implicit none
       
 #include "bcs.inc"
@@ -101,6 +102,7 @@ clcs     common/quest/iquest(100)
       character*132 file_kin
       character*8 recname
       character*32 env_value
+      character*80 mode3_failure_reason
 
       DATA PI   /3.1415926/
       DATA MPIP /.1395/
@@ -608,16 +610,24 @@ c     mcall; truncating the block to the remaining requested events would
 c     bias the generated sample.  The partial event products are deleted so
 c     that a failed job cannot be mistaken for a usable production artifact.
       if (sampling_mode .eq. 3 .and.
-     *   (sig_ratio .ne. sig_ratio .or.
+     *   (.not.ieee_is_finite(sig_ratio) .or.
      *    sig_ratio .gt. real(nmax))) then
-         write(6,*)'FATAL Born mode-3 multiplicity exceeds job capacity'
+         mode3_failure_reason=
+     *      'FATAL Born mode-3 multiplicity exceeds job capacity'
+         if (.not.ieee_is_finite(sig_ratio)) mode3_failure_reason=
+     *      'FATAL Born mode-3 non-finite cross section or envelope ratio'
+         write(6,*)trim(mode3_failure_reason)
          write(6,*)'ntries, nevent, capacity:',ntries,nevent,nmax
          write(6,*)'signr, sigr_max, ratio:',
      *      signr,sigr_max,sig_ratio
-         write(12,*)'FATAL Born mode-3 multiplicity exceeds job capacity'
+         write(6,*)'Q2, xB, W, cos(theta*), phi*:',
+     *      qsq,xb,epw,csthcm,phicm
+         write(12,*)trim(mode3_failure_reason)
          write(12,*)'ntries, nevent, capacity:',ntries,nevent,nmax
          write(12,*)'signr, sigr_max, ratio:',
      *      signr,sigr_max,sig_ratio
+         write(12,*)'Q2, xB, W, cos(theta*), phi*:',
+     *      qsq,xb,epw,csthcm,phicm
          flush(12)
          close(13,status='delete')
          close(16,status='delete')
@@ -901,6 +911,7 @@ c      if (boso.eq.1) call bos_end(recname)
      *    ,' seconds'
       open(unit=15,file=file_norm)
       write(15,*)'generator=aao_norad'
+      write(15,*)'dvmp_boundary_version=1'
       write(15,*)'integrated_cross_section_units=micro-barns'
       write(15,*)'sig_int=',sig_int
       write(15,*)'sig_sum=',sig_sum

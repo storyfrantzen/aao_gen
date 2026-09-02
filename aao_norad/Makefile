@@ -4,8 +4,12 @@ XSEC_OBJ=  aao_xsec.o aao.o daresbury.o dsigma.o dvmpw.o dvmpx.o timex.o $(CORE_
 OBJC=  unixtime.o 
 
 #CERNLIBS =  -L/apps/cernlib/x86_64_rhel6_4.7.2/2005/lib  -lmathlib  -lpacklib 
+.PHONY: all aao_rad aao_xsec_bin clean test
  
 all : aao_rad aao_xsec_bin
+
+test: all
+	python3 -m unittest -v test_mode3_safety.py test_dvmp_boundary.py test_bin_conditional.py
 
 aao_rad : $(OBJ) $(OBJC)
 	mkdir -p build
